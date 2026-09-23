@@ -1,0 +1,1788 @@
+"""Shared application/service layer used by both CLI/JSON and TUI."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from uuid import uuid4
+
+from frontierwright.data import DatasetProvenance, DatasetRole, inspect_local_dataset
+from frontierwright.domain import (
+    Axis,
+    BuildIntent,
+    BuildMode,
+    BuildTargets,
+    CandidateStatus,
+    HistoryConfidence,
+    ModelOrigin,
+    ModelState,
+    build_mode,
+)
+from frontierwright.errors import FrontierwrightError
+from frontierwright.evaluations import apply_scale, load_capability_scale, load_evaluation_receipt
+from frontierwright.execution import (
+    CommandBackendSpec,
+    HardBudgets,
+    PermissionLevel,
+    RunStatus,
+    TrainingPlan,
+    compute_execution_request_digest,
+    compute_plan_idempotency_key,
+    load_command_backend_spec,
+    run_calibration_backend,
+)
+from frontierwright.local_executor import (
+    LocalAttemptSpec,
+    atomic_write_json,
+    file_sha256,
+    launch_worker,
+    process_liveness,
+    process_start_token,
+    terminate_worker_tree,
+)
+from frontierwright.models import discover_history_evidence, inspect_local_model
+from frontierwright.paths import PathAvailability, PathContext, TrainingPathId, assess_paths
+from frontierwright.registry import ProjectState, Registry
+from frontierwright.resources import detect_local_resources
+
+
+@dataclass(frozen=True)
+class StatusView:
+    schema_version: int = 1
+    initialized: bool = False
+    project_id: str | None = None
+    project_name: str | None = None
+    language: str = "en"
+    nickname: str | None = None
+    origin: str | None = None
+    history_confidence: str | None = None
+    history_evidence_reason: str | None = None
+    measurement_state: str = "NOT_READY"
+    build_mode: str | None = None
+    strong_recommendation_allowed: bool = False
+    champion_model_id: str | None = None
+    model_format: str | None = None
+    trainable: bool | None = None
+    model_fingerprint: str | None = None
+    model_source_path: str | None = None
+    model_total_bytes: int | None = None
+    candidate_count: int = 0
+    stats: dict[str, float | None] = field(default_factory=dict)
+    resource_profile_available: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ResourceView:
+    schema_version: int = 1
+    available: bool = False
+    profile_id: str | None = None
+    profile_name: str | None = None
+    provenance: str | None = None
+    detected_at: str | None = None
+    snapshot: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class BuildView:
+    schema_version: int = 1
+    mode: str | None = None
+    configured: bool = False
+    archetype: str | None = None
+    priorities: dict[str, int] = field(default_factory=dict)
+    targets: dict[str, int] = field(default_factory=dict)
+    floors: dict[str, int] = field(default_factory=dict)
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StatsView:
+    schema_version: int = 1
+    measured: bool = False
+    model_id: str | None = None
+    model_fingerprint: str | None = None
+    profile_id: str | None = None
+    scale_id: str | None = None
+    scale_version: str | None = None
+    scale_hash: str | None = None
+    receipt_id: str | None = None
+    receipt_sha256: str | None = None
+    evaluator_id: str | None = None
+    evaluator_version: str | None = None
+    stats: dict[str, float | None] = field(default_factory=dict)
+    raw_measurements: list[dict[str, object]] = field(default_factory=list)
+    conditions: dict[str, object] = field(default_factory=dict)
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DataView:
+    schema_version: int = 1
+    datasets: list[dict[str, object]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PathsView:
+    schema_version: int = 1
+    paths: list[dict[str, object]] = field(default_factory=list)
+    recommended_path: str | None = None
+    recommendation_reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PlanView:
+    schema_version: int = 1
+    plan_id: str | None = None
+    path_id: str | None = None
+    backend_id: str | None = None
+    backend_spec_hash: str | None = None
+    model_id: str | None = None
+    dataset_id: str | None = None
+    resource_profile_id: str | None = None
+    permission: str | None = None
+    budgets: dict[str, object] = field(default_factory=dict)
+    config: dict[str, object] = field(default_factory=dict)
+    idempotency_key: str | None = None
+    calibration: dict[str, object] | None = None
+    ready: bool = False
+    blockers: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RunView:
+    schema_version: int = 1
+    run_id: str | None = None
+    plan_id: str | None = None
+    status: str | None = None
+    candidate_model_id: str | None = None
+    metrics: dict[str, object] = field(default_factory=dict)
+    error_code: str | None = None
+    error_message: str | None = None
+    dry_run: bool = False
+    liveness_state: str | None = None
+    calibration_id: str | None = None
+    request_digest: str | None = None
+    result_evidence_available: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CandidateView:
+    schema_version: int = 1
+    candidates: list[dict[str, object]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CompareView:
+    schema_version: int = 1
+    champion_model_id: str | None = None
+    candidate_model_id: str | None = None
+    candidate_status: str | None = None
+    scale_comparable: bool = False
+    scale_reason: str | None = None
+    champion_stats: dict[str, float | None] = field(default_factory=dict)
+    candidate_stats: dict[str, float | None] = field(default_factory=dict)
+    deltas: dict[str, float | None] = field(default_factory=dict)
+    build_constraints: list[dict[str, object]] = field(default_factory=list)
+    run: dict[str, object] | None = None
+    calibration: dict[str, object] | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class HistoryView:
+    schema_version: int = 1
+    events: list[dict[str, object]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def _empty_stats() -> dict[str, float | None]:
+    return {
+        "general": None,
+        "reasoning": None,
+        "math": None,
+        "coding": None,
+    }
+
+
+def get_status(root: Path) -> StatusView:
+    registry = Registry(root)
+    if not registry.exists:
+        return StatusView(stats=_empty_stats())
+
+    state = registry.read()
+    project = state.project
+    origin = ModelOrigin(project["origin"])
+    confidence = HistoryConfidence(project["history_confidence"])
+    stats = _empty_stats()
+    if state.capability_profile is not None:
+        for stat in state.capability_profile.get("stats", []):
+            axis = str(stat.get("axis", "")).lower()
+            value = stat.get("value")
+            if axis in stats and isinstance(value, (int, float)) and not isinstance(value, bool):
+                stats[axis] = float(value)
+    elif state.champion is not None:
+        for stat in state.champion.model.stats:
+            stats[stat.axis.value.lower()] = stat.value
+
+    measured = any(value is not None for value in stats.values())
+    if measured:
+        mode = BuildMode.TARGETS_FLOORS
+    else:
+        mode = build_mode(origin, state.champion)
+    artifact = state.champion_artifact or {}
+
+    return StatusView(
+        initialized=True,
+        project_id=project["project_id"],
+        project_name=project["name"],
+        language=project["language"],
+        nickname=project["name"],
+        origin=origin.value,
+        history_confidence=confidence.value,
+        history_evidence_reason=artifact.get("evidence_reason"),
+        measurement_state="MEASURED" if measured else "NOT_READY",
+        build_mode=mode.value,
+        strong_recommendation_allowed=confidence.allows_recommendation,
+        champion_model_id=state.champion.model.model_id if state.champion else None,
+        model_format=(
+            state.champion.model.model_format.value if state.champion is not None else None
+        ),
+        trainable=state.champion.model.trainable if state.champion is not None else None,
+        model_fingerprint=(
+            state.champion.model.fingerprint if state.champion is not None else None
+        ),
+        model_source_path=artifact.get("source_path"),
+        model_total_bytes=artifact.get("total_bytes"),
+        candidate_count=len(state.candidates),
+        stats=stats,
+        resource_profile_available=state.resource_profile is not None,
+    )
+
+
+def get_stats_view(root: Path, model_id: str | None = None) -> StatsView:
+    registry = Registry(root)
+    if not registry.exists:
+        return StatsView(stats=_empty_stats(), reason="Project is not initialized.")
+
+    if model_id is None:
+        state = registry.read()
+        if state.champion is None:
+            return StatsView(
+                stats=_empty_stats(),
+                reason="No current champion model is available for evaluation.",
+            )
+        model = state.champion.model
+    else:
+        model = registry.get_model(model_id)
+
+    profile = registry.get_active_capability_profile(model.model_id)
+    if profile is None:
+        stats = _empty_stats()
+        for stat in model.stats:
+            stats[stat.axis.value.lower()] = stat.value
+        if any(value is not None for value in stats.values()):
+            return StatsView(
+                measured=True,
+                model_id=model.model_id,
+                model_fingerprint=model.fingerprint,
+                stats=stats,
+                reason=(
+                    "Legacy embedded capability evidence is present; "
+                    "no raw receipt/profile metadata is attached."
+                ),
+            )
+        return StatsView(
+            model_id=model.model_id,
+            model_fingerprint=model.fingerprint,
+            stats=stats,
+            reason="Model has not been measured under a frozen capability scale.",
+        )
+
+    stats = _empty_stats()
+    for item in profile["stats"]:
+        axis = str(item.get("axis", "")).lower()
+        value = item.get("value")
+        if axis in stats and isinstance(value, (int, float)) and not isinstance(value, bool):
+            stats[axis] = float(value)
+
+    return StatsView(
+        measured=any(value is not None for value in stats.values()),
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        profile_id=profile["profile_id"],
+        scale_id=profile["scale_id"],
+        scale_version=profile["scale_version"],
+        scale_hash=profile["scale_hash"],
+        receipt_id=profile["receipt_id"],
+        receipt_sha256=profile["receipt_sha256"],
+        evaluator_id=profile["evaluator_id"],
+        evaluator_version=profile["evaluator_version"],
+        stats=stats,
+        raw_measurements=profile["measurements"],
+        conditions=profile["conditions"],
+    )
+
+
+def ingest_stats(
+    root: Path,
+    *,
+    receipt_path: Path,
+    scale_path: Path,
+) -> StatsView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before ingesting evaluation evidence.",
+            10,
+        )
+
+    receipt = load_evaluation_receipt(receipt_path)
+    scale = load_capability_scale(scale_path)
+    model = registry.get_model(receipt.model_id)
+
+    if receipt.model_fingerprint != model.fingerprint:
+        raise FrontierwrightError(
+            "EVALUATION_FINGERPRINT_MISMATCH",
+            "Evaluation receipt fingerprint does not match the referenced model.",
+            12,
+        )
+
+    stats = apply_scale(receipt, scale)
+    registry.activate_capability_profile(receipt, scale, stats)
+    return get_stats_view(root, receipt.model_id)
+
+
+def get_resource_view(root: Path) -> ResourceView:
+    registry = Registry(root)
+    if not registry.exists:
+        return ResourceView()
+    state = registry.read()
+    profile = state.resource_profile
+    if profile is None:
+        return ResourceView()
+    return ResourceView(
+        available=True,
+        profile_id=profile["profile_id"],
+        profile_name=profile["profile_name"],
+        provenance=profile["provenance"],
+        detected_at=profile["created_at"],
+        snapshot=profile["snapshot"],
+    )
+
+
+def detect_resources(root: Path) -> ResourceView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before detecting project resources.",
+            10,
+        )
+    snapshot = detect_local_resources(root)
+    registry.save_resource_snapshot(snapshot, profile_name="local")
+    return get_resource_view(root)
+
+
+def import_local_model(
+    root: Path,
+    source: Path,
+    *,
+    origin: ModelOrigin = ModelOrigin.IMPORTED_LOCAL,
+    project_name: str | None = None,
+    language: str = "en",
+    history_manifest: Path | None = None,
+) -> StatusView:
+    if origin is ModelOrigin.ZERO:
+        raise FrontierwrightError(
+            "INVALID_IMPORT_ORIGIN",
+            "Local model import origin must be IMPORTED_LOCAL or INTERNAL_LAB.",
+            2,
+        )
+
+    descriptor = inspect_local_model(source)
+    evidence = discover_history_evidence(
+        descriptor,
+        manifest_path=history_manifest,
+    )
+
+    registry = Registry(root)
+    if not registry.exists:
+        name = project_name or descriptor.source_path.stem or "Imported Model"
+        registry.initialize(name, origin, language=language)
+
+    state = registry.read()
+    project_origin = ModelOrigin(state.project["origin"])
+    if project_origin is not origin:
+        raise FrontierwrightError(
+            "ORIGIN_MISMATCH",
+            f"Project origin is {project_origin.value}, not {origin.value}.",
+            13,
+        )
+
+    model = ModelState(
+        model_id=f"model-{uuid4().hex}",
+        identity_id=state.project["identity_id"],
+        origin=origin,
+        checkpoint=str(descriptor.source_path),
+        fingerprint=descriptor.fingerprint,
+        stats=(),
+        model_format=descriptor.model_format,
+        trainable=descriptor.trainable,
+    )
+    registry.set_initial_imported_model(model, descriptor, evidence)
+    return get_status(root)
+
+
+def _axis_pairs(values: dict[str, int]) -> tuple[tuple[Axis, int], ...]:
+    pairs: list[tuple[Axis, int]] = []
+    for raw_axis, value in values.items():
+        try:
+            axis = Axis(raw_axis.upper())
+        except ValueError as exc:
+            raise FrontierwrightError(
+                "INVALID_AXIS",
+                f"Unknown capability axis: {raw_axis}",
+                2,
+            ) from exc
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise FrontierwrightError(
+                "INVALID_BUILD_VALUE",
+                f"Build value for {raw_axis} must be an integer.",
+                2,
+            )
+        pairs.append((axis, value))
+    return tuple(sorted(pairs, key=lambda item: item[0].value))
+
+
+def get_build_view(root: Path) -> BuildView:
+    registry = Registry(root)
+    if not registry.exists:
+        return BuildView(reason="Project is not initialized.")
+
+    state = registry.read()
+    profile_measured = bool(
+        state.capability_profile is not None
+        and state.capability_profile.get("stats")
+    )
+    if profile_measured:
+        mode = BuildMode.TARGETS_FLOORS
+    else:
+        mode = build_mode(ModelOrigin(state.project["origin"]), state.champion)
+    saved = state.build_state
+
+    if mode is BuildMode.NOT_READY:
+        return BuildView(
+            mode=mode.value,
+            reason="Evaluate the inserted model before setting numeric targets/floors.",
+        )
+
+    if mode is BuildMode.INTENT:
+        if saved is not None and saved.get("mode") == BuildMode.INTENT.value:
+            return BuildView(
+                mode=mode.value,
+                configured=True,
+                archetype=saved.get("archetype"),
+                priorities=saved.get("priorities", {}),
+            )
+        return BuildView(
+            mode=mode.value,
+            configured=False,
+            archetype="Balanced",
+            reason="Choose a build direction before meaningful stats exist.",
+        )
+
+    if saved is not None and saved.get("mode") == BuildMode.TARGETS_FLOORS.value:
+        return BuildView(
+            mode=mode.value,
+            configured=True,
+            targets=saved.get("targets", {}),
+            floors=saved.get("floors", {}),
+        )
+    return BuildView(
+        mode=mode.value,
+        configured=False,
+        reason="Set numeric targets/floors relative to current measured stats.",
+    )
+
+
+def set_build_intent(
+    root: Path,
+    *,
+    archetype: str,
+    priorities: dict[str, int],
+) -> BuildView:
+    registry = Registry(root)
+    try:
+        intent = BuildIntent(archetype=archetype, priorities=_axis_pairs(priorities))
+    except ValueError as exc:
+        raise FrontierwrightError("INVALID_BUILD", str(exc), 2) from exc
+    registry.set_build_intent(intent)
+    return get_build_view(root)
+
+
+def set_build_targets(
+    root: Path,
+    *,
+    targets: dict[str, int],
+    floors: dict[str, int],
+) -> BuildView:
+    registry = Registry(root)
+    try:
+        build = BuildTargets(
+            targets=_axis_pairs(targets),
+            floors=_axis_pairs(floors),
+        )
+    except ValueError as exc:
+        raise FrontierwrightError("INVALID_BUILD", str(exc), 2) from exc
+    registry.set_build_targets(build)
+    return get_build_view(root)
+
+
+def get_data_view(root: Path) -> DataView:
+    registry = Registry(root)
+    if not registry.exists:
+        return DataView()
+
+    state = registry.read()
+    datasets: list[dict[str, object]] = []
+    for item in state.datasets:
+        datasets.append(
+            {
+                "dataset_id": item["dataset_id"],
+                "name": item["name"],
+                "role": item["role"],
+                "provenance": item["provenance"],
+                "source_path": item["source_path"],
+                "fingerprint": item["fingerprint"],
+                "total_bytes": item["total_bytes"],
+                "file_count": item["file_count"],
+                "license": item["license"],
+                "domain": item["domain"],
+                "language": item["language"],
+                "token_count": item["token_count"],
+            }
+        )
+    return DataView(datasets=datasets)
+
+
+def add_local_dataset(
+    root: Path,
+    source: Path,
+    *,
+    name: str,
+    role: DatasetRole,
+    license_name: str | None = None,
+    domain: str | None = None,
+    language: str | None = None,
+    token_count: int | None = None,
+) -> DataView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before registering data.",
+            10,
+        )
+    descriptor = inspect_local_dataset(source)
+    registry.register_dataset(
+        descriptor,
+        name=name,
+        role=role,
+        provenance=DatasetProvenance.LOCAL_USER,
+        license_name=license_name,
+        domain=domain,
+        language=language,
+        token_count=token_count,
+    )
+    return get_data_view(root)
+
+
+def _required_dataset_role(path_id: TrainingPathId) -> DatasetRole:
+    if path_id in (
+        TrainingPathId.FROM_SCRATCH_PRETRAINING,
+        TrainingPathId.CONTINUED_PRETRAINING,
+    ):
+        return DatasetRole.PRETRAIN
+    return DatasetRole.SFT
+
+
+def _write_state_json(path: Path, payload: dict[str, object]) -> None:
+    try:
+        atomic_write_json(path, payload)
+    except OSError as exc:
+        raise FrontierwrightError(
+            "STATE_FILE_ERROR",
+            f"Could not atomically publish state file: {path}",
+            4,
+        ) from exc
+
+
+def _find_dataset(
+    datasets: tuple[dict[str, object], ...],
+    *,
+    dataset_id: str | None,
+    role: DatasetRole,
+) -> dict[str, object]:
+    matching = [item for item in datasets if item.get("role") == role.value]
+    if dataset_id is not None:
+        for item in matching:
+            if item.get("dataset_id") == dataset_id:
+                return item
+        raise FrontierwrightError(
+            "DATASET_NOT_FOUND",
+            f"Active {role.value} dataset not found: {dataset_id}",
+            3,
+        )
+    if not matching:
+        raise FrontierwrightError(
+            "DATASET_REQUIRED",
+            f"{role.value} dataset is required for this path.",
+            12,
+        )
+    if len(matching) > 1:
+        raise FrontierwrightError(
+            "DATASET_AMBIGUOUS",
+            f"Multiple {role.value} datasets are registered; choose --dataset explicitly.",
+            2,
+        )
+    return matching[0]
+
+
+def _plan_input_blockers(
+    state: ProjectState,
+    plan: TrainingPlan,
+) -> list[str]:
+    blockers: list[str] = []
+    project_state = state
+
+    champion = project_state.champion
+    if plan.model_id is None:
+        if champion is not None:
+            blockers.append("current champion changed since plan creation")
+    else:
+        if champion is None:
+            blockers.append("planned champion no longer exists")
+        elif (
+            champion.model.model_id != plan.model_id
+            or champion.model.fingerprint != plan.model_fingerprint
+        ):
+            blockers.append("current champion differs from the model pinned by the plan")
+        else:
+            artifact = project_state.champion_artifact
+            if artifact is not None:
+                source = artifact.get("source_path")
+                if isinstance(source, str):
+                    try:
+                        current = inspect_local_model(Path(source))
+                    except FrontierwrightError:
+                        blockers.append("pinned model artifacts are no longer readable")
+                    else:
+                        if current.fingerprint != plan.model_fingerprint:
+                            blockers.append("pinned model content fingerprint drifted")
+
+    dataset = next(
+        (
+            item
+            for item in project_state.datasets
+            if item.get("dataset_id") == plan.dataset_id
+        ),
+        None,
+    )
+    if dataset is None:
+        blockers.append("planned dataset is no longer active")
+    else:
+        if dataset.get("fingerprint") != plan.dataset_fingerprint:
+            blockers.append("planned dataset registry fingerprint changed")
+        source = dataset.get("source_path")
+        if isinstance(source, str):
+            try:
+                current_data = inspect_local_dataset(Path(source))
+            except FrontierwrightError:
+                blockers.append("planned dataset files are no longer readable")
+            else:
+                if current_data.fingerprint != plan.dataset_fingerprint:
+                    blockers.append("planned dataset content fingerprint drifted")
+
+    if plan.resource_profile_id is not None:
+        profile = project_state.resource_profile
+        if profile is None or profile.get("profile_id") != plan.resource_profile_id:
+            blockers.append("active resource profile differs from the plan")
+    return blockers
+
+
+def _calibration_budget_blockers(
+    plan: TrainingPlan,
+    calibration: dict[str, object] | None,
+    resource_profile: dict[str, object] | None,
+) -> list[str]:
+    if calibration is None:
+        return ["representative calibration required"]
+    if calibration.get("feasible") is not True:
+        return ["latest calibration reported infeasible"]
+
+    blockers: list[str] = []
+    if calibration.get("tokens_per_second") is None:
+        blockers.append("calibration did not measure tokens_per_second")
+    if calibration.get("projected_wall_seconds") is None:
+        blockers.append("calibration did not project total wall time")
+    if calibration.get("projected_storage_bytes") is None:
+        blockers.append("calibration did not project new storage")
+    if (
+        calibration.get("peak_vram_bytes") is None
+        and calibration.get("peak_ram_bytes") is None
+    ):
+        blockers.append("calibration did not measure peak memory")
+
+    budgets = plan.budgets
+    projected_wall = calibration.get("projected_wall_seconds")
+    projected_storage = calibration.get("projected_storage_bytes")
+
+    if (
+        budgets.max_wall_seconds is not None
+        and isinstance(projected_wall, (int, float))
+        and not isinstance(projected_wall, bool)
+        and float(projected_wall) > budgets.max_wall_seconds
+    ):
+        blockers.append("projected wall time exceeds max_wall_seconds budget")
+
+    if (
+        budgets.max_storage_bytes is not None
+        and isinstance(projected_storage, int)
+        and not isinstance(projected_storage, bool)
+        and projected_storage > budgets.max_storage_bytes
+    ):
+        blockers.append("projected storage exceeds max_storage_bytes budget")
+
+    backend_result = calibration.get("backend_result")
+    backend_map = backend_result if isinstance(backend_result, dict) else {}
+
+    if budgets.max_gpu_hours is not None:
+        gpu_count: int | None = None
+        reported_gpu_count = backend_map.get("gpu_count")
+        if (
+            isinstance(reported_gpu_count, int)
+            and not isinstance(reported_gpu_count, bool)
+            and reported_gpu_count > 0
+        ):
+            gpu_count = reported_gpu_count
+        elif resource_profile is not None:
+            snapshot = resource_profile.get("snapshot")
+            if isinstance(snapshot, dict):
+                gpus = snapshot.get("gpus")
+                if isinstance(gpus, list) and gpus:
+                    gpu_count = len(gpus)
+        if gpu_count is None:
+            blockers.append("GPU-hour budget cannot be enforced without GPU count")
+        elif not isinstance(projected_wall, (int, float)) or isinstance(projected_wall, bool):
+            blockers.append("GPU-hour budget cannot be enforced without projected wall time")
+        else:
+            projected_gpu_hours = float(projected_wall) * gpu_count / 3600.0
+            if projected_gpu_hours > budgets.max_gpu_hours:
+                blockers.append("projected GPU-hours exceed max_gpu_hours budget")
+
+    if budgets.max_money is not None:
+        projected_money = backend_map.get("projected_money")
+        if not isinstance(projected_money, (int, float)) or isinstance(
+            projected_money, bool
+        ):
+            blockers.append("money budget cannot be enforced without projected_money")
+        elif float(projected_money) > budgets.max_money:
+            blockers.append("projected money exceeds max_money budget")
+
+    return blockers
+
+
+def get_plan_view(root: Path, plan_id: str) -> PlanView:
+    registry = Registry(root)
+    plan = registry.get_plan(plan_id)
+    state = registry.read()
+    calibration = registry.latest_calibration_for_plan(plan.plan_id)
+    blockers = _plan_input_blockers(state, plan)
+    blockers.extend(
+        _calibration_budget_blockers(plan, calibration, state.resource_profile)
+    )
+    return PlanView(
+        plan_id=plan.plan_id,
+        path_id=plan.path_id.value,
+        backend_id=plan.backend_id,
+        backend_spec_hash=plan.backend_spec_hash,
+        model_id=plan.model_id,
+        dataset_id=plan.dataset_id,
+        resource_profile_id=plan.resource_profile_id,
+        permission=plan.permission.name,
+        budgets=plan.budgets.to_dict(),
+        config=plan.config,
+        idempotency_key=plan.idempotency_key,
+        calibration=calibration,
+        ready=not blockers,
+        blockers=list(dict.fromkeys(blockers)),
+    )
+
+
+def create_training_plan(
+    root: Path,
+    *,
+    path_id: TrainingPathId,
+    backend_spec_path: Path,
+    dataset_id: str | None,
+    permission: PermissionLevel,
+    budgets: HardBudgets,
+    config: dict[str, object],
+) -> PlanView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before creating a training plan.",
+            10,
+        )
+    backend = load_command_backend_spec(backend_spec_path)
+    if path_id not in backend.supported_paths:
+        raise FrontierwrightError(
+            "BACKEND_PATH_UNSUPPORTED",
+            f"Backend {backend.backend_id} does not support {path_id.value}.",
+            12,
+        )
+
+    paths = get_paths_view(root)
+    assessment = next(
+        (item for item in paths.paths if item.get("path_id") == path_id.value),
+        None,
+    )
+    if assessment is None:
+        raise FrontierwrightError("PATH_NOT_FOUND", "Training path does not exist.", 3)
+    if assessment.get("availability") == PathAvailability.LOCKED.value:
+        blockers = assessment.get("blockers")
+        raise FrontierwrightError(
+            "PATH_LOCKED",
+            f"Training path is locked: {blockers}",
+            12,
+        )
+
+    state = registry.read()
+    dataset = _find_dataset(
+        state.datasets,
+        dataset_id=dataset_id,
+        role=_required_dataset_role(path_id),
+    )
+
+    try:
+        key = compute_plan_idempotency_key(
+            path_id=path_id,
+            backend_id=backend.backend_id,
+            backend_spec_hash=backend.sha256,
+            model_fingerprint=(
+                state.champion.model.fingerprint if state.champion is not None else None
+            ),
+            dataset_fingerprint=str(dataset["fingerprint"]),
+            resource_profile_id=(
+                str(state.resource_profile["profile_id"])
+                if state.resource_profile is not None
+                else None
+            ),
+            permission=permission,
+            budgets=budgets,
+            config=config,
+        )
+    except (TypeError, ValueError) as exc:
+        raise FrontierwrightError(
+            "INVALID_PLAN_CONFIG",
+            f"Plan config must be finite JSON-compatible data: {exc}",
+            2,
+        ) from exc
+
+    plan = TrainingPlan(
+        plan_id=f"plan-{uuid4().hex}",
+        path_id=path_id,
+        backend_id=backend.backend_id,
+        backend_spec_hash=backend.sha256,
+        model_id=state.champion.model.model_id if state.champion is not None else None,
+        model_fingerprint=(
+            state.champion.model.fingerprint if state.champion is not None else None
+        ),
+        model_source_path=(
+            str(state.champion_artifact["source_path"])
+            if state.champion is not None
+            and state.champion_artifact is not None
+            and isinstance(state.champion_artifact.get("source_path"), str)
+            else (
+                state.champion.model.checkpoint
+                if state.champion is not None
+                else None
+            )
+        ),
+        dataset_id=str(dataset["dataset_id"]),
+        dataset_fingerprint=str(dataset["fingerprint"]),
+        dataset_source_path=str(dataset["source_path"]),
+        resource_profile_id=(
+            str(state.resource_profile["profile_id"])
+            if state.resource_profile is not None
+            else None
+        ),
+        permission=permission,
+        budgets=budgets,
+        config=config,
+        idempotency_key=key,
+    )
+    stored = registry.store_plan(plan)
+    _write_state_json(
+        registry.state_dir / "plans" / f"{stored.plan_id}.json",
+        stored.request_payload(),
+    )
+    return get_plan_view(root, stored.plan_id)
+
+
+def _validate_backend_for_plan(
+    plan: TrainingPlan,
+    backend_spec_path: Path,
+) -> CommandBackendSpec:
+    backend = load_command_backend_spec(backend_spec_path)
+    if backend.backend_id != plan.backend_id:
+        raise FrontierwrightError(
+            "BACKEND_MISMATCH",
+            "Backend ID differs from the backend pinned by the plan.",
+            13,
+        )
+    if backend.sha256 != plan.backend_spec_hash:
+        raise FrontierwrightError(
+            "BACKEND_SPEC_DRIFT",
+            "Backend spec content changed after plan creation.",
+            13,
+        )
+    if plan.path_id not in backend.supported_paths:
+        raise FrontierwrightError(
+            "BACKEND_PATH_UNSUPPORTED",
+            f"Backend no longer supports {plan.path_id.value}.",
+            13,
+        )
+    return backend
+
+
+def calibrate_training_plan(
+    root: Path,
+    *,
+    plan_id: str,
+    backend_spec_path: Path,
+    timeout_seconds: float = 300.0,
+) -> PlanView:
+    registry = Registry(root)
+    plan = registry.get_plan(plan_id)
+    if plan.permission < PermissionLevel.DRY_RUN:
+        raise FrontierwrightError(
+            "PERMISSION_DENIED",
+            "Calibration requires DRY_RUN permission or higher.",
+            13,
+        )
+    state = registry.read()
+    blockers = _plan_input_blockers(state, plan)
+    if blockers:
+        raise FrontierwrightError(
+            "PLAN_INPUT_STALE",
+            "; ".join(blockers),
+            13,
+        )
+    backend = _validate_backend_for_plan(plan, backend_spec_path)
+
+    effective_timeout = timeout_seconds
+    if plan.budgets.max_wall_seconds is not None:
+        effective_timeout = min(effective_timeout, plan.budgets.max_wall_seconds)
+    if effective_timeout <= 0:
+        raise FrontierwrightError(
+            "INVALID_TIMEOUT",
+            "Calibration timeout must be positive.",
+            2,
+        )
+
+    calibration_id = f"calibration-{uuid4().hex}"
+    request_path = (
+        registry.state_dir
+        / "profiles"
+        / "calibrations"
+        / f"{calibration_id}-request.json"
+    )
+    receipt = run_calibration_backend(
+        backend,
+        plan,
+        request_path=request_path,
+        calibration_id=calibration_id,
+        timeout_seconds=effective_timeout,
+    )
+    registry.store_calibration(receipt)
+    _write_state_json(
+        registry.state_dir / "profiles" / "calibrations" / f"{calibration_id}.json",
+        asdict(receipt),
+    )
+    return get_plan_view(root, plan_id)
+
+
+def _run_timeout_seconds(
+    plan: TrainingPlan,
+    calibration: dict[str, object],
+    resource_profile: dict[str, object] | None,
+    requested: float,
+) -> float:
+    timeout = requested
+    if plan.budgets.max_wall_seconds is not None:
+        timeout = min(timeout, plan.budgets.max_wall_seconds)
+
+    if plan.budgets.max_gpu_hours is not None:
+        backend_result = calibration.get("backend_result")
+        backend_map = backend_result if isinstance(backend_result, dict) else {}
+        gpu_count: int | None = None
+        reported = backend_map.get("gpu_count")
+        if isinstance(reported, int) and not isinstance(reported, bool) and reported > 0:
+            gpu_count = reported
+        elif resource_profile is not None:
+            snapshot = resource_profile.get("snapshot")
+            if isinstance(snapshot, dict):
+                gpus = snapshot.get("gpus")
+                if isinstance(gpus, list) and gpus:
+                    gpu_count = len(gpus)
+        if gpu_count is not None:
+            timeout = min(
+                timeout,
+                plan.budgets.max_gpu_hours * 3600.0 / gpu_count,
+            )
+    return timeout
+
+
+def get_run_view(root: Path, run_id: str) -> RunView:
+    run = Registry(root).get_run(run_id)
+    return RunView(
+        run_id=run["run_id"],
+        plan_id=run["plan_id"],
+        status=run["status"],
+        candidate_model_id=run["candidate_model_id"],
+        metrics=run["metrics"],
+        error_code=run["error_code"],
+        error_message=run["error_message"],
+        liveness_state=run.get("liveness_state"),
+        calibration_id=run.get("calibration_id"),
+        request_digest=run.get("request_digest"),
+        result_evidence_available=run.get("result") is not None,
+    )
+
+
+def _deterministic_candidate_id(run_id: str, fingerprint: str) -> str:
+    digest = hashlib.sha256(f"{run_id}\0{fingerprint}".encode()).hexdigest()
+    return f"model-{digest[:32]}"
+
+
+def _validate_executor_result(
+    run: dict[str, object],
+    result: dict[str, object],
+) -> None:
+    if result.get("schema_version") != 1:
+        raise FrontierwrightError(
+            "RUN_RESULT_INVALID",
+            "Executor result schema_version must be 1.",
+            14,
+        )
+    for key in ("run_id", "plan_id", "calibration_id", "request_digest"):
+        if result.get(key) != run.get(key):
+            raise FrontierwrightError(
+                "RUN_RESULT_BINDING_MISMATCH",
+                f"Executor result {key} does not match the durable attempt.",
+                14,
+            )
+
+
+def _publish_run_receipt(root: Path, run_id: str) -> None:
+    registry = Registry(root)
+    view = get_run_view(root, run_id)
+    _write_state_json(
+        registry.state_dir / "runs" / f"{run_id}.json",
+        view.to_dict(),
+    )
+
+
+def repair_run_receipt(root: Path, run_id: str) -> RunView:
+    view = get_run_view(root, run_id)
+    _publish_run_receipt(root, run_id)
+    return view
+
+
+def reconcile_training_run(root: Path, run_id: str) -> RunView:
+    registry = Registry(root)
+    run = registry.get_run(run_id)
+    status = RunStatus(run["status"])
+    if status is not RunStatus.RUNNING:
+        return get_run_view(root, run_id)
+
+    attempt = registry.get_run_attempt(run_id)
+    if attempt is None:
+        registry.finish_run_failure(
+            run_id,
+            status=RunStatus.INCOMPLETE,
+            error_code="RUN_ATTEMPT_METADATA_MISSING",
+            error_message="RUNNING attempt has no durable executor metadata.",
+        )
+        return get_run_view(root, run_id)
+
+    result = attempt.get("result")
+    result_path_raw = attempt.get("result_path")
+    result_path = (
+        Path(result_path_raw)
+        if isinstance(result_path_raw, str) and result_path_raw
+        else None
+    )
+
+    if result is None and result_path is not None and result_path.is_file():
+        try:
+            loaded = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise FrontierwrightError(
+                "RUN_RESULT_INVALID",
+                "Executor result evidence is not valid UTF-8 JSON.",
+                14,
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise FrontierwrightError(
+                "RUN_RESULT_INVALID",
+                "Executor result evidence must be an object.",
+                14,
+            )
+        result = loaded
+        _validate_executor_result(run, result)
+        registry.record_run_result_evidence(
+            run_id,
+            result_path=str(result_path),
+            result_sha256=file_sha256(result_path),
+            result=result,
+        )
+        run = registry.get_run(run_id)
+        attempt = registry.get_run_attempt(run_id)
+        if attempt is None:
+            raise FrontierwrightError(
+                "RUN_ATTEMPT_NOT_FOUND",
+                "Run attempt metadata disappeared after evidence persistence.",
+                4,
+            )
+    elif isinstance(result, dict):
+        _validate_executor_result(run, result)
+
+    if isinstance(result, dict):
+        if result.get("ok") is not True:
+            error = result.get("error")
+            error_map = error if isinstance(error, dict) else {}
+            code = str(error_map.get("code") or "BACKEND_FAILED")
+            message = str(error_map.get("message") or "Executor reported failure.")
+            terminal_status = (
+                RunStatus.INCOMPLETE
+                if code in {"BACKEND_TIMEOUT", "EXECUTOR_LOST", "STORAGE_BUDGET_REACHED"}
+                else RunStatus.FAILED
+            )
+            registry.finish_run_failure(
+                run_id,
+                status=terminal_status,
+                error_code=code,
+                error_message=message,
+            )
+            return get_run_view(root, run_id)
+
+        output = result.get("output_model_path")
+        metrics = result.get("metrics", {})
+        if not isinstance(output, str) or not output:
+            raise FrontierwrightError(
+                "RUN_RESULT_INVALID",
+                "Successful executor result lacks output_model_path.",
+                14,
+            )
+        if not isinstance(metrics, dict):
+            raise FrontierwrightError(
+                "RUN_RESULT_INVALID",
+                "Successful executor result metrics must be an object.",
+                14,
+            )
+
+        plan = registry.get_plan(str(run["plan_id"]))
+        descriptor = inspect_local_model(Path(output))
+        if (
+            plan.budgets.max_storage_bytes is not None
+            and descriptor.total_bytes > plan.budgets.max_storage_bytes
+        ):
+            registry.finish_run_failure(
+                run_id,
+                status=RunStatus.INCOMPLETE,
+                error_code="STORAGE_BUDGET_REACHED",
+                error_message="Candidate output exceeds max_storage_bytes budget.",
+            )
+            return get_run_view(root, run_id)
+
+        state = registry.read()
+        candidate = ModelState(
+            model_id=_deterministic_candidate_id(run_id, descriptor.fingerprint),
+            identity_id=state.project["identity_id"],
+            origin=ModelOrigin(state.project["origin"]),
+            checkpoint=str(descriptor.source_path),
+            fingerprint=descriptor.fingerprint,
+            parent_model_id=plan.model_id,
+            stats=(),
+            model_format=descriptor.model_format,
+            trainable=descriptor.trainable,
+        )
+        registry.register_training_candidate(
+            candidate,
+            descriptor,
+            run_id=run_id,
+            metrics=dict(metrics),
+        )
+        return get_run_view(root, run_id)
+
+    worker_pid = attempt.get("worker_pid")
+    worker_start_token = attempt.get("worker_start_token")
+    pid = worker_pid if isinstance(worker_pid, int) else None
+    token = worker_start_token if isinstance(worker_start_token, str) else None
+
+    if attempt.get("liveness_state") == "RESERVED" and pid is None:
+        registry.finish_run_failure(
+            run_id,
+            status=RunStatus.INCOMPLETE,
+            error_code="EXECUTOR_NOT_LAUNCHED",
+            error_message="Attempt was reserved but no local worker was attached.",
+        )
+        return get_run_view(root, run_id)
+
+    liveness = process_liveness(pid, token)
+    if liveness == "LIVE":
+        registry.set_run_liveness(run_id, "LIVE")
+        return get_run_view(root, run_id)
+    if liveness == "DEAD":
+        registry.finish_run_failure(
+            run_id,
+            status=RunStatus.INCOMPLETE,
+            error_code="EXECUTOR_LOST",
+            error_message="Local worker exited without durable terminal result evidence.",
+        )
+        return get_run_view(root, run_id)
+
+    registry.set_run_liveness(run_id, "UNRESOLVED")
+    return get_run_view(root, run_id)
+
+
+def execute_training_plan(
+    root: Path,
+    *,
+    plan_id: str,
+    backend_spec_path: Path,
+    dry_run: bool,
+    rerun: bool,
+    timeout_seconds: float = 86400.0,
+) -> RunView:
+    registry = Registry(root)
+    plan = registry.get_plan(plan_id)
+
+    if not dry_run:
+        latest = registry.latest_run_for_plan(plan.plan_id)
+        if latest is not None:
+            latest_status = RunStatus(latest["status"])
+            if not rerun:
+                if latest_status is RunStatus.COMPLETED:
+                    view = get_run_view(root, str(latest["run_id"]))
+                    try:
+                        _publish_run_receipt(root, str(latest["run_id"]))
+                    except FrontierwrightError:
+                        pass
+                    return view
+                if latest_status is RunStatus.RUNNING:
+                    reconciled = reconcile_training_run(root, str(latest["run_id"]))
+                    if reconciled.status in {
+                        RunStatus.RUNNING.value,
+                        RunStatus.COMPLETED.value,
+                    }:
+                        try:
+                            _publish_run_receipt(root, str(latest["run_id"]))
+                        except FrontierwrightError:
+                            pass
+                        return reconciled
+                    raise FrontierwrightError(
+                        "RUN_RERUN_REQUIRED",
+                        "Previous attempt became terminal; use --rerun to create a new attempt.",
+                        13,
+                    )
+                raise FrontierwrightError(
+                    "RUN_RERUN_REQUIRED",
+                    "Previous attempt is terminal without success; use --rerun to retry.",
+                    13,
+                )
+
+            if latest_status is RunStatus.RUNNING:
+                reconciled = reconcile_training_run(root, str(latest["run_id"]))
+                if reconciled.status == RunStatus.RUNNING.value:
+                    raise FrontierwrightError(
+                        "RUN_ACTIVE",
+                        "Cannot rerun while the prior attempt is live or unresolved.",
+                        13,
+                    )
+
+    required_permission = (
+        PermissionLevel.DRY_RUN if dry_run else PermissionLevel.EXECUTE_SINGLE
+    )
+    if plan.permission < required_permission:
+        raise FrontierwrightError(
+            "PERMISSION_DENIED",
+            f"Operation requires {required_permission.name} permission or higher.",
+            13,
+        )
+
+    state = registry.read()
+    input_blockers = _plan_input_blockers(state, plan)
+    if input_blockers:
+        raise FrontierwrightError(
+            "PLAN_INPUT_STALE",
+            "; ".join(input_blockers),
+            13,
+        )
+    _validate_backend_for_plan(plan, backend_spec_path)
+    calibration = registry.latest_calibration_for_plan(plan.plan_id)
+    budget_blockers = _calibration_budget_blockers(
+        plan,
+        calibration,
+        state.resource_profile,
+    )
+    if budget_blockers:
+        raise FrontierwrightError(
+            "PLAN_NOT_READY",
+            "; ".join(budget_blockers),
+            13,
+        )
+    assert calibration is not None
+
+    if dry_run:
+        return RunView(
+            plan_id=plan.plan_id,
+            status="DRY_RUN",
+            dry_run=True,
+        )
+
+    if timeout_seconds <= 0:
+        raise FrontierwrightError("INVALID_TIMEOUT", "Run timeout must be positive.", 2)
+
+    calibration_id = calibration.get("calibration_id")
+    if not isinstance(calibration_id, str) or not calibration_id:
+        raise FrontierwrightError(
+            "CALIBRATION_INVALID",
+            "Latest calibration lacks a durable calibration_id.",
+            14,
+        )
+    request_digest = compute_execution_request_digest(
+        plan,
+        calibration_id=calibration_id,
+    )
+
+    run_id, existing = registry.start_run(
+        plan.plan_id,
+        rerun=rerun,
+        calibration_id=calibration_id,
+        request_digest=request_digest,
+        owner_pid=os.getpid(),
+    )
+    if existing:
+        existing_view = get_run_view(root, run_id)
+        if existing_view.status == RunStatus.RUNNING.value:
+            existing_view = reconcile_training_run(root, run_id)
+        return existing_view
+
+    effective_timeout = _run_timeout_seconds(
+        plan,
+        calibration,
+        state.resource_profile,
+        timeout_seconds,
+    )
+    attempt_path = registry.state_dir / "runs" / f"{run_id}-attempt.json"
+    request_path = registry.state_dir / "runs" / f"{run_id}-backend-request.json"
+    result_path = registry.state_dir / "runs" / f"{run_id}-executor-result.json"
+    output_root = registry.state_dir / "candidates" / run_id
+    attempt = LocalAttemptSpec(
+        project_root=registry.root,
+        run_id=run_id,
+        plan_id=plan.plan_id,
+        calibration_id=calibration_id,
+        backend_spec_path=backend_spec_path.resolve(),
+        request_path=request_path,
+        output_root=output_root,
+        result_path=result_path,
+        request_digest=request_digest,
+        timeout_seconds=effective_timeout,
+    )
+
+    try:
+        atomic_write_json(attempt_path, attempt.to_dict())
+        worker = launch_worker(attempt_path)
+        start_token = process_start_token(worker.pid)
+        registry.attach_run_worker(
+            run_id,
+            worker_pid=worker.pid,
+            worker_start_token=start_token,
+            result_path=str(result_path),
+        )
+    except (OSError, FrontierwrightError) as exc:
+        code = exc.code if isinstance(exc, FrontierwrightError) else "EXECUTOR_LAUNCH_FAILED"
+        registry.finish_run_failure(
+            run_id,
+            status=RunStatus.FAILED,
+            error_code=code,
+            error_message=str(exc),
+        )
+        raise
+
+    try:
+        worker.wait(timeout=effective_timeout + 15.0)
+    except subprocess.TimeoutExpired:
+        try:
+            terminate_worker_tree(worker)
+        except FrontierwrightError:
+            registry.set_run_liveness(run_id, "UNRESOLVED")
+            return get_run_view(root, run_id)
+
+    reconciled = reconcile_training_run(root, run_id)
+    try:
+        _publish_run_receipt(root, run_id)
+    except FrontierwrightError:
+        # SQLite and durable executor evidence are authoritative. Receipt export
+        # is repairable and must never downgrade a committed outcome.
+        pass
+
+    if reconciled.status in {RunStatus.FAILED.value, RunStatus.INCOMPLETE.value}:
+        raise FrontierwrightError(
+            reconciled.error_code or "RUN_FAILED",
+            reconciled.error_message or "Training attempt did not complete.",
+            14,
+        )
+    return reconciled
+
+
+def get_candidates_view(root: Path) -> CandidateView:
+    registry = Registry(root)
+    if not registry.exists:
+        return CandidateView()
+
+    state = registry.read()
+    items: list[dict[str, object]] = []
+    for candidate in state.candidates:
+        stats = get_stats_view(root, candidate.model.model_id)
+        run = next(
+            (
+                item
+                for item in reversed(state.runs)
+                if item.get("candidate_model_id") == candidate.model.model_id
+            ),
+            None,
+        )
+        plan = None
+        if run is not None:
+            plan_id = run.get("plan_id")
+            plan = next(
+                (item for item in state.plans if item.get("plan_id") == plan_id),
+                None,
+            )
+        items.append(
+            {
+                "model_id": candidate.model.model_id,
+                "parent_model_id": candidate.model.parent_model_id,
+                "status": candidate.status.value,
+                "fingerprint": candidate.model.fingerprint,
+                "model_format": candidate.model.model_format.value,
+                "trainable": candidate.model.trainable,
+                "measured": stats.measured,
+                "stats": stats.stats,
+                "scale_id": stats.scale_id,
+                "scale_version": stats.scale_version,
+                "scale_hash": stats.scale_hash,
+                "run_id": run.get("run_id") if run is not None else None,
+                "path_id": plan.get("path_id") if plan is not None else None,
+            }
+        )
+    return CandidateView(candidates=items)
+
+
+def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
+    registry = Registry(root)
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required for candidate comparison.",
+            12,
+        )
+    candidate = registry.get_candidate(candidate_model_id)
+    champion_stats = get_stats_view(root, state.champion.model.model_id)
+    candidate_stats = get_stats_view(root, candidate.model.model_id)
+
+    comparable = bool(
+        champion_stats.measured
+        and candidate_stats.measured
+        and champion_stats.scale_hash is not None
+        and champion_stats.scale_hash == candidate_stats.scale_hash
+    )
+    if comparable:
+        scale_reason = "Champion and candidate use the same frozen capability scale."
+    elif not champion_stats.measured:
+        scale_reason = "Champion is not measured under a frozen capability scale."
+    elif not candidate_stats.measured:
+        scale_reason = "Candidate is not measured under a frozen capability scale."
+    elif champion_stats.scale_hash is None or candidate_stats.scale_hash is None:
+        scale_reason = "At least one model lacks comparable frozen-scale provenance."
+    else:
+        scale_reason = "Champion and candidate use different frozen capability scales."
+
+    deltas = _empty_stats()
+    if comparable:
+        for axis in deltas:
+            champion_value = champion_stats.stats.get(axis)
+            candidate_value = candidate_stats.stats.get(axis)
+            if champion_value is not None and candidate_value is not None:
+                deltas[axis] = candidate_value - champion_value
+
+    constraints: list[dict[str, object]] = []
+    build = state.build_state
+    if build is not None and build.get("mode") == BuildMode.TARGETS_FLOORS.value:
+        for kind, values in (
+            ("FLOOR", build.get("floors", {})),
+            ("TARGET", build.get("targets", {})),
+        ):
+            if not isinstance(values, dict):
+                continue
+            for axis, threshold in sorted(values.items()):
+                value = candidate_stats.stats.get(str(axis))
+                if value is None:
+                    result = "UNKNOWN"
+                elif kind == "FLOOR":
+                    result = "PASS" if value >= float(threshold) else "FAIL"
+                else:
+                    result = "REACHED" if value >= float(threshold) else "NOT_REACHED"
+                constraints.append(
+                    {
+                        "axis": axis,
+                        "kind": kind,
+                        "threshold": threshold,
+                        "candidate_value": value,
+                        "status": result,
+                    }
+                )
+
+    run = next(
+        (
+            item
+            for item in reversed(state.runs)
+            if item.get("candidate_model_id") == candidate.model.model_id
+        ),
+        None,
+    )
+    calibration = None
+    if run is not None:
+        run_plan_id = run.get("plan_id")
+        calibration = next(
+            (
+                item
+                for item in reversed(state.calibrations)
+                if item.get("plan_id") == run_plan_id
+            ),
+            None,
+        )
+
+    return CompareView(
+        champion_model_id=state.champion.model.model_id,
+        candidate_model_id=candidate.model.model_id,
+        candidate_status=candidate.status.value,
+        scale_comparable=comparable,
+        scale_reason=scale_reason,
+        champion_stats=champion_stats.stats,
+        candidate_stats=candidate_stats.stats,
+        deltas=deltas,
+        build_constraints=constraints,
+        run=dict(run) if run is not None else None,
+        calibration=dict(calibration) if calibration is not None else None,
+    )
+
+
+def promote_candidate(
+    root: Path,
+    candidate_model_id: str,
+    *,
+    allow_unmeasured: bool = False,
+) -> StatusView:
+    registry = Registry(root)
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required before promotion.",
+            12,
+        )
+    candidate = registry.get_candidate(candidate_model_id)
+    if candidate.status is not CandidateStatus.PENDING:
+        raise FrontierwrightError(
+            "CANDIDATE_STATE_CONFLICT",
+            f"Only PENDING candidates can be promoted; current status is {candidate.status.value}.",
+            13,
+        )
+
+    candidate_stats = get_stats_view(root, candidate_model_id)
+    champion_stats = get_stats_view(root, state.champion.model.model_id)
+    if not candidate_stats.measured and not allow_unmeasured:
+        raise FrontierwrightError(
+            "CANDIDATE_NOT_MEASURED",
+            (
+                "Candidate must be evaluated before promotion; use "
+                "--allow-unmeasured explicitly to override."
+            ),
+            13,
+        )
+    if (
+        candidate_stats.measured
+        and champion_stats.measured
+        and not allow_unmeasured
+        and (
+            candidate_stats.scale_hash is None
+            or champion_stats.scale_hash is None
+            or candidate_stats.scale_hash != champion_stats.scale_hash
+        )
+    ):
+        raise FrontierwrightError(
+            "CAPABILITY_SCALE_MISMATCH",
+            "Champion and candidate must use the same frozen capability scale before promotion.",
+            13,
+        )
+
+    registry.promote_candidate(candidate_model_id)
+    return get_status(root)
+
+
+def reject_candidate(root: Path, candidate_model_id: str) -> CandidateView:
+    registry = Registry(root)
+    registry.reject_candidate(candidate_model_id)
+    return get_candidates_view(root)
+
+
+def get_history_view(root: Path) -> HistoryView:
+    registry = Registry(root)
+    if not registry.exists:
+        return HistoryView()
+    state = registry.read()
+    events = [
+        {
+            "sequence": event["sequence"],
+            "kind": event["kind"],
+            "recorded_at": event["recorded_at"],
+            "details": event["details"],
+        }
+        for event in state.history
+    ]
+    return HistoryView(events=events)
+
+
+def get_paths_view(root: Path) -> PathsView:
+    registry = Registry(root)
+    if not registry.exists:
+        return PathsView(recommendation_reason="Project is not initialized.")
+
+    state = registry.read()
+    origin = ModelOrigin(state.project["origin"])
+    confidence = HistoryConfidence(state.project["history_confidence"])
+    roles = frozenset(DatasetRole(item["role"]) for item in state.datasets)
+
+    context = PathContext(
+        origin=origin,
+        champion_present=state.champion is not None,
+        champion_trainable=(
+            state.champion.model.trainable if state.champion is not None else None
+        ),
+        history_confidence=confidence,
+        resource_profile_available=state.resource_profile is not None,
+        dataset_roles=roles,
+    )
+    assessments = assess_paths(context)
+
+    paths: list[dict[str, object]] = []
+    for item in assessments:
+        payload: dict[str, object] = {
+            "path_id": item.path_id.value,
+            "title": item.title,
+            "availability": item.availability.value,
+            "blockers": list(item.blockers),
+            "next_checks": list(item.next_checks),
+            "recommendation_eligible": item.recommendation_eligible,
+        }
+
+        if item.availability is PathAvailability.PLANNABLE:
+            for stored_plan in reversed(state.plans):
+                if stored_plan.get("path_id") != item.path_id.value:
+                    continue
+                plan_id = stored_plan.get("plan_id")
+                if not isinstance(plan_id, str):
+                    continue
+                try:
+                    plan_view = get_plan_view(root, plan_id)
+                except FrontierwrightError:
+                    continue
+                if not plan_view.ready:
+                    continue
+                payload["availability"] = PathAvailability.READY.value
+                payload["blockers"] = []
+                payload["next_checks"] = []
+                payload["ready_plan_id"] = plan_view.plan_id
+                payload["backend_id"] = plan_view.backend_id
+                payload["calibration"] = plan_view.calibration
+                break
+
+        paths.append(payload)
+
+    if not confidence.allows_recommendation:
+        recommendation_reason = (
+            "History-aware recommendation is withheld until history is COMPLETE or VERIFIED."
+        )
+    else:
+        recommendation_reason = (
+            "No effect/recommendation model is implemented yet; showing factual "
+            "path availability only."
+        )
+
+    return PathsView(
+        paths=paths,
+        recommended_path=None,
+        recommendation_reason=recommendation_reason,
+    )
+
+
+def build_mode_for(root: Path) -> BuildMode | None:
+    registry = Registry(root)
+    if not registry.exists:
+        return None
+    state = registry.read()
+    return build_mode(ModelOrigin(state.project["origin"]), state.champion)
