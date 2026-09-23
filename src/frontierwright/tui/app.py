@@ -214,10 +214,17 @@ class FrontierwrightApp(App[None]):
             return tr(self.language, "no_project")
         lines = [
             self.view.nickname or "?",
-            f"Origin: {self.view.origin}",
-            f"History: {self.view.history_confidence}",
-            f"State: {self.view.measurement_state}",
+            f"Edition: {self.view.edition_name or self.view.edition_profile or '?'}",
         ]
+        if self.view.edition_tagline:
+            lines.append(self.view.edition_tagline)
+        lines.extend(
+            [
+                f"Origin: {self.view.origin}",
+                f"History: {self.view.history_confidence}",
+                f"State: {self.view.measurement_state}",
+            ]
+        )
         if self.view.champion_model_id:
             lines.extend(
                 [

@@ -30,6 +30,7 @@ from frontierwright.domain import (
     build_mode,
     require_text,
 )
+from frontierwright.editions import EditionProfile, default_edition_for_origin
 from frontierwright.errors import FrontierwrightError
 from frontierwright.evaluations import CapabilityScale, EvaluationReceipt
 from frontierwright.execution import (
@@ -43,7 +44,7 @@ from frontierwright.models import HistoryEvidenceResult, ImportedModelDescriptor
 from frontierwright.paths import TrainingPathId
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -62,6 +63,8 @@ CREATE TABLE project (
     origin TEXT NOT NULL CHECK (origin IN ('ZERO','IMPORTED_LOCAL','INTERNAL_LAB')),
     history_confidence TEXT NOT NULL CHECK (
         history_confidence IN ('COMPLETE','VERIFIED','PARTIAL','UNKNOWN')),
+    edition_profile TEXT NOT NULL CHECK (
+        edition_profile IN ('STUDIO','ACADEMY','LAB')),
     created_at TEXT NOT NULL,
     champion_id TEXT REFERENCES models(model_id)
 );
@@ -416,6 +419,17 @@ CREATE TABLE sealed_artifacts (
 );
 """
 
+MIGRATION_9_TO_10 = """
+ALTER TABLE project ADD COLUMN edition_profile TEXT NOT NULL DEFAULT 'STUDIO'
+CHECK (edition_profile IN ('STUDIO','ACADEMY','LAB'));
+UPDATE project
+SET edition_profile = CASE origin
+    WHEN 'ZERO' THEN 'ACADEMY'
+    WHEN 'INTERNAL_LAB' THEN 'LAB'
+    ELSE 'STUDIO'
+END;
+"""
+
 
 def timestamp() -> str:
     return datetime.now(UTC).isoformat()
@@ -582,6 +596,23 @@ class Registry:
                 connection.commit()
                 version = 9
 
+            if version == 9:
+                project_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(project)")
+                }
+                if "edition_profile" not in project_columns:
+                    connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_9_TO_10)
+                else:
+                    connection.execute("BEGIN IMMEDIATE")
+                connection.execute("PRAGMA user_version = 10")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 9, "to_version": 10},
+                )
+                connection.commit()
+                version = 10
+
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
                     "UNSUPPORTED_SCHEMA",
@@ -640,10 +671,18 @@ class Registry:
                 4,
             ) from exc
 
-    def initialize(self, name: str, origin: ModelOrigin, *, language: str = "en") -> None:
+    def initialize(
+        self,
+        name: str,
+        origin: ModelOrigin,
+        *,
+        language: str = "en",
+        edition_profile: EditionProfile | None = None,
+    ) -> None:
         require_text(name, "name")
         if language not in {"en", "ko"}:
             raise FrontierwrightError("INVALID_LANGUAGE", "language must be 'en' or 'ko'", 2)
+        edition = edition_profile or default_edition_for_origin(origin)
 
         self.state_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -665,8 +704,12 @@ class Registry:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            created_at = timestamp()
             connection.execute(
-                "INSERT INTO project VALUES (1, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                "INSERT INTO project ("
+                "singleton, project_id, identity_id, name, language, origin, "
+                "history_confidence, edition_profile, created_at, champion_id"
+                ") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                 (
                     project_id,
                     identity_id,
@@ -674,7 +717,8 @@ class Registry:
                     language,
                     origin.value,
                     confidence.value,
-                    timestamp(),
+                    edition.value,
+                    created_at,
                 ),
             )
             self.event(
@@ -683,6 +727,7 @@ class Registry:
                 {
                     "origin": origin.value,
                     "history_confidence": confidence.value,
+                    "edition_profile": edition.value,
                     "language": language,
                 },
             )
@@ -699,20 +744,56 @@ class Registry:
             if "connection" in locals():
                 connection.close()
 
+        self._write_project_toml(
+            {
+                "project_id": project_id,
+                "identity_id": identity_id,
+                "name": name,
+                "language": language,
+                "origin": origin.value,
+                "edition_profile": edition.value,
+            }
+        )
+
+    def _write_project_toml(self, project: dict[str, Any]) -> None:
         (self.state_dir / "project.toml").write_text(
             "\n".join(
                 [
                     f"schema_version = {SCHEMA_VERSION}",
-                    f'project_id = "{project_id}"',
-                    f'identity_id = "{identity_id}"',
-                    f'name = {json.dumps(name, ensure_ascii=False)}',
-                    f'language = "{language}"',
-                    f'origin = "{origin.value}"',
+                    f'project_id = "{project["project_id"]}"',
+                    f'identity_id = "{project["identity_id"]}"',
+                    f'name = {json.dumps(project["name"], ensure_ascii=False)}',
+                    f'language = "{project["language"]}"',
+                    f'origin = "{project["origin"]}"',
+                    f'edition_profile = "{project["edition_profile"]}"',
                     "",
                 ]
             ),
             encoding="utf-8",
         )
+
+    def set_edition_profile(self, edition: EditionProfile) -> None:
+        with self.connect(write=True) as connection:
+            row = connection.execute(
+                "SELECT edition_profile FROM project WHERE singleton = 1"
+            ).fetchone()
+            if row is None:
+                raise FrontierwrightError("REGISTRY_ERROR", "Missing project metadata.", 4)
+            previous = EditionProfile(row["edition_profile"])
+            if previous is edition:
+                return
+            connection.execute(
+                "UPDATE project SET edition_profile = ? WHERE singleton = 1",
+                (edition.value,),
+            )
+            self.event(
+                connection,
+                "EDITION_PROFILE_CHANGED",
+                {"from": previous.value, "to": edition.value},
+            )
+
+        state = self.read()
+        self._write_project_toml(state.project)
 
     @staticmethod
     def event(connection: sqlite3.Connection, kind: str, details: dict[str, Any]) -> None:

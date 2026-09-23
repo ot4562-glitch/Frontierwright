@@ -25,6 +25,10 @@ def make_view() -> StatusView:
         project_name="NOVA",
         language="en",
         nickname="NOVA",
+        edition_profile="ACADEMY",
+        edition_name="Frontierwright Academy",
+        edition_tagline="Build an AI model from birth.",
+        edition_starting_point="BIRTH",
         origin="ZERO",
         history_confidence="COMPLETE",
         measurement_state="NOT_READY",
@@ -36,6 +40,8 @@ def make_view() -> StatusView:
 
 async def test_tui_starts_with_required_sections_and_keyboard_navigation() -> None:
     app = FrontierwrightApp(view=make_view(), language="en")
+    assert "Frontierwright Academy" in app._character_text()
+    assert "Build an AI model from birth." in app._character_text()
 
     async with app.run_test(size=(120, 40)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)

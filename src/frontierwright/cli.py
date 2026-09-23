@@ -13,6 +13,7 @@ from rich.console import Console
 
 from frontierwright.data import DatasetRole
 from frontierwright.domain import ModelOrigin
+from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
@@ -54,6 +55,7 @@ from frontierwright.service import (
     repair_run_receipt,
     set_build_intent,
     set_build_targets,
+    set_project_edition,
 )
 
 app = typer.Typer(
@@ -417,6 +419,10 @@ def _print_history(view: HistoryView) -> None:
 
 def _print_status(view: StatusView) -> None:
     console.print(f"[bold]{view.nickname}[/bold]")
+    if view.edition_name:
+        console.print(f"Edition: {view.edition_name}")
+        if view.edition_tagline:
+            console.print(view.edition_tagline)
     console.print(f"Origin: {view.origin}")
     console.print(f"History: {view.history_confidence}")
     if view.history_evidence_reason:
@@ -492,6 +498,14 @@ def project_init(
         str,
         typer.Option("--lang", help="Human UI language: en or ko."),
     ] = "en",
+    edition: Annotated[
+        EditionProfile | None,
+        typer.Option(
+            "--edition",
+            case_sensitive=False,
+            help="STUDIO, ACADEMY, or LAB. Defaults from origin.",
+        ),
+    ] = None,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Stable machine-readable JSON."),
@@ -507,7 +521,12 @@ def project_init(
 ) -> None:
     del non_interactive, yes
     try:
-        Registry(path).initialize(name, origin, language=language)
+        Registry(path).initialize(
+            name,
+            origin,
+            language=language,
+            edition_profile=edition,
+        )
         view = get_status(path)
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)
@@ -518,6 +537,51 @@ def project_init(
 
     console.print(f"[bold]Frontierwright[/bold] initialized: {view.project_name}")
     _print_status(view)
+
+
+@project_app.command("edition")
+def project_edition(
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    set_to: Annotated[
+        EditionProfile | None,
+        typer.Option(
+            "--set",
+            case_sensitive=False,
+            help="Change profile to STUDIO, ACADEMY, or LAB.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Stable machine-readable JSON."),
+    ] = False,
+    non_interactive: Annotated[
+        bool,
+        typer.Option("--non-interactive", help="Never prompt."),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Pre-authorize non-destructive confirmations."),
+    ] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = set_project_edition(path, set_to) if set_to is not None else get_status(path)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_status_payload(view))
+        return
+
+    if view.edition_name:
+        console.print(f"[bold]{view.edition_name}[/bold]")
+    if view.edition_tagline:
+        console.print(view.edition_tagline)
+    if view.edition_starting_point:
+        console.print(f"Starting point: {view.edition_starting_point}")
 
 
 @app.command("import")
@@ -546,6 +610,14 @@ def import_model(
             help="Optional frontierwright-lineage.json with verifiable evidence hashes.",
         ),
     ] = None,
+    edition: Annotated[
+        EditionProfile | None,
+        typer.Option(
+            "--edition",
+            case_sensitive=False,
+            help="STUDIO, ACADEMY, or LAB when creating the project.",
+        ),
+    ] = None,
     language: Annotated[str, typer.Option("--lang")] = "en",
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
@@ -560,6 +632,7 @@ def import_model(
             project_name=name,
             language=language,
             history_manifest=history_manifest,
+            edition_profile=edition,
         )
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)

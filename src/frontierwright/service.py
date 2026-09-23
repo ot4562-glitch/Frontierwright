@@ -27,6 +27,7 @@ from frontierwright.domain import (
     ModelState,
     build_mode,
 )
+from frontierwright.editions import EditionProfile, policy_for
 from frontierwright.errors import FrontierwrightError
 from frontierwright.evaluations import apply_scale, load_capability_scale, load_evaluation_receipt
 from frontierwright.execution import (
@@ -63,6 +64,10 @@ class StatusView:
     project_name: str | None = None
     language: str = "en"
     nickname: str | None = None
+    edition_profile: str | None = None
+    edition_name: str | None = None
+    edition_tagline: str | None = None
+    edition_starting_point: str | None = None
     origin: str | None = None
     history_confidence: str | None = None
     history_evidence_reason: str | None = None
@@ -252,6 +257,8 @@ def get_status(root: Path) -> StatusView:
     project = state.project
     origin = ModelOrigin(project["origin"])
     confidence = HistoryConfidence(project["history_confidence"])
+    edition = EditionProfile(project["edition_profile"])
+    edition_policy = policy_for(edition)
     stats = _empty_stats()
     if state.capability_profile is not None:
         for stat in state.capability_profile.get("stats", []):
@@ -276,6 +283,10 @@ def get_status(root: Path) -> StatusView:
         project_name=project["name"],
         language=project["language"],
         nickname=project["name"],
+        edition_profile=edition.value,
+        edition_name=edition_policy.display_name,
+        edition_tagline=edition_policy.tagline,
+        edition_starting_point=edition_policy.starting_point,
         origin=origin.value,
         history_confidence=confidence.value,
         history_evidence_reason=artifact.get("evidence_reason"),
@@ -296,6 +307,18 @@ def get_status(root: Path) -> StatusView:
         stats=stats,
         resource_profile_available=state.resource_profile is not None,
     )
+
+
+def set_project_edition(root: Path, edition: EditionProfile) -> StatusView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before changing its edition profile.",
+            10,
+        )
+    registry.set_edition_profile(edition)
+    return get_status(root)
 
 
 def get_stats_view(root: Path, model_id: str | None = None) -> StatsView:
@@ -471,6 +494,7 @@ def import_local_model(
     project_name: str | None = None,
     language: str = "en",
     history_manifest: Path | None = None,
+    edition_profile: EditionProfile | None = None,
 ) -> StatusView:
     if origin is ModelOrigin.ZERO:
         raise FrontierwrightError(
@@ -488,7 +512,12 @@ def import_local_model(
     registry = Registry(root)
     if not registry.exists:
         name = project_name or descriptor.source_path.stem or "Imported Model"
-        registry.initialize(name, origin, language=language)
+        registry.initialize(
+            name,
+            origin,
+            language=language,
+            edition_profile=edition_profile,
+        )
 
     state = registry.read()
     project_origin = ModelOrigin(state.project["origin"])

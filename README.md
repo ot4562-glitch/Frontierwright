@@ -23,6 +23,16 @@ The local workspace/folder name and public product name are both **Frontierwrigh
 - API-only hosted models without user-controlled trainable state are not trainable Frontierwright characters.
 - Frontierwright is an independent product. It has no dependency on a separate research project.
 
+## Official editions
+
+Frontierwright is one shared core with three official product profiles:
+
+- **Frontierwright Studio** — develop existing user-controlled models.
+- **Frontierwright Academy** — build a real model from birth with education-oriented guidance.
+- **Frontierwright Lab** — develop private/internal models inside controlled infrastructure.
+
+Edition is a UX/policy profile, not model identity. Projects can move between edition profiles without rewriting lineage.
+
 ## Canonical product documents
 
 Read these in this order:
@@ -72,7 +82,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v9;
+- automatic registry migration through schema v10, including persisted edition profiles;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
@@ -128,7 +138,8 @@ Those surfaces remain explicitly `NOT_READY` / `UNKNOWN` rather than using fake 
 python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 
-.venv/bin/frontierwright project init . --name NOVA --origin ZERO
+.venv/bin/frontierwright project init . --name NOVA --origin ZERO --edition ACADEMY
+.venv/bin/frontierwright project edition --path . --set STUDIO --json --non-interactive --yes
 .venv/bin/frontierwright status --json --non-interactive --yes
 .venv/bin/frontierwright play
 ```

@@ -56,7 +56,7 @@ def test_previous_registry_versions_migrate_to_current(
             )
         }
 
-    assert version == SCHEMA_VERSION == 9
+    assert version == SCHEMA_VERSION == 10
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -69,6 +69,7 @@ def test_previous_registry_versions_migrate_to_current(
     assert "runs" in tables
     assert "run_attempts" in tables
     assert "sealed_artifacts" in tables
+    assert state.project["edition_profile"] == "ACADEMY"
 
 
 def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
@@ -118,7 +119,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 9
+    assert version == SCHEMA_VERSION == 10
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -236,3 +237,46 @@ def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
     assert stored.permission is PermissionLevel.PLAN
     assert stored.budgets.max_runs == 1
     assert stored.config == {"epochs": 1}
+
+
+def test_v9_project_migrates_to_origin_appropriate_edition_profile(
+    tmp_path: Path,
+) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("Legacy Zero", ModelOrigin.ZERO)
+
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute("ALTER TABLE project RENAME TO project_v10")
+        connection.execute(
+            """
+            CREATE TABLE project (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                project_id TEXT NOT NULL UNIQUE,
+                identity_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                language TEXT NOT NULL CHECK (language IN ('en','ko')),
+                origin TEXT NOT NULL CHECK (
+                    origin IN ('ZERO','IMPORTED_LOCAL','INTERNAL_LAB')),
+                history_confidence TEXT NOT NULL CHECK (
+                    history_confidence IN ('COMPLETE','VERIFIED','PARTIAL','UNKNOWN')),
+                created_at TEXT NOT NULL,
+                champion_id TEXT REFERENCES models(model_id)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO project (singleton, project_id, identity_id, name, language, "
+            "origin, history_confidence, created_at, champion_id) "
+            "SELECT singleton, project_id, identity_id, name, language, origin, "
+            "history_confidence, created_at, champion_id FROM project_v10"
+        )
+        connection.execute("DROP TABLE project_v10")
+        connection.execute("PRAGMA user_version = 9")
+        connection.commit()
+
+    state = registry.read()
+
+    assert state.project["edition_profile"] == "ACADEMY"
+    with sqlite3.connect(registry.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    assert version == SCHEMA_VERSION == 10
