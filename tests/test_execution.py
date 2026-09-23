@@ -231,6 +231,12 @@ def test_command_backend_full_plan_calibrate_run_candidate_flow(tmp_path: Path) 
     assert completed.status == "COMPLETED"
     assert completed.candidate_model_id is not None
     assert completed.metrics == {"steps": 4, "loss": 0.25}
+    assert completed.usage["wall_seconds"] >= 0
+    assert completed.usage["output_storage_bytes"] > 0
+    assert completed.usage["gpu_count"] == 1
+    assert completed.usage["gpu_count_provenance"] == "CALIBRATION_REPORTED"
+    assert completed.usage["accounted_gpu_hours"] >= 0
+    assert completed.usage["money_spent"] is None
 
     state = Registry(project).read()
     assert state.project["champion_id"] == champion_before
@@ -323,6 +329,59 @@ def test_calibration_can_prove_budget_blocker_without_running(tmp_path: Path) ->
             rerun=False,
         )
     assert Registry(project).read().runs == ()
+
+
+def test_plan_reports_actual_budget_enforcement_modes(tmp_path: Path) -> None:
+    project, backend_spec = setup_project(tmp_path)
+    plan = create_training_plan(
+        project,
+        path_id=TrainingPathId.LORA_SFT,
+        backend_spec_path=backend_spec,
+        dataset_id=None,
+        permission=PermissionLevel.EXECUTE_BOUNDED,
+        budgets=HardBudgets(
+            max_wall_seconds=30,
+            max_gpu_hours=1,
+            max_runs=2,
+            max_storage_bytes=4096,
+        ),
+        config={},
+    )
+    calibrated = calibrate_training_plan(
+        project,
+        plan_id=plan.plan_id or "",
+        backend_spec_path=backend_spec,
+    )
+
+    assert calibrated.ready is True
+    assert calibrated.budget_enforcement == {
+        "max_gpu_hours": "HARD_ACCOUNTED_TIMEOUT:CALIBRATION_REPORTED",
+        "max_runs": "HARD_REGISTRY_ADMISSION",
+        "max_storage_bytes": "ADMISSION_AND_FINALIZATION_GATE",
+        "max_wall_seconds": "HARD_LOCAL_TIMEOUT",
+    }
+
+
+def test_money_budget_stays_blocked_without_runtime_enforcement(tmp_path: Path) -> None:
+    project, backend_spec = setup_project(tmp_path)
+    plan = create_training_plan(
+        project,
+        path_id=TrainingPathId.LORA_SFT,
+        backend_spec_path=backend_spec,
+        dataset_id=None,
+        permission=PermissionLevel.EXECUTE_BOUNDED,
+        budgets=HardBudgets(max_money=10),
+        config={},
+    )
+    calibrated = calibrate_training_plan(
+        project,
+        plan_id=plan.plan_id or "",
+        backend_spec_path=backend_spec,
+    )
+
+    assert calibrated.ready is False
+    assert calibrated.budget_enforcement["max_money"] == "NOT_RUNTIME_ENFORCEABLE"
+    assert "money budget cannot be evaluated without projected_money" in calibrated.blockers
 
 
 def test_max_runs_one_still_replays_completed_run(tmp_path: Path) -> None:
@@ -448,6 +507,15 @@ def test_durable_result_reconciliation_creates_exactly_one_candidate(tmp_path: P
             "request_digest": digest,
             "output_model_path": str(output),
             "metrics": {"steps": 4, "loss": 0.2},
+            "usage": {
+                "wall_seconds": 3.5,
+                "output_storage_bytes": 64,
+                "gpu_count": 2,
+                "gpu_count_provenance": "CALIBRATION_REPORTED",
+                "accounted_gpu_hours": 3.5 * 2 / 3600,
+                "money_spent": None,
+                "measured_by": "fixture-executor",
+            },
             "worker_pid": 999_999_998,
         },
     )
@@ -459,8 +527,66 @@ def test_durable_result_reconciliation_creates_exactly_one_candidate(tmp_path: P
     assert first.status == "COMPLETED"
     assert second.run_id == first.run_id
     assert first.candidate_model_id is not None
+    assert first.usage["wall_seconds"] == 3.5
+    assert first.usage["gpu_count"] == 2
+    assert first.usage["measured_by"] == "fixture-executor"
     assert len(state.candidates) == 1
     assert state.project["champion_id"] != first.candidate_model_id
+
+
+def test_measured_output_storage_budget_blocks_candidate_finalization(
+    tmp_path: Path,
+) -> None:
+    project, backend_spec = setup_project(tmp_path)
+    plan_id = make_ready_plan(project, backend_spec)
+    run_id, calibration_id, digest = reserve_run(project, plan_id)
+
+    output = tmp_path / "budget-output"
+    output.mkdir()
+    (output / "config.json").write_text(
+        json.dumps({"model_type": "fixture-budget"}),
+        encoding="utf-8",
+    )
+    (output / "model.safetensors").write_bytes(b"small-candidate")
+
+    result_path = tmp_path / "budget-result.json"
+    Registry(project).attach_run_worker(
+        run_id,
+        worker_pid=999_999_997,
+        worker_start_token=None,
+        result_path=str(result_path),
+    )
+    atomic_write_json(
+        result_path,
+        {
+            "schema_version": 1,
+            "ok": True,
+            "run_id": run_id,
+            "plan_id": plan_id,
+            "calibration_id": calibration_id,
+            "request_digest": digest,
+            "output_model_path": str(output),
+            "metrics": {"steps": 1},
+            "usage": {
+                "wall_seconds": 1.0,
+                "output_storage_bytes": 5000,
+                "gpu_count": 1,
+                "gpu_count_provenance": "CALIBRATION_REPORTED",
+                "accounted_gpu_hours": 1 / 3600,
+                "money_spent": None,
+                "measured_by": "fixture-executor",
+            },
+            "worker_pid": 999_999_997,
+        },
+    )
+
+    reconciled = reconcile_training_run(project, run_id)
+
+    assert reconciled.status == "INCOMPLETE"
+    assert reconciled.error_code == "STORAGE_BUDGET_REACHED"
+    assert reconciled.candidate_model_id is None
+    assert reconciled.usage["output_storage_bytes"] == 5000
+    assert Registry(project).read().candidates == ()
 
 
 def test_receipt_export_failure_does_not_downgrade_completed_run(

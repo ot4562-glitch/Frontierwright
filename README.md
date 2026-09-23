@@ -82,7 +82,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v16, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, and Lab adapter manifests;
+- automatic registry migration through schema v17, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, Lab adapter manifests, and durable run-usage receipts;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
@@ -125,6 +125,10 @@ Implemented now:
 - immutable `TrainingPlan` identity with pinned intervention ID/version/family, model fingerprint, dataset/recipe fingerprint, dataset classification, backend spec hash/data boundary, resource profile, config, permission, and hard budgets;
 - representative calibration receipts with step time, throughput, peak memory, projected storage, and projected wall time;
 - idempotent durable local run attempts with worker/process identity, liveness reconciliation, durable executor results, explicit rerun semantics, and repairable run-receipt export;
+- durable run-usage receipts record measured wall time and output bytes, plus provenance-labelled accounted GPU-hours when GPU count is available; unknown cost dimensions remain unknown instead of being fabricated;
+- budget enforcement modes are explicit in plan views: run-count registry admission, wall-time timeout, accounted GPU-hour timeout, storage admission/finalization gate, and currently unavailable runtime money enforcement;
+- measured output-size budget violations block candidate finalization even when the training backend itself reports success;
+- `max_money` keeps a plan non-ready until an executor with real runtime cost enforcement exists; a projected price alone is not treated as a hard budget;
 - built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` from-scratch pretraining/calibration;
 - successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
 - sealed artifact manifests bind the run, plan, intervention ID/version/family, dataset, dataset-preparation recipe, backend, effective config, model fingerprint, and exact file hashes;
@@ -141,7 +145,7 @@ Not implemented yet:
 
 - an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and benchmark runner;
 - production built-in training backends for all five paths beyond the narrow from-scratch reference backend and structured external command adapter;
-- full execution-time enforcement/accounting for every hard-budget dimension across calibration and repeated attempts;
+- live output-storage quota enforcement during backend execution, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
 - public dataset discovery/download adapters and transformative recipes such as normalize/dedupe/tokenize/mixture;
 - remote/server/Slurm executor implementations and concrete private Lab adapters;
 - stronger executor-boundary attestation beyond the current adapter-declared trust contract.

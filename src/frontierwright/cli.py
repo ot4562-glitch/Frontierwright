@@ -389,6 +389,10 @@ def _print_plan(view: PlanView) -> None:
             f"{view.backend_adapter_hash or 'UNPINNED'}"
         )
     console.print(f"Resource profile: {view.resource_profile_id or 'UNPINNED'}")
+    if view.budget_enforcement:
+        console.print("Budget enforcement:")
+        for key, value in sorted(view.budget_enforcement.items()):
+            console.print(f"  {key}: {value}")
     console.print(f"Ready: {'YES' if view.ready else 'NO'}")
     if view.calibration:
         console.print("Calibration:")
@@ -423,6 +427,10 @@ def _print_run(view: RunView) -> None:
     if view.metrics:
         console.print("Metrics:")
         for key, value in sorted(view.metrics.items()):
+            console.print(f"  {key}: {value}")
+    if view.usage:
+        console.print("Usage:")
+        for key, value in sorted(view.usage.items()):
             console.print(f"  {key}: {value}")
     if view.error_code:
         console.print(f"Error: {view.error_code}: {view.error_message}")

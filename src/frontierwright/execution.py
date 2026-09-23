@@ -272,6 +272,64 @@ class TrainingBackendResult:
     metrics: dict[str, object]
 
 
+@dataclass(frozen=True)
+class RunUsage:
+    """Measured execution usage. Unknown dimensions stay explicitly unknown."""
+
+    wall_seconds: float
+    output_storage_bytes: int | None = None
+    gpu_count: int | None = None
+    gpu_count_provenance: str | None = None
+    accounted_gpu_hours: float | None = None
+    money_spent: float | None = None
+    measured_by: str = "frontierwright-local-executor-v1"
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.wall_seconds, bool)
+            or not math.isfinite(self.wall_seconds)
+            or self.wall_seconds < 0
+        ):
+            raise ValueError("wall_seconds must be finite and nonnegative")
+        if self.output_storage_bytes is not None and (
+            isinstance(self.output_storage_bytes, bool)
+            or not isinstance(self.output_storage_bytes, int)
+            or self.output_storage_bytes < 0
+        ):
+            raise ValueError("output_storage_bytes must be a nonnegative integer")
+        if self.gpu_count is not None and (
+            isinstance(self.gpu_count, bool)
+            or not isinstance(self.gpu_count, int)
+            or self.gpu_count <= 0
+        ):
+            raise ValueError("gpu_count must be a positive integer")
+        if (self.gpu_count is None) != (self.gpu_count_provenance is None):
+            raise ValueError(
+                "gpu_count and gpu_count_provenance must be supplied together"
+            )
+        if self.gpu_count_provenance is not None and not self.gpu_count_provenance.strip():
+            raise ValueError("gpu_count_provenance must be nonempty")
+        if self.accounted_gpu_hours is not None and (
+            isinstance(self.accounted_gpu_hours, bool)
+            or not math.isfinite(self.accounted_gpu_hours)
+            or self.accounted_gpu_hours < 0
+        ):
+            raise ValueError("accounted_gpu_hours must be finite and nonnegative")
+        if self.accounted_gpu_hours is not None and self.gpu_count is None:
+            raise ValueError("accounted_gpu_hours requires gpu_count")
+        if self.money_spent is not None and (
+            isinstance(self.money_spent, bool)
+            or not math.isfinite(self.money_spent)
+            or self.money_spent < 0
+        ):
+            raise ValueError("money_spent must be finite and nonnegative")
+        if not self.measured_by.strip():
+            raise ValueError("measured_by must be nonempty")
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 def _load_json(path: Path, label: str) -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))

@@ -44,6 +44,7 @@ from frontierwright.execution import (
     HardBudgets,
     PermissionLevel,
     RunStatus,
+    RunUsage,
     TrainingPlan,
 )
 from frontierwright.lab_adapters import LabAdapterManifest
@@ -52,7 +53,7 @@ from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import DataPreparationRecipe
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -227,6 +228,7 @@ CREATE TABLE runs (
     finished_at TEXT,
     candidate_model_id TEXT REFERENCES models(model_id),
     metrics_json TEXT NOT NULL,
+    usage_json TEXT NOT NULL DEFAULT '{}',
     error_code TEXT,
     error_message TEXT
 );
@@ -910,6 +912,24 @@ class Registry:
                 )
                 connection.commit()
                 version = 16
+
+            if version == 16:
+                run_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(runs)")
+                }
+                connection.execute("BEGIN IMMEDIATE")
+                if "usage_json" not in run_columns:
+                    connection.execute(
+                        "ALTER TABLE runs ADD COLUMN usage_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                connection.execute("PRAGMA user_version = 17")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 16, "to_version": 17},
+                )
+                connection.commit()
+                version = 17
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -1973,6 +1993,8 @@ class Registry:
     def _decode_run_row(row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
         payload["metrics"] = json.loads(payload.pop("metrics_json"))
+        usage_raw = payload.pop("usage_json", "{}")
+        payload["usage"] = json.loads(usage_raw) if usage_raw else {}
         result_raw = payload.pop("result_json", None)
         payload["result"] = json.loads(result_raw) if result_raw else None
         return payload
@@ -2187,6 +2209,44 @@ class Registry:
                 {
                     "run_id": run_id,
                     "result_sha256": result_sha256,
+                },
+            )
+
+    def record_run_usage(self, run_id: str, usage: RunUsage) -> None:
+        serialized = json.dumps(
+            usage.to_dict(),
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        with self.connect(write=True) as connection:
+            row = connection.execute(
+                "SELECT usage_json FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise FrontierwrightError("RUN_NOT_FOUND", "Run does not exist.", 3)
+            existing = str(row["usage_json"] or "{}")
+            if existing not in {"", "{}"}:
+                if existing == serialized:
+                    return
+                raise FrontierwrightError(
+                    "RUN_USAGE_CONFLICT",
+                    "Run already has different durable usage evidence.",
+                    13,
+                )
+            connection.execute(
+                "UPDATE runs SET usage_json = ? WHERE run_id = ?",
+                (serialized, run_id),
+            )
+            self.event(
+                connection,
+                "RUN_USAGE_RECORDED",
+                {
+                    "run_id": run_id,
+                    "wall_seconds": usage.wall_seconds,
+                    "output_storage_bytes": usage.output_storage_bytes,
+                    "accounted_gpu_hours": usage.accounted_gpu_hours,
                 },
             )
 

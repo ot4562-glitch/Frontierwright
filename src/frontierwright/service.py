@@ -42,6 +42,7 @@ from frontierwright.execution import (
     HardBudgets,
     PermissionLevel,
     RunStatus,
+    RunUsage,
     TrainingPlan,
     backend_allows_dataset,
     compute_execution_request_digest,
@@ -241,6 +242,7 @@ class PlanView:
     resource_profile_id: str | None = None
     permission: str | None = None
     budgets: dict[str, object] = field(default_factory=dict)
+    budget_enforcement: dict[str, str] = field(default_factory=dict)
     config: dict[str, object] = field(default_factory=dict)
     idempotency_key: str | None = None
     calibration: dict[str, object] | None = None
@@ -259,6 +261,7 @@ class RunView:
     status: str | None = None
     candidate_model_id: str | None = None
     metrics: dict[str, object] = field(default_factory=dict)
+    usage: dict[str, object] = field(default_factory=dict)
     error_code: str | None = None
     error_message: str | None = None
     dry_run: bool = False
@@ -1382,6 +1385,29 @@ def _plan_input_blockers(
     return blockers
 
 
+def _accounted_gpu_count(
+    calibration: dict[str, object],
+    resource_profile: dict[str, object] | None,
+) -> tuple[int | None, str | None]:
+    backend_result = calibration.get("backend_result")
+    backend_map = backend_result if isinstance(backend_result, dict) else {}
+    reported = backend_map.get("gpu_count")
+    if (
+        isinstance(reported, int)
+        and not isinstance(reported, bool)
+        and reported > 0
+    ):
+        return reported, "CALIBRATION_REPORTED"
+
+    if resource_profile is not None:
+        snapshot = resource_profile.get("snapshot")
+        if isinstance(snapshot, dict):
+            gpus = snapshot.get("gpus")
+            if isinstance(gpus, list) and gpus:
+                return len(gpus), "RESOURCE_PROFILE_DETECTED"
+    return None, None
+
+
 def _calibration_budget_blockers(
     plan: TrainingPlan,
     calibration: dict[str, object] | None,
@@ -1429,20 +1455,7 @@ def _calibration_budget_blockers(
     backend_map = backend_result if isinstance(backend_result, dict) else {}
 
     if budgets.max_gpu_hours is not None:
-        gpu_count: int | None = None
-        reported_gpu_count = backend_map.get("gpu_count")
-        if (
-            isinstance(reported_gpu_count, int)
-            and not isinstance(reported_gpu_count, bool)
-            and reported_gpu_count > 0
-        ):
-            gpu_count = reported_gpu_count
-        elif resource_profile is not None:
-            snapshot = resource_profile.get("snapshot")
-            if isinstance(snapshot, dict):
-                gpus = snapshot.get("gpus")
-                if isinstance(gpus, list) and gpus:
-                    gpu_count = len(gpus)
+        gpu_count, _ = _accounted_gpu_count(calibration, resource_profile)
         if gpu_count is None:
             blockers.append("GPU-hour budget cannot be enforced without GPU count")
         elif not isinstance(projected_wall, (int, float)) or isinstance(projected_wall, bool):
@@ -1457,11 +1470,46 @@ def _calibration_budget_blockers(
         if not isinstance(projected_money, (int, float)) or isinstance(
             projected_money, bool
         ):
-            blockers.append("money budget cannot be enforced without projected_money")
+            blockers.append("money budget cannot be evaluated without projected_money")
         elif float(projected_money) > budgets.max_money:
             blockers.append("projected money exceeds max_money budget")
+        else:
+            blockers.append(
+                "max_money cannot be hard-enforced by the local executor yet"
+            )
 
     return blockers
+
+
+def _budget_enforcement_modes(
+    plan: TrainingPlan,
+    calibration: dict[str, object] | None,
+    resource_profile: dict[str, object] | None,
+) -> dict[str, str]:
+    modes: dict[str, str] = {}
+    if plan.budgets.max_runs is not None:
+        modes["max_runs"] = "HARD_REGISTRY_ADMISSION"
+    if plan.budgets.max_wall_seconds is not None:
+        modes["max_wall_seconds"] = "HARD_LOCAL_TIMEOUT"
+    if plan.budgets.max_gpu_hours is not None:
+        if calibration is None:
+            modes["max_gpu_hours"] = "UNAVAILABLE_WITHOUT_CALIBRATION"
+        else:
+            gpu_count, provenance = _accounted_gpu_count(
+                calibration,
+                resource_profile,
+            )
+            if gpu_count is None or provenance is None:
+                modes["max_gpu_hours"] = "UNAVAILABLE_WITHOUT_GPU_COUNT"
+            else:
+                modes["max_gpu_hours"] = (
+                    f"HARD_ACCOUNTED_TIMEOUT:{provenance}"
+                )
+    if plan.budgets.max_storage_bytes is not None:
+        modes["max_storage_bytes"] = "ADMISSION_AND_FINALIZATION_GATE"
+    if plan.budgets.max_money is not None:
+        modes["max_money"] = "NOT_RUNTIME_ENFORCEABLE"
+    return modes
 
 
 def _resolve_backend_adapter(
@@ -1571,6 +1619,11 @@ def get_plan_view(root: Path, plan_id: str) -> PlanView:
         resource_profile_id=plan.resource_profile_id,
         permission=plan.permission.name,
         budgets=plan.budgets.to_dict(),
+        budget_enforcement=_budget_enforcement_modes(
+            plan,
+            calibration,
+            state.resource_profile,
+        ),
         config=plan.config,
         idempotency_key=plan.idempotency_key,
         calibration=calibration,
@@ -1844,18 +1897,7 @@ def _run_timeout_seconds(
         timeout = min(timeout, plan.budgets.max_wall_seconds)
 
     if plan.budgets.max_gpu_hours is not None:
-        backend_result = calibration.get("backend_result")
-        backend_map = backend_result if isinstance(backend_result, dict) else {}
-        gpu_count: int | None = None
-        reported = backend_map.get("gpu_count")
-        if isinstance(reported, int) and not isinstance(reported, bool) and reported > 0:
-            gpu_count = reported
-        elif resource_profile is not None:
-            snapshot = resource_profile.get("snapshot")
-            if isinstance(snapshot, dict):
-                gpus = snapshot.get("gpus")
-                if isinstance(gpus, list) and gpus:
-                    gpu_count = len(gpus)
+        gpu_count, _ = _accounted_gpu_count(calibration, resource_profile)
         if gpu_count is not None:
             timeout = min(
                 timeout,
@@ -1872,6 +1914,7 @@ def get_run_view(root: Path, run_id: str) -> RunView:
         status=run["status"],
         candidate_model_id=run["candidate_model_id"],
         metrics=run["metrics"],
+        usage=run["usage"],
         error_code=run["error_code"],
         error_message=run["error_message"],
         liveness_state=run.get("liveness_state"),
@@ -1884,6 +1927,56 @@ def get_run_view(root: Path, run_id: str) -> RunView:
 def _deterministic_candidate_id(run_id: str, fingerprint: str) -> str:
     digest = hashlib.sha256(f"{run_id}\0{fingerprint}".encode()).hexdigest()
     return f"model-{digest[:32]}"
+
+
+def _run_usage_from_result(result: dict[str, object]) -> RunUsage | None:
+    raw = result.get("usage")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise FrontierwrightError(
+            "RUN_USAGE_INVALID",
+            "Executor usage evidence must be an object.",
+            14,
+        )
+    try:
+        return RunUsage(
+            wall_seconds=float(raw["wall_seconds"]),
+            output_storage_bytes=(
+                int(raw["output_storage_bytes"])
+                if raw.get("output_storage_bytes") is not None
+                else None
+            ),
+            gpu_count=(
+                int(raw["gpu_count"])
+                if raw.get("gpu_count") is not None
+                else None
+            ),
+            gpu_count_provenance=(
+                str(raw["gpu_count_provenance"])
+                if raw.get("gpu_count_provenance") is not None
+                else None
+            ),
+            accounted_gpu_hours=(
+                float(raw["accounted_gpu_hours"])
+                if raw.get("accounted_gpu_hours") is not None
+                else None
+            ),
+            money_spent=(
+                float(raw["money_spent"])
+                if raw.get("money_spent") is not None
+                else None
+            ),
+            measured_by=str(
+                raw.get("measured_by") or "frontierwright-local-executor-v1"
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FrontierwrightError(
+            "RUN_USAGE_INVALID",
+            f"Executor usage evidence is invalid: {exc}",
+            14,
+        ) from exc
 
 
 def _validate_executor_result(
@@ -1980,6 +2073,9 @@ def reconcile_training_run(root: Path, run_id: str) -> RunView:
         _validate_executor_result(run, result)
 
     if isinstance(result, dict):
+        usage = _run_usage_from_result(result)
+        if usage is not None:
+            registry.record_run_usage(run_id, usage)
         if result.get("ok") is not True:
             error = result.get("error")
             error_map = error if isinstance(error, dict) else {}
@@ -2014,6 +2110,22 @@ def reconcile_training_run(root: Path, run_id: str) -> RunView:
             )
 
         plan = registry.get_plan(str(run["plan_id"]))
+        if (
+            usage is not None
+            and plan.budgets.max_storage_bytes is not None
+            and usage.output_storage_bytes is not None
+            and usage.output_storage_bytes > plan.budgets.max_storage_bytes
+        ):
+            registry.finish_run_failure(
+                run_id,
+                status=RunStatus.INCOMPLETE,
+                error_code="STORAGE_BUDGET_REACHED",
+                error_message=(
+                    "Measured executor output exceeds max_storage_bytes budget."
+                ),
+            )
+            return get_run_view(root, run_id)
+
         backend_descriptor = inspect_local_model(Path(output))
         if (
             plan.budgets.max_storage_bytes is not None
@@ -2219,6 +2331,10 @@ def execute_training_plan(
         state.resource_profile,
         timeout_seconds,
     )
+    gpu_count, gpu_count_provenance = _accounted_gpu_count(
+        calibration,
+        state.resource_profile,
+    )
     attempt_path = registry.state_dir / "runs" / f"{run_id}-attempt.json"
     request_path = registry.state_dir / "runs" / f"{run_id}-backend-request.json"
     result_path = registry.state_dir / "runs" / f"{run_id}-executor-result.json"
@@ -2234,6 +2350,8 @@ def execute_training_plan(
         result_path=result_path,
         request_digest=request_digest,
         timeout_seconds=effective_timeout,
+        gpu_count=gpu_count,
+        gpu_count_provenance=gpu_count_provenance,
     )
 
     try:

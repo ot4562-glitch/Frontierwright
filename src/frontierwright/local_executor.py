@@ -9,12 +9,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from frontierwright.errors import FrontierwrightError
-from frontierwright.execution import load_command_backend_spec, run_training_backend
+from frontierwright.execution import RunUsage, load_command_backend_spec, run_training_backend
 from frontierwright.registry import Registry
 
 WORKER_RESULT_SCHEMA = 1
@@ -32,6 +33,22 @@ class LocalAttemptSpec:
     result_path: Path
     request_digest: str
     timeout_seconds: float
+    gpu_count: int | None = None
+    gpu_count_provenance: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.gpu_count is None) != (self.gpu_count_provenance is None):
+            raise ValueError(
+                "gpu_count and gpu_count_provenance must be supplied together"
+            )
+        if self.gpu_count is not None and (
+            isinstance(self.gpu_count, bool)
+            or not isinstance(self.gpu_count, int)
+            or self.gpu_count <= 0
+        ):
+            raise ValueError("gpu_count must be a positive integer")
+        if self.gpu_count_provenance is not None and not self.gpu_count_provenance.strip():
+            raise ValueError("gpu_count_provenance must be nonempty")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -46,6 +63,8 @@ class LocalAttemptSpec:
             "result_path": str(self.result_path),
             "request_digest": self.request_digest,
             "timeout_seconds": self.timeout_seconds,
+            "gpu_count": self.gpu_count,
+            "gpu_count_provenance": self.gpu_count_provenance,
         }
 
     @classmethod
@@ -63,6 +82,8 @@ class LocalAttemptSpec:
             result_path=Path(_require_str(payload, "result_path")),
             request_digest=_require_str(payload, "request_digest"),
             timeout_seconds=_require_positive_number(payload, "timeout_seconds"),
+            gpu_count=_optional_positive_int(payload, "gpu_count"),
+            gpu_count_provenance=_optional_str(payload, "gpu_count_provenance"),
         )
 
 
@@ -78,6 +99,24 @@ def _require_positive_number(payload: dict[str, object], key: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ValueError(f"{key} must be a positive number")
     return float(value)
+
+
+def _optional_positive_int(payload: dict[str, object], key: str) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{key} must be a positive integer when supplied")
+    return value
+
+
+def _optional_str(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{key} must be a nonempty string when supplied")
+    return value
 
 
 def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
@@ -237,11 +276,52 @@ def load_attempt(path: Path) -> LocalAttemptSpec:
     return LocalAttemptSpec.from_dict(raw)
 
 
+def _tree_size_bytes(root: Path) -> int:
+    if not root.exists():
+        return 0
+    total = 0
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(directory)
+        dirnames[:] = [
+            name for name in dirnames if not (base / name).is_symlink()
+        ]
+        for name in filenames:
+            path = base / name
+            if path.is_symlink():
+                continue
+            try:
+                total += path.stat().st_size
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def _usage_for_attempt(
+    attempt: LocalAttemptSpec,
+    *,
+    started_monotonic: float,
+) -> RunUsage:
+    wall_seconds = max(0.0, time.monotonic() - started_monotonic)
+    accounted_gpu_hours = (
+        wall_seconds * attempt.gpu_count / 3600.0
+        if attempt.gpu_count is not None
+        else None
+    )
+    return RunUsage(
+        wall_seconds=wall_seconds,
+        output_storage_bytes=_tree_size_bytes(attempt.output_root),
+        gpu_count=attempt.gpu_count,
+        gpu_count_provenance=attempt.gpu_count_provenance,
+        accounted_gpu_hours=accounted_gpu_hours,
+    )
+
+
 def _success_payload(
     attempt: LocalAttemptSpec,
     *,
     output_model_path: Path,
     metrics: dict[str, object],
+    usage: RunUsage,
 ) -> dict[str, object]:
     return {
         "schema_version": WORKER_RESULT_SCHEMA,
@@ -252,6 +332,7 @@ def _success_payload(
         "request_digest": attempt.request_digest,
         "output_model_path": str(output_model_path),
         "metrics": metrics,
+        "usage": usage.to_dict(),
         "worker_pid": os.getpid(),
     }
 
@@ -261,6 +342,7 @@ def _failure_payload(
     *,
     code: str,
     message: str,
+    usage: RunUsage,
 ) -> dict[str, object]:
     return {
         "schema_version": WORKER_RESULT_SCHEMA,
@@ -270,12 +352,14 @@ def _failure_payload(
         "calibration_id": attempt.calibration_id,
         "request_digest": attempt.request_digest,
         "error": {"code": code, "message": message[:2000]},
+        "usage": usage.to_dict(),
         "worker_pid": os.getpid(),
     }
 
 
 def run_worker(attempt_file: Path) -> int:
     attempt = load_attempt(attempt_file)
+    started_monotonic = time.monotonic()
     try:
         registry = Registry(attempt.project_root)
         plan = registry.get_plan(attempt.plan_id)
@@ -300,13 +384,25 @@ def run_worker(attempt_file: Path) -> int:
                 attempt,
                 output_model_path=result.output_model_path,
                 metrics=result.metrics,
+                usage=_usage_for_attempt(
+                    attempt,
+                    started_monotonic=started_monotonic,
+                ),
             ),
         )
         return 0
     except FrontierwrightError as exc:
         atomic_write_json(
             attempt.result_path,
-            _failure_payload(attempt, code=exc.code, message=str(exc)),
+            _failure_payload(
+                attempt,
+                code=exc.code,
+                message=str(exc),
+                usage=_usage_for_attempt(
+                    attempt,
+                    started_monotonic=started_monotonic,
+                ),
+            ),
         )
         return exc.exit_code if 0 < exc.exit_code < 256 else 14
     except Exception as exc:
@@ -316,6 +412,10 @@ def run_worker(attempt_file: Path) -> int:
                 attempt,
                 code="EXECUTOR_WORKER_ERROR",
                 message=f"{type(exc).__name__}: {exc}",
+                usage=_usage_for_attempt(
+                    attempt,
+                    started_monotonic=started_monotonic,
+                ),
             ),
         )
         return 14
