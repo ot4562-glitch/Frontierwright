@@ -13,7 +13,13 @@ from typing import Any
 from uuid import uuid4
 
 from frontierwright.artifact_store import SealedArtifact
-from frontierwright.data import DatasetDescriptor, DatasetProvenance, DatasetRole
+from frontierwright.data import (
+    DatasetClassification,
+    DatasetDescriptor,
+    DatasetProvenance,
+    DatasetRole,
+    default_dataset_classification,
+)
 from frontierwright.domain import (
     Axis,
     BuildIntent,
@@ -45,7 +51,7 @@ from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import DataPreparationRecipe
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -143,6 +149,8 @@ CREATE TABLE datasets (
     role TEXT NOT NULL CHECK (role IN ('PRETRAIN','SFT')),
     provenance TEXT NOT NULL CHECK (
         provenance IN ('LOCAL_USER','INTERNAL_CONNECTED','PUBLIC_DISCOVERED')),
+    classification TEXT NOT NULL DEFAULT 'PRIVATE' CHECK (
+        classification IN ('PUBLIC','INTERNAL','CONFIDENTIAL','PRIVATE')),
     source_path TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
     total_bytes INTEGER NOT NULL,
@@ -185,6 +193,8 @@ CREATE TABLE plans (
     dataset_source_path TEXT NOT NULL,
     dataset_recipe_id TEXT,
     dataset_recipe_hash TEXT,
+    dataset_classification TEXT NOT NULL DEFAULT 'PRIVATE',
+    backend_data_boundary TEXT NOT NULL DEFAULT 'LOCAL_MACHINE',
     resource_profile_id TEXT,
     permission TEXT NOT NULL,
     budgets_json TEXT NOT NULL,
@@ -505,6 +515,8 @@ def decode_plan(row: sqlite3.Row) -> TrainingPlan:
         dataset_source_path=row["dataset_source_path"],
         dataset_recipe_id=row["dataset_recipe_id"],
         dataset_recipe_hash=row["dataset_recipe_hash"],
+        dataset_classification=row["dataset_classification"],
+        backend_data_boundary=row["backend_data_boundary"],
         resource_profile_id=row["resource_profile_id"],
         permission=PermissionLevel[row["permission"]],
         budgets=HardBudgets(**budgets_raw),
@@ -794,6 +806,51 @@ class Registry:
                 )
                 connection.commit()
                 version = 14
+
+            if version == 14:
+                dataset_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(datasets)")
+                }
+                plan_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(plans)")
+                }
+                connection.execute("BEGIN IMMEDIATE")
+                if "classification" not in dataset_columns:
+                    connection.execute(
+                        "ALTER TABLE datasets ADD COLUMN classification TEXT NOT NULL "
+                        "DEFAULT 'PRIVATE' CHECK (classification IN "
+                        "('PUBLIC','INTERNAL','CONFIDENTIAL','PRIVATE'))"
+                    )
+                connection.execute(
+                    "UPDATE datasets SET classification = CASE provenance "
+                    "WHEN 'PUBLIC_DISCOVERED' THEN 'PUBLIC' "
+                    "WHEN 'INTERNAL_CONNECTED' THEN 'INTERNAL' "
+                    "ELSE COALESCE(classification, 'PRIVATE') END"
+                )
+                if "dataset_classification" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN dataset_classification TEXT NOT NULL "
+                        "DEFAULT 'PRIVATE'"
+                    )
+                if "backend_data_boundary" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN backend_data_boundary TEXT NOT NULL "
+                        "DEFAULT 'LOCAL_MACHINE'"
+                    )
+                connection.execute(
+                    "UPDATE plans SET dataset_classification = COALESCE(("
+                    "SELECT datasets.classification FROM datasets "
+                    "WHERE datasets.dataset_id = plans.dataset_id"
+                    "), dataset_classification, 'PRIVATE')"
+                )
+                connection.execute("PRAGMA user_version = 15")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 14, "to_version": 15},
+                )
+                connection.commit()
+                version = 15
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -1572,9 +1629,10 @@ class Registry:
                 "intervention_version, intervention_family, backend_id, "
                 "backend_spec_hash, model_id, model_fingerprint, model_source_path, "
                 "dataset_id, dataset_fingerprint, dataset_source_path, "
-                "dataset_recipe_id, dataset_recipe_hash, resource_profile_id, "
-                "permission, budgets_json, config_json, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "dataset_recipe_id, dataset_recipe_hash, dataset_classification, "
+                "backend_data_boundary, resource_profile_id, permission, budgets_json, "
+                "config_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     plan.plan_id,
                     plan.idempotency_key,
@@ -1592,6 +1650,8 @@ class Registry:
                     plan.dataset_source_path,
                     plan.dataset_recipe_id,
                     plan.dataset_recipe_hash,
+                    plan.dataset_classification,
+                    plan.backend_data_boundary,
                     plan.resource_profile_id,
                     plan.permission.name,
                     json.dumps(plan.budgets.to_dict(), sort_keys=True, allow_nan=False),
@@ -2003,12 +2063,16 @@ class Registry:
         name: str,
         role: DatasetRole,
         provenance: DatasetProvenance = DatasetProvenance.LOCAL_USER,
+        classification: DatasetClassification | None = None,
         license_name: str | None = None,
         domain: str | None = None,
         language: str | None = None,
         token_count: int | None = None,
     ) -> str:
         require_text(name, "dataset name")
+        effective_classification = (
+            classification or default_dataset_classification(provenance)
+        )
         if token_count is not None and token_count < 0:
             raise FrontierwrightError(
                 "INVALID_TOKEN_COUNT",
@@ -2020,8 +2084,14 @@ class Registry:
             existing = connection.execute(
                 "SELECT dataset_id FROM datasets "
                 "WHERE fingerprint = ? AND role = ? AND provenance = ? "
-                "AND preparation_recipe_hash IS NULL AND active = 1 LIMIT 1",
-                (descriptor.fingerprint, role.value, provenance.value),
+                "AND classification = ? AND preparation_recipe_hash IS NULL "
+                "AND active = 1 LIMIT 1",
+                (
+                    descriptor.fingerprint,
+                    role.value,
+                    provenance.value,
+                    effective_classification.value,
+                ),
             ).fetchone()
             if existing is not None:
                 return str(existing["dataset_id"])
@@ -2029,16 +2099,17 @@ class Registry:
             dataset_id = f"dataset-{uuid4().hex}"
             connection.execute(
                 "INSERT INTO datasets ("
-                "dataset_id, name, role, provenance, source_path, fingerprint, "
-                "total_bytes, file_count, manifest_json, license, domain, language, "
-                "token_count, created_at, active, source_dataset_id, "
+                "dataset_id, name, role, provenance, classification, source_path, "
+                "fingerprint, total_bytes, file_count, manifest_json, license, domain, "
+                "language, token_count, created_at, active, source_dataset_id, "
                 "preparation_recipe_id, preparation_recipe_hash"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, NULL, NULL)",
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, NULL, NULL)",
                 (
                     dataset_id,
                     name,
                     role.value,
                     provenance.value,
+                    effective_classification.value,
                     str(descriptor.source_path),
                     descriptor.fingerprint,
                     descriptor.total_bytes,
@@ -2059,6 +2130,7 @@ class Registry:
                     "name": name,
                     "role": role.value,
                     "provenance": provenance.value,
+                    "classification": effective_classification.value,
                     "fingerprint": descriptor.fingerprint,
                     "total_bytes": descriptor.total_bytes,
                     "file_count": descriptor.file_count,
@@ -2144,16 +2216,17 @@ class Registry:
             prepared_name = name or f"{source['name']} · prepared"
             connection.execute(
                 "INSERT INTO datasets ("
-                "dataset_id, name, role, provenance, source_path, fingerprint, "
-                "total_bytes, file_count, manifest_json, license, domain, language, "
-                "token_count, created_at, active, source_dataset_id, "
+                "dataset_id, name, role, provenance, classification, source_path, "
+                "fingerprint, total_bytes, file_count, manifest_json, license, domain, "
+                "language, token_count, created_at, active, source_dataset_id, "
                 "preparation_recipe_id, preparation_recipe_hash"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
                 (
                     dataset_id,
                     prepared_name,
                     source["role"],
                     source["provenance"],
+                    source["classification"],
                     str(descriptor.source_path),
                     descriptor.fingerprint,
                     descriptor.total_bytes,
@@ -2179,6 +2252,7 @@ class Registry:
                     "recipe_hash": recipe.recipe_hash,
                     "plugin_id": recipe.plugin_id,
                     "plugin_version": recipe.plugin_version,
+                    "classification": source["classification"],
                     "fingerprint": descriptor.fingerprint,
                 },
             )

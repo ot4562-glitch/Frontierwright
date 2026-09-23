@@ -85,6 +85,7 @@ def test_data_and_paths_machine_surface(tmp_path: Path) -> None:
     assert data_payload["ok"] is True
     assert data_payload["datasets"][0]["role"] == "PRETRAIN"
     assert data_payload["datasets"][0]["provenance"] == "LOCAL_USER"
+    assert data_payload["datasets"][0]["classification"] == "PRIVATE"
     raw_dataset_id = data_payload["datasets"][0]["dataset_id"]
 
     prepared = runner.invoke(

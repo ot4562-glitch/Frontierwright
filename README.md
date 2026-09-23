@@ -82,7 +82,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v14, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, and frozen-scale Build binding;
+- automatic registry migration through schema v15, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, and dataset/backend data-boundary policy;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
@@ -102,7 +102,11 @@ Implemented now:
   - unmeasured inserted model -> `NOT_READY`;
   - measured model -> `TARGETS_FLOORS`;
 - persisted build archetypes/relative priorities plus numeric targets/floors with validation;
-- user/lab-first local dataset inventory with content fingerprints, role, license/domain/language metadata, and optional token count;
+- user/lab-first local dataset inventory with content fingerprints, role, license/domain/language metadata, optional token count, and explicit `PUBLIC / INTERNAL / CONFIDENTIAL / PRIVATE` classification;
+- local user data defaults to `PRIVATE`; prepared datasets inherit the source classification instead of silently weakening policy;
+- backend specs declare a pinned data boundary: `LOCAL_MACHINE / CONTROLLED_PRIVATE / EXTERNAL / UNKNOWN`; non-public data is hard-blocked from `EXTERNAL` and `UNKNOWN` boundaries;
+- plan identity pins both dataset classification and backend boundary, and re-checks classification drift before calibration/execution;
+- legacy backend specs without a boundary remain hash-compatible and are interpreted as `LOCAL_MACHINE`; new explicit boundary declarations participate in the backend-spec hash;
 - reproducible DataPreparationPlugin contract with discoverable recipe registry;
 - built-in byte-preserving managed snapshot recipe via `frontierwright data prepare`, preserving source provenance while freezing exact training-input bytes under Frontierwright state;
 - prepared datasets retain source-dataset ID plus recipe ID/hash, and training plans pin the recipe hash in addition to dataset bytes;
@@ -114,7 +118,7 @@ Implemented now:
 - Academy zero-model birth via `frontierwright birth zero`, with deterministic `zero-8m` / `zero-25m` root checkpoint materialization, exact fingerprinting, runtime provenance, and idempotent repeated birth requests;
 - from-scratch pretraining now requires and pins a materialized zero-model birth root instead of silently reinitializing weights;
 - hard-missing prerequisites show `LOCKED`; calibrated accepted plans can project `READY` only after pinned model/data/backend/resource checks;
-- immutable `TrainingPlan` identity with pinned intervention ID/version/family, model fingerprint, dataset/recipe fingerprint, backend spec hash, resource profile, config, permission, and hard budgets;
+- immutable `TrainingPlan` identity with pinned intervention ID/version/family, model fingerprint, dataset/recipe fingerprint, dataset classification, backend spec hash/data boundary, resource profile, config, permission, and hard budgets;
 - representative calibration receipts with step time, throughput, peak memory, projected storage, and projected wall time;
 - idempotent durable local run attempts with worker/process identity, liveness reconciliation, durable executor results, explicit rerun semantics, and repairable run-receipt export;
 - built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` from-scratch pretraining/calibration;
@@ -123,6 +127,7 @@ Implemented now:
 - evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
 - training creates a `PENDING` candidate and never silently changes the champion;
 - candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
+- promotion re-checks current champion/build/evaluation state transactionally, enforces frozen-scale build floors by default, and records explicit override evidence when a user intentionally accepts an unmeasured or build-violating candidate;
 - stable JSON/non-interactive machine surfaces for project/model/birth/resource/build/stats/data/path/plan/run/candidate operations;
 - mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;
 - English/Korean human-string structure;
@@ -134,8 +139,8 @@ Not implemented yet:
 - production built-in training backends for all five paths beyond the narrow from-scratch reference backend and structured external command adapter;
 - full execution-time enforcement/accounting for every hard-budget dimension across calibration and repeated attempts;
 - public dataset discovery/download adapters and transformative recipes such as normalize/dedupe/tokenize/mixture;
-- remote/server/Slurm executor implementations;
-- full candidate evaluation-eligibility policy and build-floor enforcement transaction.
+- remote/server/Slurm executor implementations and concrete private Lab adapters;
+- stronger executor-boundary attestation beyond the current adapter-declared trust contract.
 
 Those surfaces remain explicitly `NOT_READY` / `UNKNOWN` rather than using fake data.
 

@@ -22,6 +22,23 @@ class DatasetProvenance(StrEnum):
     PUBLIC_DISCOVERED = "PUBLIC_DISCOVERED"
 
 
+class DatasetClassification(StrEnum):
+    PUBLIC = "PUBLIC"
+    INTERNAL = "INTERNAL"
+    CONFIDENTIAL = "CONFIDENTIAL"
+    PRIVATE = "PRIVATE"
+
+
+def default_dataset_classification(
+    provenance: DatasetProvenance,
+) -> DatasetClassification:
+    if provenance is DatasetProvenance.PUBLIC_DISCOVERED:
+        return DatasetClassification.PUBLIC
+    if provenance is DatasetProvenance.INTERNAL_CONNECTED:
+        return DatasetClassification.INTERNAL
+    return DatasetClassification.PRIVATE
+
+
 @dataclass(frozen=True)
 class DatasetFile:
     relative_path: str

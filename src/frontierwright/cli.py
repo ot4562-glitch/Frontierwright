@@ -11,7 +11,7 @@ from typing import Annotated, NoReturn
 import typer
 from rich.console import Console
 
-from frontierwright.data import DatasetRole
+from frontierwright.data import DatasetClassification, DatasetRole
 from frontierwright.domain import ModelOrigin
 from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
@@ -305,6 +305,7 @@ def _print_data(view: DataView) -> None:
         )
         console.print(f"  Fingerprint: {item.get('fingerprint')}")
         console.print(f"  Provenance: {item.get('provenance')}")
+        console.print(f"  Classification: {item.get('classification') or 'UNKNOWN'}")
         console.print(f"  License: {item.get('license') or 'UNKNOWN'}")
         console.print(f"  Domain: {item.get('domain') or 'UNKNOWN'}")
         console.print(f"  Language: {item.get('language') or 'UNKNOWN'}")
@@ -350,6 +351,10 @@ def _print_plan(view: PlanView) -> None:
     console.print(f"Backend: {view.backend_id}")
     console.print(f"Permission: {view.permission}")
     console.print(f"Dataset: {view.dataset_id}")
+    console.print(
+        f"Data policy: {view.dataset_classification or 'UNKNOWN'} -> "
+        f"{view.backend_data_boundary or 'UNKNOWN'}"
+    )
     console.print(f"Resource profile: {view.resource_profile_id or 'UNPINNED'}")
     console.print(f"Ready: {'YES' if view.ready else 'NO'}")
     if view.calibration:
@@ -1004,6 +1009,14 @@ def data_add(
         DatasetRole,
         typer.Option("--role", case_sensitive=False, help="PRETRAIN or SFT."),
     ],
+    classification: Annotated[
+        DatasetClassification | None,
+        typer.Option(
+            "--classification",
+            case_sensitive=False,
+            help="PUBLIC, INTERNAL, CONFIDENTIAL, or PRIVATE. Local data defaults PRIVATE.",
+        ),
+    ] = None,
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     name: Annotated[str | None, typer.Option("--name")] = None,
     license_name: Annotated[str | None, typer.Option("--license")] = None,
@@ -1021,6 +1034,7 @@ def data_add(
             source,
             name=name or source.stem or "Dataset",
             role=role,
+            classification=classification,
             license_name=license_name,
             domain=domain,
             language=language,

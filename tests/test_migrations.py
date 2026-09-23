@@ -56,7 +56,7 @@ def test_previous_registry_versions_migrate_to_current(
             )
         }
 
-    assert version == SCHEMA_VERSION == 14
+    assert version == SCHEMA_VERSION == 15
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -121,7 +121,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 14
+    assert version == SCHEMA_VERSION == 15
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -286,7 +286,7 @@ def test_v9_project_migrates_to_origin_appropriate_edition_profile(
     assert state.project["edition_profile"] == "ACADEMY"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 14
+    assert version == SCHEMA_VERSION == 15
 
 
 def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
@@ -315,7 +315,7 @@ def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(plans)")
         }
 
-    assert version == SCHEMA_VERSION == 14
+    assert version == SCHEMA_VERSION == 15
     assert "data_recipes" in tables
     assert {
         "source_dataset_id",
@@ -377,7 +377,7 @@ def test_v12_backfills_intervention_identity_for_existing_plan(tmp_path: Path) -
     assert plan.intervention_family == "SPECIALIZE"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 14
+    assert version == SCHEMA_VERSION == 15
 
 
 def test_v13_binds_numeric_build_schema_without_inventing_scale(
@@ -428,5 +428,81 @@ def test_v13_binds_numeric_build_schema_without_inventing_scale(
             row[1] for row in connection.execute("PRAGMA table_info(build_state)")
         }
 
-    assert version == SCHEMA_VERSION == 14
+    assert version == SCHEMA_VERSION == 15
     assert {"scale_hash", "scale_id", "scale_version"}.issubset(columns)
+
+
+def test_v14_backfills_dataset_classification_and_plan_boundary(tmp_path: Path) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("Lab", ModelOrigin.INTERNAL_LAB)
+
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute(
+            "INSERT INTO datasets ("
+            "dataset_id, name, role, provenance, classification, source_path, fingerprint, "
+            "total_bytes, file_count, manifest_json, created_at, active"
+            ") VALUES (?, ?, 'SFT', 'PUBLIC_DISCOVERED', 'PRIVATE', ?, ?, 1, 1, '[]', ?, 1)",
+            (
+                "dataset-public",
+                "Public",
+                "/tmp/public",
+                "sha256:public",
+                "2026-09-23T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO datasets ("
+            "dataset_id, name, role, provenance, classification, source_path, fingerprint, "
+            "total_bytes, file_count, manifest_json, created_at, active"
+            ") VALUES (?, ?, 'SFT', 'INTERNAL_CONNECTED', 'PRIVATE', ?, ?, 1, 1, '[]', ?, 1)",
+            (
+                "dataset-internal",
+                "Internal",
+                "/tmp/internal",
+                "sha256:internal",
+                "2026-09-23T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO plans ("
+            "plan_id, idempotency_key, path_id, intervention_id, intervention_version, "
+            "intervention_family, backend_id, backend_spec_hash, dataset_id, "
+            "dataset_fingerprint, dataset_source_path, permission, budgets_json, "
+            "config_json, created_at"
+            ") VALUES (?, ?, 'LORA_SFT', 'frontierwright.specialize.lora-sft', '1', "
+            "'SPECIALIZE', ?, ?, ?, ?, ?, 'PLAN', '{}', '{}', ?)",
+            (
+                "plan-v14",
+                "sha256:plan-v14",
+                "legacy-local",
+                "sha256:legacy-local",
+                "dataset-public",
+                "sha256:public",
+                "/tmp/public",
+                "2026-09-23T00:00:00+00:00",
+            ),
+        )
+        connection.execute("UPDATE plans SET dataset_classification = 'PRIVATE'")
+        connection.execute("PRAGMA user_version = 14")
+        connection.commit()
+
+    registry.read()
+    plan = registry.get_plan("plan-v14")
+
+    with sqlite3.connect(registry.path) as connection:
+        rows = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT dataset_id, classification FROM datasets "
+                "WHERE dataset_id IN ('dataset-public','dataset-internal')"
+            )
+        }
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert version == SCHEMA_VERSION == 15
+    assert rows == {
+        "dataset-public": "PUBLIC",
+        "dataset-internal": "INTERNAL",
+    }
+    assert plan.dataset_classification == "PUBLIC"
+    assert plan.backend_data_boundary == "LOCAL_MACHINE"

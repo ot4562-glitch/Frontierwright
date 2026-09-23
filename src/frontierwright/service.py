@@ -16,7 +16,12 @@ from frontierwright.artifact_store import (
     verify_manifest_digest,
     verify_sealed_artifact,
 )
-from frontierwright.data import DatasetProvenance, DatasetRole, inspect_local_dataset
+from frontierwright.data import (
+    DatasetClassification,
+    DatasetProvenance,
+    DatasetRole,
+    inspect_local_dataset,
+)
 from frontierwright.domain import (
     Axis,
     BuildIntent,
@@ -32,11 +37,13 @@ from frontierwright.editions import EditionProfile, policy_for
 from frontierwright.errors import FrontierwrightError
 from frontierwright.evaluations import apply_scale, load_capability_scale, load_evaluation_receipt
 from frontierwright.execution import (
+    BackendDataBoundary,
     CommandBackendSpec,
     HardBudgets,
     PermissionLevel,
     RunStatus,
     TrainingPlan,
+    backend_allows_dataset,
     compute_execution_request_digest,
     compute_plan_idempotency_key,
     load_command_backend_spec,
@@ -217,6 +224,8 @@ class PlanView:
     dataset_id: str | None = None
     dataset_recipe_id: str | None = None
     dataset_recipe_hash: str | None = None
+    dataset_classification: str | None = None
+    backend_data_boundary: str | None = None
     resource_profile_id: str | None = None
     permission: str | None = None
     budgets: dict[str, object] = field(default_factory=dict)
@@ -1009,6 +1018,7 @@ def get_data_view(root: Path) -> DataView:
                 "name": item["name"],
                 "role": item["role"],
                 "provenance": item["provenance"],
+                "classification": item["classification"],
                 "source_path": item["source_path"],
                 "fingerprint": item["fingerprint"],
                 "total_bytes": item["total_bytes"],
@@ -1032,6 +1042,7 @@ def add_local_dataset(
     *,
     name: str,
     role: DatasetRole,
+    classification: DatasetClassification | None = None,
     license_name: str | None = None,
     domain: str | None = None,
     language: str | None = None,
@@ -1050,6 +1061,7 @@ def add_local_dataset(
         name=name,
         role=role,
         provenance=DatasetProvenance.LOCAL_USER,
+        classification=classification,
         license_name=license_name,
         domain=domain,
         language=language,
@@ -1263,6 +1275,8 @@ def _plan_input_blockers(
             blockers.append("planned dataset preparation recipe identity changed")
         if dataset.get("preparation_recipe_hash") != plan.dataset_recipe_hash:
             blockers.append("planned dataset preparation recipe hash changed")
+        if dataset.get("classification") != plan.dataset_classification:
+            blockers.append("planned dataset classification changed")
         source = dataset.get("source_path")
         if isinstance(source, str):
             try:
@@ -1272,6 +1286,17 @@ def _plan_input_blockers(
             else:
                 if current_data.fingerprint != plan.dataset_fingerprint:
                     blockers.append("planned dataset content fingerprint drifted")
+
+    try:
+        pinned_classification = DatasetClassification(plan.dataset_classification)
+        pinned_boundary = BackendDataBoundary(plan.backend_data_boundary)
+    except ValueError:
+        blockers.append("plan contains invalid data-policy metadata")
+    else:
+        if not backend_allows_dataset(pinned_boundary, pinned_classification):
+            blockers.append(
+                "data policy blocks this dataset classification from the pinned backend"
+            )
 
     if plan.resource_profile_id is not None:
         profile = project_state.resource_profile
@@ -1383,6 +1408,8 @@ def get_plan_view(root: Path, plan_id: str) -> PlanView:
         dataset_id=plan.dataset_id,
         dataset_recipe_id=plan.dataset_recipe_id,
         dataset_recipe_hash=plan.dataset_recipe_hash,
+        dataset_classification=plan.dataset_classification,
+        backend_data_boundary=plan.backend_data_boundary,
         resource_profile_id=plan.resource_profile_id,
         permission=plan.permission.name,
         budgets=plan.budgets.to_dict(),
@@ -1441,6 +1468,23 @@ def create_training_plan(
         role=_required_dataset_role(path_id),
     )
     intervention = intervention_for_training_path(path_id)
+    try:
+        dataset_classification = DatasetClassification(str(dataset["classification"]))
+    except (KeyError, ValueError) as exc:
+        raise FrontierwrightError(
+            "DATASET_CLASSIFICATION_INVALID",
+            "Dataset classification is missing or invalid.",
+            4,
+        ) from exc
+    if not backend_allows_dataset(backend.data_boundary, dataset_classification):
+        raise FrontierwrightError(
+            "DATA_POLICY_LOCKED",
+            (
+                f"{dataset_classification.value} data cannot be used with "
+                f"{backend.data_boundary.value} backend boundary."
+            ),
+            12,
+        )
 
     try:
         key = compute_plan_idempotency_key(
@@ -1466,6 +1510,8 @@ def create_training_plan(
             permission=permission,
             budgets=budgets,
             config=config,
+            dataset_classification=dataset_classification.value,
+            backend_data_boundary=backend.data_boundary.value,
         )
     except (TypeError, ValueError) as exc:
         raise FrontierwrightError(
@@ -1510,6 +1556,8 @@ def create_training_plan(
             if isinstance(dataset.get("preparation_recipe_hash"), str)
             else None
         ),
+        dataset_classification=dataset_classification.value,
+        backend_data_boundary=backend.data_boundary.value,
         resource_profile_id=(
             str(state.resource_profile["profile_id"])
             if state.resource_profile is not None

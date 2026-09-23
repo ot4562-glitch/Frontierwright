@@ -762,6 +762,7 @@ def backend_spec_payload(python_executable: str) -> dict[str, object]:
     return {
         "schema_version": 1,
         "backend_id": REFERENCE_BACKEND_ID,
+        "data_boundary": "LOCAL_MACHINE",
         "supported_paths": [SUPPORTED_PATH],
         "calibrate_argv": [
             python_executable,

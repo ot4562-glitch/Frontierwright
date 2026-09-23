@@ -17,6 +17,7 @@ from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from frontierwright.data import DatasetClassification
 from frontierwright.errors import FrontierwrightError
 from frontierwright.paths import TrainingPathId
 
@@ -35,6 +36,25 @@ class RunStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     INCOMPLETE = "INCOMPLETE"
+
+
+class BackendDataBoundary(StrEnum):
+    LOCAL_MACHINE = "LOCAL_MACHINE"
+    CONTROLLED_PRIVATE = "CONTROLLED_PRIVATE"
+    EXTERNAL = "EXTERNAL"
+    UNKNOWN = "UNKNOWN"
+
+
+def backend_allows_dataset(
+    boundary: BackendDataBoundary,
+    classification: DatasetClassification,
+) -> bool:
+    if boundary in {
+        BackendDataBoundary.LOCAL_MACHINE,
+        BackendDataBoundary.CONTROLLED_PRIVATE,
+    }:
+        return True
+    return classification is DatasetClassification.PUBLIC
 
 
 @dataclass(frozen=True)
@@ -70,6 +90,8 @@ class CommandBackendSpec:
     calibrate_argv: tuple[str, ...]
     train_argv: tuple[str, ...]
     environment: dict[str, str]
+    data_boundary: BackendDataBoundary = BackendDataBoundary.LOCAL_MACHINE
+    data_boundary_explicit: bool = True
 
     def __post_init__(self) -> None:
         if not self.backend_id.strip():
@@ -88,13 +110,16 @@ class CommandBackendSpec:
                 raise ValueError("backend environment entries must be NUL-free")
 
     def canonical_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "backend_id": self.backend_id,
             "supported_paths": [item.value for item in self.supported_paths],
             "calibrate_argv": list(self.calibrate_argv),
             "train_argv": list(self.train_argv),
             "environment": self.environment,
         }
+        if self.data_boundary_explicit:
+            payload["data_boundary"] = self.data_boundary.value
+        return payload
 
     @property
     def sha256(self) -> str:
@@ -129,6 +154,8 @@ class TrainingPlan:
     budgets: HardBudgets
     config: dict[str, object]
     idempotency_key: str
+    dataset_classification: str = DatasetClassification.PRIVATE.value
+    backend_data_boundary: str = BackendDataBoundary.LOCAL_MACHINE.value
 
     def __post_init__(self) -> None:
         for name in (
@@ -139,6 +166,8 @@ class TrainingPlan:
             value = getattr(self, name)
             if not value.strip():
                 raise ValueError(f"{name} must be nonempty")
+        DatasetClassification(self.dataset_classification)
+        BackendDataBoundary(self.backend_data_boundary)
 
     def request_payload(self) -> dict[str, object]:
         return {
@@ -158,6 +187,8 @@ class TrainingPlan:
             "dataset_source_path": self.dataset_source_path,
             "dataset_recipe_id": self.dataset_recipe_id,
             "dataset_recipe_hash": self.dataset_recipe_hash,
+            "dataset_classification": self.dataset_classification,
+            "backend_data_boundary": self.backend_data_boundary,
             "resource_profile_id": self.resource_profile_id,
             "permission": self.permission.name,
             "budgets": self.budgets.to_dict(),
@@ -243,6 +274,10 @@ def load_command_backend_spec(path: Path) -> CommandBackendSpec:
         calibrate_raw = raw["calibrate_argv"]
         train_raw = raw["train_argv"]
         environment_raw = raw.get("environment", {})
+        data_boundary_raw = raw.get(
+            "data_boundary",
+            BackendDataBoundary.LOCAL_MACHINE.value,
+        )
         if not isinstance(supported_raw, list):
             raise ValueError("supported_paths must be a list")
         if not isinstance(calibrate_raw, list) or not all(
@@ -264,6 +299,8 @@ def load_command_backend_spec(path: Path) -> CommandBackendSpec:
             calibrate_argv=tuple(calibrate_raw),
             train_argv=tuple(train_raw),
             environment=dict(environment_raw),
+            data_boundary=BackendDataBoundary(str(data_boundary_raw)),
+            data_boundary_explicit="data_boundary" in raw,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise FrontierwrightError(
@@ -308,7 +345,11 @@ def compute_plan_idempotency_key(
     permission: PermissionLevel,
     budgets: HardBudgets,
     config: dict[str, object],
+    dataset_classification: str = DatasetClassification.PRIVATE.value,
+    backend_data_boundary: str = BackendDataBoundary.LOCAL_MACHINE.value,
 ) -> str:
+    DatasetClassification(dataset_classification)
+    BackendDataBoundary(backend_data_boundary)
     payload = {
         "path_id": path_id.value,
         "intervention_id": intervention_id,
@@ -318,6 +359,8 @@ def compute_plan_idempotency_key(
         "model_fingerprint": model_fingerprint,
         "dataset_fingerprint": dataset_fingerprint,
         "dataset_recipe_hash": dataset_recipe_hash,
+        "dataset_classification": dataset_classification,
+        "backend_data_boundary": backend_data_boundary,
         "resource_profile_id": resource_profile_id,
         "permission": permission.name,
         "budgets": budgets.to_dict(),

@@ -352,6 +352,7 @@ class FrontierwrightApp(App[None]):
                 f"{_human_bytes(item.get('total_bytes'))}"
             )
             lines.append(f"  Provenance: {item.get('provenance')}")
+            lines.append(f"  Classification: {item.get('classification') or 'UNKNOWN'}")
             lines.append(f"  Fingerprint: {item.get('fingerprint')}")
             lines.append(f"  License: {item.get('license') or 'UNKNOWN'}")
             if item.get("managed"):
