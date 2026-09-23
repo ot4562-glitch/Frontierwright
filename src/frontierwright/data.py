@@ -14,6 +14,7 @@ from frontierwright.models import sha256_file
 class DatasetRole(StrEnum):
     PRETRAIN = "PRETRAIN"
     SFT = "SFT"
+    PREFERENCE = "PREFERENCE"
 
 
 class DatasetProvenance(StrEnum):

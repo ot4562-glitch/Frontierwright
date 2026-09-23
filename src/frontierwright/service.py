@@ -2235,6 +2235,8 @@ def _required_dataset_role(path_id: TrainingPathId) -> DatasetRole:
         TrainingPathId.CONTINUED_PRETRAINING,
     ):
         return DatasetRole.PRETRAIN
+    if path_id is TrainingPathId.DPO:
+        return DatasetRole.PREFERENCE
     return DatasetRole.SFT
 
 

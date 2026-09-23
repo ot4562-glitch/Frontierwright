@@ -174,6 +174,12 @@ BUILTIN_INTERVENTION_PLUGINS: tuple[InterventionPlugin, ...] = (
         title="QLoRA SFT",
         path_id=TrainingPathId.QLORA_SFT,
     ),
+    _training_plugin(
+        intervention_id="frontierwright.align.dpo",
+        family=InterventionFamily.ALIGN,
+        title="Direct Preference Optimization (DPO)",
+        path_id=TrainingPathId.DPO,
+    ),
 )
 
 BUILTIN_INTERVENTIONS: tuple[InterventionDescriptor, ...] = tuple(

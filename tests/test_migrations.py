@@ -56,7 +56,7 @@ def test_previous_registry_versions_migrate_to_current(
             )
         }
 
-    assert version == SCHEMA_VERSION == 17
+    assert version == SCHEMA_VERSION == 18
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -122,7 +122,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 17
+    assert version == SCHEMA_VERSION == 18
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -287,7 +287,7 @@ def test_v9_project_migrates_to_origin_appropriate_edition_profile(
     assert state.project["edition_profile"] == "ACADEMY"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 17
+    assert version == SCHEMA_VERSION == 18
 
 
 def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
@@ -316,7 +316,7 @@ def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(plans)")
         }
 
-    assert version == SCHEMA_VERSION == 17
+    assert version == SCHEMA_VERSION == 18
     assert "data_recipes" in tables
     assert {
         "source_dataset_id",
@@ -378,7 +378,7 @@ def test_v12_backfills_intervention_identity_for_existing_plan(tmp_path: Path) -
     assert plan.intervention_family == "SPECIALIZE"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 17
+    assert version == SCHEMA_VERSION == 18
 
 
 def test_v13_binds_numeric_build_schema_without_inventing_scale(
@@ -429,7 +429,7 @@ def test_v13_binds_numeric_build_schema_without_inventing_scale(
             row[1] for row in connection.execute("PRAGMA table_info(build_state)")
         }
 
-    assert version == SCHEMA_VERSION == 17
+    assert version == SCHEMA_VERSION == 18
     assert {"scale_hash", "scale_id", "scale_version"}.issubset(columns)
 
 
@@ -500,7 +500,7 @@ def test_v14_backfills_dataset_classification_and_plan_boundary(tmp_path: Path) 
         }
         version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-    assert version == SCHEMA_VERSION == 17
+    assert version == SCHEMA_VERSION == 18
     assert rows == {
         "dataset-public": "PUBLIC",
         "dataset-internal": "INTERNAL",
@@ -526,5 +526,71 @@ def test_v16_adds_durable_run_usage_ledger(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(runs)")
         }
 
-    assert version == SCHEMA_VERSION == 17
+    assert version == SCHEMA_VERSION == 18
     assert "usage_json" in columns
+
+
+def test_v17_migration_preserves_datasets_and_allows_preference_role(
+    tmp_path: Path,
+) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("NOVA", ModelOrigin.ZERO)
+
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute(
+            "INSERT INTO datasets ("
+            "dataset_id, name, role, provenance, classification, source_path, "
+            "fingerprint, total_bytes, file_count, manifest_json, created_at, active"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "dataset-existing",
+                "Existing SFT",
+                "SFT",
+                "LOCAL_USER",
+                "PRIVATE",
+                str(tmp_path / "existing"),
+                "sha256:existing",
+                12,
+                1,
+                "[]",
+                "2026-09-23T00:00:00Z",
+                1,
+            ),
+        )
+        connection.execute("PRAGMA user_version = 17")
+        connection.commit()
+
+    state = registry.read()
+    assert any(item["dataset_id"] == "dataset-existing" for item in state.datasets)
+
+    with sqlite3.connect(registry.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'datasets'"
+        ).fetchone()[0]
+        self_fk = connection.execute("PRAGMA foreign_key_list(datasets)").fetchall()
+        connection.execute(
+            "INSERT INTO datasets ("
+            "dataset_id, name, role, provenance, classification, source_path, "
+            "fingerprint, total_bytes, file_count, manifest_json, created_at, active"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "dataset-preference",
+                "Preference pairs",
+                "PREFERENCE",
+                "LOCAL_USER",
+                "PRIVATE",
+                str(tmp_path / "preference"),
+                "sha256:preference",
+                24,
+                1,
+                "[]",
+                "2026-09-23T00:00:01Z",
+                1,
+            ),
+        )
+        connection.commit()
+
+    assert version == SCHEMA_VERSION == 18
+    assert "PREFERENCE" in schema
+    assert any(row[2] == "datasets" for row in self_fk)

@@ -2,9 +2,9 @@
 
 This backend intentionally stays narrow: real causal language-model training for
 Frontierwright reference-model lineages, including initial/continued pretraining,
-full-parameter causal SFT, merged-output LoRA SFT, and merged-output NF4 QLoRA SFT
-over serialized text. It is not a compatibility layer for arbitrary Hugging Face
-architectures.
+full-parameter causal SFT, merged-output LoRA SFT, merged-output NF4 QLoRA SFT,
+and full-parameter Direct Preference Optimization over structured preference pairs.
+It is not a compatibility layer for arbitrary Hugging Face architectures.
 
 The module is executed by a dedicated training Python environment:
     python -m frontierwright.reference_backend REQUEST_JSON
@@ -28,6 +28,7 @@ SUPPORTED_PATHS = (
     "FULL_SFT",
     "LORA_SFT",
     "QLORA_SFT",
+    "DPO",
 )
 VOCAB_SIZE = 256
 QLORA_BLOCK_SIZE = 64
@@ -112,6 +113,7 @@ class ReferenceConfig:
     max_dataset_bytes: int
     lora_rank: int
     lora_alpha: float
+    dpo_beta: float = 0.1
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -126,6 +128,7 @@ class ReferenceConfig:
             "max_dataset_bytes": self.max_dataset_bytes,
             "lora_rank": self.lora_rank,
             "lora_alpha": self.lora_alpha,
+            "dpo_beta": self.dpo_beta,
         }
 
 
@@ -253,6 +256,8 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
         raise ValueError(
             "lora_rank/lora_alpha are only valid for LORA_SFT or QLORA_SFT"
         )
+    if path_id != "DPO" and "dpo_beta" in raw:
+        raise ValueError("dpo_beta is only valid for DPO")
 
     return ReferenceConfig(
         preset=preset,
@@ -282,6 +287,7 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
         ),
         lora_rank=_positive_int(raw.get("lora_rank"), 8, "lora_rank"),
         lora_alpha=_positive_float(raw.get("lora_alpha"), 16.0, "lora_alpha"),
+        dpo_beta=_positive_float(raw.get("dpo_beta"), 0.1, "dpo_beta"),
     )
 
 
@@ -384,8 +390,272 @@ def _read_corpus(source: Path, *, max_bytes: int) -> bytes:
     corpus = b"".join(chunks)
     if not corpus:
         raise ValueError("dataset corpus is empty")
+
     return corpus
 
+
+@dataclass(frozen=True)
+class PreferencePair:
+    prompt: bytes
+    chosen: bytes
+    rejected: bytes
+
+
+def _read_preference_pairs(
+    source: Path,
+    *,
+    max_bytes: int,
+) -> tuple[PreferencePair, ...]:
+    """Load deterministic UTF-8 JSONL preference pairs."""
+
+    files = [
+        path
+        for path in _dataset_files(source)
+        if path.suffix.lower() == ".jsonl"
+    ]
+    if not files:
+        raise ValueError(
+            "DPO preference dataset must contain at least one .jsonl file"
+        )
+
+    pairs: list[PreferencePair] = []
+    consumed = 0
+    limit_reached = False
+    for path in files:
+        with path.open("rb") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                if not raw_line.strip():
+                    continue
+                if consumed + len(raw_line) > max_bytes:
+                    if not pairs:
+                        raise ValueError(
+                            "first DPO preference record exceeds max_dataset_bytes"
+                        )
+                    limit_reached = True
+                    break
+                consumed += len(raw_line)
+                try:
+                    raw = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"invalid UTF-8 JSONL preference record: "
+                        f"{path.name}:{line_number}"
+                    ) from exc
+                if not isinstance(raw, dict):
+                    raise ValueError(
+                        f"preference record must be an object: "
+                        f"{path.name}:{line_number}"
+                    )
+
+                values: dict[str, bytes] = {}
+                for key in ("prompt", "chosen", "rejected"):
+                    value = raw.get(key)
+                    if not isinstance(value, str) or not value:
+                        raise ValueError(
+                            f"preference record {key} must be a nonempty string: "
+                            f"{path.name}:{line_number}"
+                        )
+                    values[key] = value.encode("utf-8")
+                if values["chosen"] == values["rejected"]:
+                    raise ValueError(
+                        f"chosen and rejected must differ: "
+                        f"{path.name}:{line_number}"
+                    )
+                pairs.append(
+                    PreferencePair(
+                        prompt=values["prompt"],
+                        chosen=values["chosen"],
+                        rejected=values["rejected"],
+                    )
+                )
+        if limit_reached:
+            break
+
+    if not pairs:
+        raise ValueError("DPO preference dataset contains no usable pairs")
+    return tuple(pairs)
+
+
+def _validate_preference_pairs(
+    pairs: tuple[PreferencePair, ...],
+    preset: ModelPreset,
+) -> None:
+    maximum = preset.context_length + 1
+    for index, pair in enumerate(pairs):
+        for label, response in (
+            ("chosen", pair.chosen),
+            ("rejected", pair.rejected),
+        ):
+            combined = len(pair.prompt) + len(response)
+            if combined < 2:
+                raise ValueError(
+                    f"DPO pair {index} {label} sequence is too short to score"
+                )
+            if combined > maximum:
+                raise ValueError(
+                    f"DPO pair {index} {label} exceeds context capacity "
+                    f"({combined} bytes > {maximum})"
+                )
+
+
+def _response_logprob(
+    torch: Any,
+    model: Any,
+    *,
+    prompt: bytes,
+    response: bytes,
+    device: str,
+) -> Any:
+    combined = prompt + response
+    tokens = torch.tensor(list(combined), dtype=torch.long, device=device)
+    inputs = tokens[:-1].unsqueeze(0)
+    targets = tokens[1:]
+    logits = model(inputs)[0]
+    response_start = max(len(prompt) - 1, 0)
+    response_logits = logits[response_start:]
+    response_targets = targets[response_start:]
+    token_logprobs = torch.nn.functional.log_softmax(
+        response_logits,
+        dim=-1,
+    )
+    selected = token_logprobs.gather(
+        1,
+        response_targets.unsqueeze(1),
+    ).squeeze(1)
+    return selected.sum()
+
+
+def _dpo_training_objects(
+    torch: Any,
+    config: ReferenceConfig,
+    pairs: tuple[PreferencePair, ...],
+    *,
+    model_source_path: str,
+) -> tuple[Any, Any, Any, Any, str, dict[str, object]]:
+    torch.manual_seed(config.seed)
+    device = _select_device(torch, config.device)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(config.seed)
+
+    policy = _load_reference_model(
+        torch,
+        config.preset,
+        model_source_path=model_source_path,
+        device=device,
+    )
+    reference = _load_reference_model(
+        torch,
+        config.preset,
+        model_source_path=model_source_path,
+        device=device,
+    )
+    _validate_preference_pairs(pairs, config.preset)
+
+    for parameter in reference.parameters():
+        parameter.requires_grad = False
+    reference.eval()
+
+    trainable_parameters = [
+        parameter for parameter in policy.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("DPO policy produced no trainable parameters")
+    optimizer = torch.optim.AdamW(
+        trainable_parameters,
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(config.seed)
+    base_parameter_count = _parameter_count(policy)
+    training_details: dict[str, object] = {
+        "method": "dpo",
+        "beta": config.dpo_beta,
+        "reference_frozen": True,
+        "reference_source": "current_model_checkpoint",
+        "pair_count": len(pairs),
+        "base_parameter_count": base_parameter_count,
+        "trainable_parameter_count": _trainable_parameter_count(policy),
+    }
+    return (
+        policy,
+        reference,
+        optimizer,
+        generator,
+        device,
+        training_details,
+    )
+
+
+def _dpo_train_step(
+    torch: Any,
+    policy: Any,
+    reference: Any,
+    optimizer: Any,
+    pairs: tuple[PreferencePair, ...],
+    generator: Any,
+    *,
+    config: ReferenceConfig,
+    device: str,
+) -> tuple[float, int]:
+    policy.train()
+    optimizer.zero_grad(set_to_none=True)
+    indexes = torch.randint(
+        0,
+        len(pairs),
+        (config.batch_size,),
+        generator=generator,
+    )
+
+    losses: list[Any] = []
+    processed_tokens = 0
+    for raw_index in indexes.tolist():
+        pair = pairs[int(raw_index)]
+        policy_chosen = _response_logprob(
+            torch,
+            policy,
+            prompt=pair.prompt,
+            response=pair.chosen,
+            device=device,
+        )
+        policy_rejected = _response_logprob(
+            torch,
+            policy,
+            prompt=pair.prompt,
+            response=pair.rejected,
+            device=device,
+        )
+        with torch.no_grad():
+            reference_chosen = _response_logprob(
+                torch,
+                reference,
+                prompt=pair.prompt,
+                response=pair.chosen,
+                device=device,
+            )
+            reference_rejected = _response_logprob(
+                torch,
+                reference,
+                prompt=pair.prompt,
+                response=pair.rejected,
+                device=device,
+            )
+
+        policy_logratio = policy_chosen - policy_rejected
+        reference_logratio = reference_chosen - reference_rejected
+        preference_logit = config.dpo_beta * (
+            policy_logratio - reference_logratio
+        )
+        losses.append(-torch.nn.functional.logsigmoid(preference_logit))
+        processed_tokens += 2 * (
+            len(pair.prompt + pair.chosen) - 1
+            + len(pair.prompt + pair.rejected) - 1
+        )
+
+    loss = torch.stack(losses).mean()
+    loss.backward()
+    optimizer.step()
+    return float(loss.detach().cpu().item()), processed_tokens
 
 
 def _objective_for_path(path_id: object) -> str:
@@ -399,6 +669,8 @@ def _objective_for_path(path_id: object) -> str:
         return "lora_causal_sft"
     if path_id == "QLORA_SFT":
         return "qlora_nf4_causal_sft"
+    if path_id == "DPO":
+        return "direct_preference_optimization"
     raise ValueError(f"unsupported reference training path: {path_id!r}")
 
 
@@ -1237,40 +1509,53 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
     dataset_source = request.get("dataset_source_path")
     if not isinstance(dataset_source, str) or not dataset_source:
         raise ValueError("dataset_source_path is required")
-    corpus_bytes = _read_corpus(
-        _native_path(dataset_source),
-        max_bytes=config.max_dataset_bytes,
-    )
     model_source_path = request.get("model_source_path")
     if model_source_path is not None and not isinstance(model_source_path, str):
         raise ValueError("model_source_path must be a string when supplied")
-    model, optimizer, corpus, generator, device, training_details = _training_objects(
-        torch,
-        config,
-        corpus_bytes,
-        path_id=path_id,
-        model_source_path=model_source_path,
-    )
 
-    # Warm-up once so initialization/runtime setup is not charged to steady-state timing.
-    _train_step(
-        torch,
-        model,
-        optimizer,
-        corpus,
-        generator,
-        config=config,
-        device=device,
-    )
-    if device == "cuda":
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-
-    rss_peak = _process_rss_bytes()
-    token_count = 0
-    start = time.perf_counter()
-    for _ in range(config.calibration_steps):
-        _, tokens = _train_step(
+    if path_id == "DPO":
+        if not isinstance(model_source_path, str) or not model_source_path:
+            raise ValueError("DPO requires a materialized current model")
+        preference_pairs = _read_preference_pairs(
+            _native_path(dataset_source),
+            max_bytes=config.max_dataset_bytes,
+        )
+        (
+            model,
+            reference_model,
+            optimizer,
+            generator,
+            device,
+            training_details,
+        ) = _dpo_training_objects(
+            torch,
+            config,
+            preference_pairs,
+            model_source_path=model_source_path,
+        )
+        _dpo_train_step(
+            torch,
+            model,
+            reference_model,
+            optimizer,
+            preference_pairs,
+            generator,
+            config=config,
+            device=device,
+        )
+    else:
+        corpus_bytes = _read_corpus(
+            _native_path(dataset_source),
+            max_bytes=config.max_dataset_bytes,
+        )
+        model, optimizer, corpus, generator, device, training_details = _training_objects(
+            torch,
+            config,
+            corpus_bytes,
+            path_id=path_id,
+            model_source_path=model_source_path,
+        )
+        _train_step(
             torch,
             model,
             optimizer,
@@ -1279,6 +1564,35 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
             config=config,
             device=device,
         )
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+    rss_peak = _process_rss_bytes()
+    token_count = 0
+    start = time.perf_counter()
+    for _ in range(config.calibration_steps):
+        if path_id == "DPO":
+            _, tokens = _dpo_train_step(
+                torch,
+                model,
+                reference_model,
+                optimizer,
+                preference_pairs,
+                generator,
+                config=config,
+                device=device,
+            )
+        else:
+            _, tokens = _train_step(
+                torch,
+                model,
+                optimizer,
+                corpus,
+                generator,
+                config=config,
+                device=device,
+            )
         token_count += tokens
         current_rss = _process_rss_bytes()
         if current_rss is not None:
@@ -1330,20 +1644,42 @@ def _train(
     if not isinstance(output_root, str) or not output_root:
         raise ValueError("output_root is required")
 
-    corpus_bytes = _read_corpus(
-        _native_path(dataset_source),
-        max_bytes=config.max_dataset_bytes,
-    )
     model_source_path = request.get("model_source_path")
     if model_source_path is not None and not isinstance(model_source_path, str):
         raise ValueError("model_source_path must be a string when supplied")
-    model, optimizer, corpus, generator, device, training_details = _training_objects(
-        torch,
-        config,
-        corpus_bytes,
-        path_id=path_id,
-        model_source_path=model_source_path,
-    )
+
+    if path_id == "DPO":
+        if not isinstance(model_source_path, str) or not model_source_path:
+            raise ValueError("DPO requires a materialized current model")
+        preference_pairs = _read_preference_pairs(
+            _native_path(dataset_source),
+            max_bytes=config.max_dataset_bytes,
+        )
+        (
+            model,
+            reference_model,
+            optimizer,
+            generator,
+            device,
+            training_details,
+        ) = _dpo_training_objects(
+            torch,
+            config,
+            preference_pairs,
+            model_source_path=model_source_path,
+        )
+    else:
+        corpus_bytes = _read_corpus(
+            _native_path(dataset_source),
+            max_bytes=config.max_dataset_bytes,
+        )
+        model, optimizer, corpus, generator, device, training_details = _training_objects(
+            torch,
+            config,
+            corpus_bytes,
+            path_id=path_id,
+            model_source_path=model_source_path,
+        )
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
@@ -1351,15 +1687,27 @@ def _train(
     token_count = 0
     start = time.perf_counter()
     for _ in range(config.steps):
-        loss, tokens = _train_step(
-            torch,
-            model,
-            optimizer,
-            corpus,
-            generator,
-            config=config,
-            device=device,
-        )
+        if path_id == "DPO":
+            loss, tokens = _dpo_train_step(
+                torch,
+                model,
+                reference_model,
+                optimizer,
+                preference_pairs,
+                generator,
+                config=config,
+                device=device,
+            )
+        else:
+            loss, tokens = _train_step(
+                torch,
+                model,
+                optimizer,
+                corpus,
+                generator,
+                config=config,
+                device=device,
+            )
         losses.append(loss)
         token_count += tokens
     if device == "cuda":

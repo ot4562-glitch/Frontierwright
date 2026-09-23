@@ -1356,7 +1356,11 @@ def data_add(
     source: Annotated[Path, typer.Argument(help="Local dataset file or directory.")],
     role: Annotated[
         DatasetRole,
-        typer.Option("--role", case_sensitive=False, help="PRETRAIN or SFT."),
+        typer.Option(
+            "--role",
+            case_sensitive=False,
+            help="PRETRAIN, SFT, or PREFERENCE.",
+        ),
     ],
     classification: Annotated[
         DatasetClassification | None,

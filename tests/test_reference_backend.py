@@ -11,6 +11,7 @@ from frontierwright.reference_backend import (
     _objective_for_path,
     _parameter_count,
     _read_corpus,
+    _read_preference_pairs,
     _trainable_parameter_count,
     backend_spec_payload,
 )
@@ -25,6 +26,7 @@ def test_reference_backend_declares_pretraining_full_sft_and_lora() -> None:
         "FULL_SFT",
         "LORA_SFT",
         "QLORA_SFT",
+        "DPO",
     ]
 
 
@@ -36,6 +38,7 @@ def test_reference_backend_objective_labels_are_path_specific() -> None:
     assert _objective_for_path("FULL_SFT") == "full_parameter_causal_sft"
     assert _objective_for_path("LORA_SFT") == "lora_causal_sft"
     assert _objective_for_path("QLORA_SFT") == "qlora_nf4_causal_sft"
+    assert _objective_for_path("DPO") == "direct_preference_optimization"
 
 
 def test_reference_config_infers_preset_from_materialized_model(
@@ -190,3 +193,93 @@ def test_reference_qlora_packs_nf4_and_merges_when_torch_available() -> None:
     _merge_lora_parametrizations(torch, model)
     assert _parameter_count(model) == base_parameter_count
     assert not hasattr(model.blocks[0].mlp[0], "parametrizations")
+
+
+def test_reference_dpo_config_is_path_scoped(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "frontierwright_reference_backend": (
+                    "frontierwright-reference-pytorch-v1"
+                ),
+                "preset": "zero-8m",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = _load_config(
+        {
+            "path_id": "DPO",
+            "model_source_path": str(model),
+            "config": {"dpo_beta": 0.2},
+        }
+    )
+    assert config.dpo_beta == 0.2
+
+    import pytest
+
+    with pytest.raises(ValueError, match="dpo_beta is only valid for DPO"):
+        _load_config(
+            {
+                "path_id": "FULL_SFT",
+                "model_source_path": str(model),
+                "config": {"dpo_beta": 0.2},
+            }
+        )
+
+
+def test_reference_dpo_reads_jsonl_pairs_deterministically(tmp_path: Path) -> None:
+    data = tmp_path / "preference"
+    data.mkdir()
+    (data / "pairs.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "prompt": "Question: 1+1? Answer:",
+                        "chosen": " 2",
+                        "rejected": " 3",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "prompt": "Opposite of cold:",
+                        "chosen": " hot",
+                        "rejected": " blue",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    pairs = _read_preference_pairs(data, max_bytes=4096)
+    assert len(pairs) == 2
+    assert pairs[0].prompt == b"Question: 1+1? Answer:"
+    assert pairs[0].chosen == b" 2"
+    assert pairs[0].rejected == b" 3"
+
+
+def test_reference_dpo_rejects_identical_preferences(tmp_path: Path) -> None:
+    import pytest
+
+    data = tmp_path / "preference"
+    data.mkdir()
+    (data / "pairs.jsonl").write_text(
+        json.dumps(
+            {
+                "prompt": "Question:",
+                "chosen": " same",
+                "rejected": " same",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="chosen and rejected must differ"):
+        _read_preference_pairs(data, max_bytes=4096)

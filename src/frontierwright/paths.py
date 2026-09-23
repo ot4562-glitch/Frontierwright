@@ -22,6 +22,7 @@ class TrainingPathId(StrEnum):
     FULL_SFT = "FULL_SFT"
     LORA_SFT = "LORA_SFT"
     QLORA_SFT = "QLORA_SFT"
+    DPO = "DPO"
 
 
 @dataclass(frozen=True)
@@ -175,12 +176,45 @@ class _SFTPath:
         )
 
 
+
+
+@dataclass(frozen=True)
+class DirectPreferenceOptimizationPath:
+    path_id: TrainingPathId = TrainingPathId.DPO
+    title: str = "Direct Preference Optimization (DPO)"
+
+    def assess(self, context: PathContext) -> PathAssessment:
+        blockers: list[str] = []
+        next_checks: list[str] = []
+        if not context.champion_present:
+            blockers.append("current model required")
+        elif context.champion_is_birth_root:
+            blockers.append(
+                "born root has not completed initial pretraining; "
+                "preference optimization requires a trained descendant"
+            )
+        elif context.champion_trainable is not True:
+            blockers.append("trainable model representation required")
+        if DatasetRole.PREFERENCE not in context.dataset_roles:
+            blockers.append("preference dataset required")
+        if not context.resource_profile_available:
+            next_checks.append("run frontierwright resources detect")
+        return _finish(
+            path_id=self.path_id,
+            title=self.title,
+            context=context,
+            blockers=blockers,
+            next_checks=next_checks,
+        )
+
+
 DEFAULT_PATHS: tuple[TrainingPathPlugin, ...] = (
     FromScratchPretrainingPath(),
     ContinuedPretrainingPath(),
     _SFTPath(TrainingPathId.FULL_SFT, "Full SFT"),
     _SFTPath(TrainingPathId.LORA_SFT, "LoRA SFT"),
     _SFTPath(TrainingPathId.QLORA_SFT, "QLoRA SFT"),
+    DirectPreferenceOptimizationPath(),
 )
 
 

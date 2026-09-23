@@ -91,3 +91,22 @@ def test_training_assessment_executes_through_intervention_plugins() -> None:
     assert lora.availability.value == "PLANNABLE"
     assert lora.blockers == ()
     assert lora.recommendation_eligible is True
+
+
+def test_dpo_is_a_builtin_align_training_intervention() -> None:
+    item = intervention_for_training_path(TrainingPathId.DPO)
+    assert item.intervention_id == "frontierwright.align.dpo"
+    assert item.family is InterventionFamily.ALIGN
+    assert item.surface is InterventionSurface.TRAINING_PATH
+
+    context = PathContext(
+        origin=ModelOrigin.IMPORTED_LOCAL,
+        champion_present=True,
+        champion_trainable=True,
+        history_confidence=HistoryConfidence.VERIFIED,
+        resource_profile_available=True,
+        dataset_roles=frozenset({DatasetRole.PREFERENCE}),
+    )
+    assessment = training_intervention_for_path(TrainingPathId.DPO).assess(context)
+    assert assessment.availability.value == "PLANNABLE"
+    assert assessment.blockers == ()

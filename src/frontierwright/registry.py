@@ -57,7 +57,7 @@ from frontierwright.recipes import (
 )
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -152,7 +152,7 @@ CREATE TABLE capability_profiles (
 CREATE TABLE datasets (
     dataset_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('PRETRAIN','SFT')),
+    role TEXT NOT NULL CHECK (role IN ('PRETRAIN','SFT','PREFERENCE')),
     provenance TEXT NOT NULL CHECK (
         provenance IN ('LOCAL_USER','INTERNAL_CONNECTED','PUBLIC_DISCOVERED')),
     classification TEXT NOT NULL DEFAULT 'PRIVATE' CHECK (
@@ -934,6 +934,65 @@ class Registry:
                 )
                 connection.commit()
                 version = 17
+
+            if version == 17:
+                connection.commit()
+                connection.execute("PRAGMA foreign_keys = OFF")
+                try:
+                    connection.executescript(
+                        """
+BEGIN IMMEDIATE;
+CREATE TABLE datasets_v18 (
+    dataset_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('PRETRAIN','SFT','PREFERENCE')),
+    provenance TEXT NOT NULL CHECK (
+        provenance IN ('LOCAL_USER','INTERNAL_CONNECTED','PUBLIC_DISCOVERED')),
+    classification TEXT NOT NULL DEFAULT 'PRIVATE' CHECK (
+        classification IN ('PUBLIC','INTERNAL','CONFIDENTIAL','PRIVATE')),
+    source_path TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    total_bytes INTEGER NOT NULL,
+    file_count INTEGER NOT NULL,
+    manifest_json TEXT NOT NULL,
+    license TEXT,
+    domain TEXT,
+    language TEXT,
+    token_count INTEGER,
+    created_at TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0,1)),
+    source_dataset_id TEXT REFERENCES datasets_v18(dataset_id),
+    preparation_recipe_id TEXT,
+    preparation_recipe_hash TEXT
+);
+INSERT INTO datasets_v18 (
+    dataset_id, name, role, provenance, classification, source_path,
+    fingerprint, total_bytes, file_count, manifest_json, license,
+    domain, language, token_count, created_at, active, source_dataset_id,
+    preparation_recipe_id, preparation_recipe_hash
+)
+SELECT
+    dataset_id, name, role, provenance, classification, source_path,
+    fingerprint, total_bytes, file_count, manifest_json, license,
+    domain, language, token_count, created_at, active, source_dataset_id,
+    preparation_recipe_id, preparation_recipe_hash
+FROM datasets;
+DROP TABLE datasets;
+ALTER TABLE datasets_v18 RENAME TO datasets;
+"""
+                    )
+                    connection.execute("PRAGMA user_version = 18")
+                    self.event(
+                        connection,
+                        "SCHEMA_MIGRATED",
+                        {"from_version": 17, "to_version": 18},
+                    )
+                    connection.commit()
+                finally:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 18
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(

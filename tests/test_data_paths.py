@@ -233,3 +233,39 @@ def test_verified_history_enables_recommendation_eligibility_but_no_fake_winner(
     assert lora["recommendation_eligible"] is True
     assert view.recommended_path is None
     assert "No effect/recommendation model" in (view.recommendation_reason or "")
+
+
+def test_preference_data_unlocks_dpo_without_unlocking_sft_paths(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    import_local_model(
+        project,
+        fake_hf_model(tmp_path / "model"),
+        origin=ModelOrigin.IMPORTED_LOCAL,
+        project_name="Imported",
+    )
+    preference = tmp_path / "preference"
+    preference.mkdir()
+    (preference / "pairs.jsonl").write_text(
+        '{"prompt":"Q: 1+1? A:","chosen":" 2","rejected":" 3"}\n',
+        encoding="utf-8",
+    )
+    add_local_dataset(
+        project,
+        preference,
+        name="Preference pairs",
+        role=DatasetRole.PREFERENCE,
+    )
+
+    view = get_paths_view(project)
+    dpo = by_id(view, "DPO")
+    assert dpo["availability"] == "PLANNABLE"
+    assert dpo["blockers"] == []
+    assert dpo["intervention_family"] == "ALIGN"
+    assert dpo["intervention_id"] == "frontierwright.align.dpo"
+
+    for path_id in ("FULL_SFT", "LORA_SFT", "QLORA_SFT"):
+        item = by_id(view, path_id)
+        assert item["availability"] == "LOCKED"
+        assert "SFT dataset required" in item["blockers"]
