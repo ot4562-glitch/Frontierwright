@@ -28,9 +28,10 @@ The local workspace/folder name and public product name are both **Frontierwrigh
 Read these in this order:
 
 1. `product/PRODUCT_DECISIONS_OVERRIDE_20260922.md` — **highest-precedence product decisions**
-2. `product/V1_IMPLEMENTATION_BLUEPRINT_20260922.md` — v1 implementation contract
+2. `product/EDITION_ARCHITECTURE_DECISION_20260923.md` — **frozen Studio / Academy / Lab edition architecture and lifecycle boundary**
+3. `product/V1_IMPLEMENTATION_BLUEPRINT_20260922.md` — v1 implementation contract
 
-If an older planning document conflicts with either file above, the two canonical documents win.
+If an older planning document conflicts with any canonical document above, the canonical documents win within their stated scope.
 
 A supporting engineering note, `product/MODEL_DEVELOPMENT_AS_RECIPE_20260923.md`, explains why Frontierwright treats a checkpoint as the current result of a reproducible training recipe rather than as a set of cleanly swappable capability modules.
 
