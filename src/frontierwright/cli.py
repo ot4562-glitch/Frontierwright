@@ -31,6 +31,7 @@ from frontierwright.service import (
     CandidateView,
     CompareView,
     DataView,
+    EvaluationCompareView,
     EvaluationRunView,
     HistoryView,
     InterventionsView,
@@ -45,6 +46,7 @@ from frontierwright.service import (
     birth_zero_model,
     calibrate_training_plan,
     compare_candidate,
+    compare_candidate_evaluation,
     connect_lab_adapter,
     create_training_plan,
     detect_resources,
@@ -157,6 +159,12 @@ def _stats_payload(view: StatsView) -> dict[str, object]:
 
 
 def _evaluation_payload(view: EvaluationRunView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _evaluation_compare_payload(
+    view: EvaluationCompareView,
+) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -334,6 +342,28 @@ def _print_evaluation(view: EvaluationRunView) -> None:
             f"{item.get('task_id')}@{item.get('task_version')} "
             f"{item.get('metric')}={item.get('value')}"
         )
+
+
+def _print_evaluation_compare(view: EvaluationCompareView) -> None:
+    console.print("[bold]RAW EVALUATION COMPARE[/bold]")
+    console.print(f"Pack: {view.pack_id}@{view.pack_version}")
+    console.print(f"Dataset: {view.dataset_id}")
+    console.print(f"Champion: {view.champion_model_id}")
+    console.print(
+        f"Candidate: {view.candidate_model_id} [{view.candidate_status or 'UNKNOWN'}]"
+    )
+    console.print(f"Comparable: {'YES' if view.comparable else 'NO'}")
+    if view.reason:
+        console.print(view.reason)
+    if view.measurements:
+        console.print("")
+        for item in view.measurements:
+            console.print(
+                f"{item.get('metric')}: champion={item.get('champion_value')} "
+                f"candidate={item.get('candidate_value')} "
+                f"raw_delta={item.get('raw_delta')} "
+                f"improvement_delta={item.get('improvement_delta')}"
+            )
 
 
 def _print_data(view: DataView) -> None:
@@ -1225,6 +1255,82 @@ def evaluation_run(
         _emit_json(_evaluation_payload(view))
         return
     _print_evaluation(view)
+
+
+@evaluation_app.command("compare")
+def evaluation_compare(
+    candidate: Annotated[
+        str,
+        typer.Option("--candidate", help="Candidate model ID to compare with champion."),
+    ],
+    dataset: Annotated[
+        str,
+        typer.Option("--dataset", help="Registered dataset ID used for both evaluations."),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    pack: Annotated[
+        str,
+        typer.Option("--pack", help="Evaluation pack ID."),
+    ] = REFERENCE_LM_PACK.pack_id,
+    python_executable: Annotated[
+        str,
+        typer.Option(
+            "--python",
+            help="Python executable for the isolated evaluator environment.",
+        ),
+    ] = sys.executable,
+    device: Annotated[
+        str,
+        typer.Option("--device", help="auto, cpu, or cuda."),
+    ] = "auto",
+    batch_size: Annotated[
+        int,
+        typer.Option("--batch-size", min=1, help="Evaluation windows per batch."),
+    ] = 4,
+    max_batches: Annotated[
+        int,
+        typer.Option("--max-batches", min=1, help="Maximum deterministic batches."),
+    ] = 16,
+    max_dataset_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-dataset-bytes",
+            min=1,
+            help="Maximum dataset bytes read by each evaluator.",
+        ),
+    ] = 64 * 1024 * 1024,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option("--timeout", min=0.001, help="Maximum wall time per evaluator."),
+    ] = 300.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = compare_candidate_evaluation(
+            path,
+            candidate_model_id=candidate,
+            pack_id=pack,
+            dataset_id=dataset,
+            python_executable=python_executable,
+            device=device,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            max_dataset_bytes=max_dataset_bytes,
+            timeout_seconds=timeout_seconds,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_evaluation_compare_payload(view))
+        return
+    _print_evaluation_compare(view)
 
 
 @data_app.command("show")

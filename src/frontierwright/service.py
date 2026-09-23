@@ -219,6 +219,26 @@ class EvaluationRunView:
 
 
 @dataclass(frozen=True)
+class EvaluationCompareView:
+    schema_version: int = 1
+    pack_id: str | None = None
+    pack_version: str | None = None
+    dataset_id: str | None = None
+    dataset_fingerprint: str | None = None
+    champion_model_id: str | None = None
+    candidate_model_id: str | None = None
+    candidate_status: str | None = None
+    comparable: bool = False
+    reason: str | None = None
+    champion_receipt_id: str | None = None
+    candidate_receipt_id: str | None = None
+    measurements: list[dict[str, object]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class DataView:
     schema_version: int = 1
     datasets: list[dict[str, object]] = field(default_factory=list)
@@ -1077,6 +1097,32 @@ def run_reference_evaluation(
     existing = registry.get_evaluation_receipt(receipt_id)
     if existing is not None:
         receipt = _receipt_from_registry_row(existing)
+        expected_conditions = {
+            "pack_id": REFERENCE_LM_PACK.pack_id,
+            "pack_version": REFERENCE_LM_PACK.pack_version,
+            "dataset_id": dataset_id,
+            "dataset_fingerprint": fingerprint,
+            "config": config,
+        }
+        replay_identity_matches = bool(
+            receipt.model_id == model.model_id
+            and receipt.model_fingerprint == model.fingerprint
+            and receipt.evaluator_id == REFERENCE_LM_PACK.evaluator_id
+            and receipt.evaluator_version == REFERENCE_LM_PACK.evaluator_version
+            and all(
+                receipt.conditions.get(key) == value
+                for key, value in expected_conditions.items()
+            )
+        )
+        if not replay_identity_matches:
+            raise FrontierwrightError(
+                "EVALUATION_RECEIPT_CONFLICT",
+                (
+                    "Deterministic evaluation receipt ID is already occupied by "
+                    "different model/data/config evidence."
+                ),
+                13,
+            )
         return _evaluation_run_view(
             receipt,
             dataset_id=dataset_id,
@@ -1273,6 +1319,179 @@ def run_evaluation_pack(
         max_batches=max_batches,
         max_dataset_bytes=max_dataset_bytes,
         timeout_seconds=timeout_seconds,
+    )
+
+
+def compare_candidate_evaluation(
+    root: Path,
+    *,
+    candidate_model_id: str,
+    pack_id: str,
+    dataset_id: str,
+    python_executable: str,
+    device: str = "auto",
+    batch_size: int = 4,
+    max_batches: int = 16,
+    max_dataset_bytes: int = 64 * 1024 * 1024,
+    timeout_seconds: float = 300.0,
+) -> EvaluationCompareView:
+    registry = Registry(root)
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required for raw evaluation comparison.",
+            12,
+        )
+    candidate = registry.get_candidate(candidate_model_id)
+
+    champion_view = run_evaluation_pack(
+        root,
+        pack_id=pack_id,
+        dataset_id=dataset_id,
+        model_id=state.champion.model.model_id,
+        python_executable=python_executable,
+        device=device,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        max_dataset_bytes=max_dataset_bytes,
+        timeout_seconds=timeout_seconds,
+    )
+    candidate_view = run_evaluation_pack(
+        root,
+        pack_id=pack_id,
+        dataset_id=dataset_id,
+        model_id=candidate.model.model_id,
+        python_executable=python_executable,
+        device=device,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        max_dataset_bytes=max_dataset_bytes,
+        timeout_seconds=timeout_seconds,
+    )
+
+    if (
+        champion_view.pack_id != candidate_view.pack_id
+        or champion_view.pack_version != candidate_view.pack_version
+        or champion_view.dataset_fingerprint != candidate_view.dataset_fingerprint
+        or champion_view.evaluator_id != candidate_view.evaluator_id
+        or champion_view.evaluator_version != candidate_view.evaluator_version
+    ):
+        return EvaluationCompareView(
+            pack_id=pack_id,
+            pack_version=champion_view.pack_version,
+            dataset_id=dataset_id,
+            dataset_fingerprint=champion_view.dataset_fingerprint,
+            champion_model_id=state.champion.model.model_id,
+            candidate_model_id=candidate.model.model_id,
+            candidate_status=candidate.status.value,
+            comparable=False,
+            reason="Champion and candidate evaluation evidence provenance differs.",
+            champion_receipt_id=champion_view.receipt_id,
+            candidate_receipt_id=candidate_view.receipt_id,
+        )
+
+    def measurement_map(
+        items: list[dict[str, object]],
+    ) -> dict[tuple[str, str, str], tuple[float, bool]]:
+        result: dict[tuple[str, str, str], tuple[float, bool]] = {}
+        for item in items:
+            task_id = item.get("task_id")
+            task_version = item.get("task_version")
+            metric = item.get("metric")
+            value = item.get("value")
+            direction = item.get("higher_is_better")
+            if (
+                not isinstance(task_id, str)
+                or not isinstance(task_version, str)
+                or not isinstance(metric, str)
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not isinstance(direction, bool)
+            ):
+                raise FrontierwrightError(
+                    "EVALUATION_RECEIPT_INVALID",
+                    "Evaluation comparison encountered malformed raw measurement evidence.",
+                    4,
+                )
+            key = (task_id, task_version, metric)
+            if key in result:
+                raise FrontierwrightError(
+                    "EVALUATION_RECEIPT_INVALID",
+                    "Evaluation comparison encountered duplicate raw measurement evidence.",
+                    4,
+                )
+            result[key] = (float(value), direction)
+        return result
+
+    champion_measurements = measurement_map(champion_view.measurements)
+    candidate_measurements = measurement_map(candidate_view.measurements)
+    if champion_measurements.keys() != candidate_measurements.keys():
+        return EvaluationCompareView(
+            pack_id=pack_id,
+            pack_version=champion_view.pack_version,
+            dataset_id=dataset_id,
+            dataset_fingerprint=champion_view.dataset_fingerprint,
+            champion_model_id=state.champion.model.model_id,
+            candidate_model_id=candidate.model.model_id,
+            candidate_status=candidate.status.value,
+            comparable=False,
+            reason="Champion and candidate evaluation receipts expose different metrics.",
+            champion_receipt_id=champion_view.receipt_id,
+            candidate_receipt_id=candidate_view.receipt_id,
+        )
+
+    comparisons: list[dict[str, object]] = []
+    for key in sorted(champion_measurements):
+        champion_value, champion_direction = champion_measurements[key]
+        candidate_value, candidate_direction = candidate_measurements[key]
+        if champion_direction != candidate_direction:
+            return EvaluationCompareView(
+                pack_id=pack_id,
+                pack_version=champion_view.pack_version,
+                dataset_id=dataset_id,
+                dataset_fingerprint=champion_view.dataset_fingerprint,
+                champion_model_id=state.champion.model.model_id,
+                candidate_model_id=candidate.model.model_id,
+                candidate_status=candidate.status.value,
+                comparable=False,
+                reason="Champion and candidate metric direction metadata differs.",
+                champion_receipt_id=champion_view.receipt_id,
+                candidate_receipt_id=candidate_view.receipt_id,
+            )
+        raw_delta = candidate_value - champion_value
+        improvement_delta = raw_delta if champion_direction else -raw_delta
+        comparisons.append(
+            {
+                "task_id": key[0],
+                "task_version": key[1],
+                "metric": key[2],
+                "higher_is_better": champion_direction,
+                "champion_value": champion_value,
+                "candidate_value": candidate_value,
+                "raw_delta": raw_delta,
+                "improvement_delta": improvement_delta,
+            }
+        )
+
+    return EvaluationCompareView(
+        pack_id=pack_id,
+        pack_version=champion_view.pack_version,
+        dataset_id=dataset_id,
+        dataset_fingerprint=champion_view.dataset_fingerprint,
+        champion_model_id=state.champion.model.model_id,
+        candidate_model_id=candidate.model.model_id,
+        candidate_status=candidate.status.value,
+        comparable=True,
+        reason=(
+            "Raw metrics were measured with the same evaluation pack, evaluator version, "
+            "dataset fingerprint, and evaluation config. Positive improvement_delta means "
+            "the candidate moved in the metric's declared better direction."
+        ),
+        champion_receipt_id=champion_view.receipt_id,
+        candidate_receipt_id=candidate_view.receipt_id,
+        measurements=comparisons,
     )
 
 

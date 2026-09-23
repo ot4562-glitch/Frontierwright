@@ -5,12 +5,13 @@ import pytest
 
 import frontierwright.service as service_module
 from frontierwright.data import DatasetRole
-from frontierwright.domain import ModelOrigin
+from frontierwright.domain import ModelOrigin, ModelState
 from frontierwright.errors import FrontierwrightError
 from frontierwright.evaluations import REFERENCE_LM_PACK, EvaluationReceipt, RawMeasurement
 from frontierwright.registry import Registry
 from frontierwright.service import (
     add_local_dataset,
+    compare_candidate_evaluation,
     get_evaluation_packs,
     get_stats_view,
     import_local_model,
@@ -307,3 +308,135 @@ def test_invalid_evaluation_provenance_is_rejected_before_idempotent_replay(
     registry.store_evaluation_receipt(receipt, provenance="GENERATED")
     with pytest.raises(FrontierwrightError, match="provenance"):
         registry.store_evaluation_receipt(receipt, provenance="INVALID")
+
+
+def test_raw_candidate_compare_respects_metric_direction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, dataset_id = setup_project(tmp_path)
+    registry = Registry(project)
+    state = registry.read()
+    assert state.champion is not None
+    candidate = ModelState(
+        model_id="model-eval-candidate",
+        identity_id=state.project["identity_id"],
+        origin=ModelOrigin.IMPORTED_LOCAL,
+        checkpoint="candidate-eval-checkpoint",
+        fingerprint="sha256:candidate-eval",
+        parent_model_id=state.champion.model.model_id,
+        stats=(),
+        trainable=True,
+    )
+    registry.register_candidate(candidate)
+
+    def model_sensitive_evaluator(
+        argv_template: tuple[str, ...],
+        *,
+        environment_overrides: dict[str, str],
+        request_path: Path,
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        del argv_template, environment_overrides, timeout_seconds
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        is_candidate = request["model_source_path"] == "candidate-eval-checkpoint"
+        cross_entropy = 3.0 if is_candidate else 4.0
+        perplexity = 20.085536923187668 if is_candidate else 54.598150033144236
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "operation": "evaluate",
+            "metrics": {
+                "backend_id": "frontierwright-reference-pytorch-v1",
+                "preset": "zero-8m",
+                "device": "cpu",
+                "cross_entropy_nats_per_token": cross_entropy,
+                "perplexity": perplexity,
+                "tokens_evaluated": 512,
+                "windows_evaluated": 4,
+                "batches_evaluated": 2,
+                "elapsed_seconds": 0.5,
+                "tokens_per_second": 1024.0,
+                "parameter_count": 7_521_280,
+                "python_version": "3.12.10",
+                "torch_version": "2.14.0+cpu",
+            },
+        }
+
+    monkeypatch.setattr(
+        service_module,
+        "run_structured_command",
+        model_sensitive_evaluator,
+    )
+
+    view = compare_candidate_evaluation(
+        project,
+        candidate_model_id=candidate.model_id,
+        pack_id=REFERENCE_LM_PACK.pack_id,
+        dataset_id=dataset_id,
+        python_executable="fixture-python",
+        device="cpu",
+        batch_size=2,
+        max_batches=2,
+    )
+
+    assert view.comparable is True
+    assert view.candidate_status == "PENDING"
+    assert view.champion_receipt_id != view.candidate_receipt_id
+    assert [item["metric"] for item in view.measurements] == [
+        "cross_entropy_nats_per_token",
+        "perplexity",
+    ]
+    for item in view.measurements:
+        assert item["higher_is_better"] is False
+        assert item["raw_delta"] < 0
+        assert item["improvement_delta"] > 0
+
+
+def test_deterministic_evaluation_replay_rejects_poisoned_receipt_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, dataset_id = setup_project(tmp_path)
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return fake_evaluator_result(*args, **kwargs)
+
+    monkeypatch.setattr(service_module, "run_structured_command", counted)
+    first = run_evaluation_pack(
+        project,
+        pack_id=REFERENCE_LM_PACK.pack_id,
+        dataset_id=dataset_id,
+        python_executable="fixture-python",
+        device="cpu",
+        max_batches=2,
+    )
+    assert first.receipt_id is not None
+    registry = Registry(project)
+    stored = registry.get_evaluation_receipt(first.receipt_id)
+    assert stored is not None
+    poisoned_conditions = dict(stored["conditions"])
+    poisoned_conditions["dataset_fingerprint"] = "sha256:poisoned"
+    with registry.connect(write=True) as connection:
+        connection.execute(
+            "UPDATE evaluation_receipts SET conditions_json = ? WHERE receipt_id = ?",
+            (
+                json.dumps(poisoned_conditions, sort_keys=True),
+                first.receipt_id,
+            ),
+        )
+
+    with pytest.raises(FrontierwrightError, match="occupied by different"):
+        run_evaluation_pack(
+            project,
+            pack_id=REFERENCE_LM_PACK.pack_id,
+            dataset_id=dataset_id,
+            python_executable="fixture-python",
+            device="cpu",
+            max_batches=2,
+        )
+
+    assert calls == 1
