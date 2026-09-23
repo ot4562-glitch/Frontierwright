@@ -17,6 +17,7 @@ from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
+from frontierwright.recipes import SNAPSHOT_COPY_PLUGIN_ID
 from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.registry import Registry
 from frontierwright.service import (
@@ -42,6 +43,7 @@ from frontierwright.service import (
     get_birth_view,
     get_build_view,
     get_candidates_view,
+    get_data_preparation_plugins,
     get_data_view,
     get_history_view,
     get_paths_view,
@@ -52,6 +54,7 @@ from frontierwright.service import (
     get_status,
     import_local_model,
     ingest_stats,
+    prepare_dataset,
     promote_candidate,
     reconcile_training_run,
     reject_candidate,
@@ -290,6 +293,12 @@ def _print_data(view: DataView) -> None:
         console.print(f"  License: {item.get('license') or 'UNKNOWN'}")
         console.print(f"  Domain: {item.get('domain') or 'UNKNOWN'}")
         console.print(f"  Language: {item.get('language') or 'UNKNOWN'}")
+        if item.get("managed"):
+            console.print(f"  Managed: YES · source={item.get('source_dataset_id')}")
+            console.print(
+                f"  Recipe: {item.get('preparation_recipe_id')} "
+                f"({item.get('preparation_recipe_hash')})"
+            )
         token_count = item.get("token_count")
         console.print(
             f"  Tokens: {token_count if isinstance(token_count, int) else 'UNKNOWN'}"
@@ -986,6 +995,70 @@ def data_add(
             domain=domain,
             language=language,
             token_count=token_count,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_data_payload(view))
+        return
+    _print_data(view)
+
+
+@data_app.command("recipes")
+def data_recipes(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    plugins = get_data_preparation_plugins()
+    if json_output:
+        _emit_json(
+            {
+                "schema_version": 1,
+                "ok": True,
+                "plugins": plugins,
+            }
+        )
+        return
+    console.print("[bold]DATA PREPARATION RECIPES[/bold]")
+    for plugin in plugins:
+        console.print(
+            f"{plugin['plugin_id']}@{plugin['plugin_version']} · {plugin['title']}"
+        )
+
+
+@data_app.command("prepare")
+def data_prepare(
+    dataset: Annotated[
+        str,
+        typer.Option("--dataset", help="Source dataset ID to prepare."),
+    ],
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    name: Annotated[str | None, typer.Option("--name")] = None,
+    recipe: Annotated[
+        str,
+        typer.Option(
+            "--recipe",
+            help=(
+                "Preparation plugin ID. Alias snapshot-copy-v1 selects the built-in "
+                "byte-preserving managed snapshot."
+            ),
+        ),
+    ] = "snapshot-copy-v1",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    plugin_id = SNAPSHOT_COPY_PLUGIN_ID if recipe == "snapshot-copy-v1" else recipe
+    try:
+        view = prepare_dataset(
+            path,
+            dataset_id=dataset,
+            plugin_id=plugin_id,
+            config=None,
+            name=name,
         )
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)

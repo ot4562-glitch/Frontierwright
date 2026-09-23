@@ -82,7 +82,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v11, including persisted edition profiles and zero-model birth provenance;
+- automatic registry migration through schema v12, including persisted edition profiles, zero-model birth provenance, and data-preparation recipes;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
@@ -103,6 +103,9 @@ Implemented now:
   - measured model -> `TARGETS_FLOORS`;
 - persisted build archetypes/relative priorities plus numeric targets/floors with validation;
 - user/lab-first local dataset inventory with content fingerprints, role, license/domain/language metadata, and optional token count;
+- reproducible DataPreparationPlugin contract with discoverable recipe registry;
+- built-in byte-preserving managed snapshot recipe via `frontierwright data prepare`, preserving source provenance while freezing exact training-input bytes under Frontierwright state;
+- prepared datasets retain source-dataset ID plus recipe ID/hash, and training plans pin the recipe hash in addition to dataset bytes;
 - extensible intervention taxonomy spanning `BIRTH / LEARN / SPECIALIZE / ALIGN / EVOLVE / OPTIMIZE / EVALUATE / OPERATE`;
 - the five v1 training paths are registered built-in interventions rather than the permanent top-level ontology;
 - factual path prerequisite evaluation using current model trainability, local data inventory, resources, birth state, and history confidence;
@@ -114,7 +117,7 @@ Implemented now:
 - idempotent durable local run attempts with worker/process identity, liveness reconciliation, durable executor results, explicit rerun semantics, and repairable run-receipt export;
 - built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` from-scratch pretraining/calibration;
 - successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
-- sealed artifact manifests bind the run, plan, dataset, backend, effective config, model fingerprint, and exact file hashes;
+- sealed artifact manifests bind the run, plan, dataset, dataset-preparation recipe, backend, effective config, model fingerprint, and exact file hashes;
 - evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
 - training creates a `PENDING` candidate and never silently changes the champion;
 - candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
@@ -128,7 +131,7 @@ Not implemented yet:
 - an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and benchmark runner;
 - production built-in training backends for all five paths beyond the narrow from-scratch reference backend and structured external command adapter;
 - full execution-time enforcement/accounting for every hard-budget dimension across calibration and repeated attempts;
-- prepared-dataset recipe artifacts and public dataset discovery/download adapters;
+- public dataset discovery/download adapters and transformative recipes such as normalize/dedupe/tokenize/mixture;
 - remote/server/Slurm executor implementations;
 - full candidate evaluation-eligibility policy and build-floor enforcement transaction.
 

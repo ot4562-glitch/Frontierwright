@@ -119,6 +119,8 @@ class TrainingPlan:
     dataset_id: str
     dataset_fingerprint: str
     dataset_source_path: str
+    dataset_recipe_id: str | None
+    dataset_recipe_hash: str | None
     resource_profile_id: str | None
     permission: PermissionLevel
     budgets: HardBudgets
@@ -138,6 +140,8 @@ class TrainingPlan:
             "dataset_id": self.dataset_id,
             "dataset_fingerprint": self.dataset_fingerprint,
             "dataset_source_path": self.dataset_source_path,
+            "dataset_recipe_id": self.dataset_recipe_id,
+            "dataset_recipe_hash": self.dataset_recipe_hash,
             "resource_profile_id": self.resource_profile_id,
             "permission": self.permission.name,
             "budgets": self.budgets.to_dict(),
@@ -281,6 +285,7 @@ def compute_plan_idempotency_key(
     backend_spec_hash: str,
     model_fingerprint: str | None,
     dataset_fingerprint: str,
+    dataset_recipe_hash: str | None,
     resource_profile_id: str | None,
     permission: PermissionLevel,
     budgets: HardBudgets,
@@ -292,6 +297,7 @@ def compute_plan_idempotency_key(
         "backend_spec_hash": backend_spec_hash,
         "model_fingerprint": model_fingerprint,
         "dataset_fingerprint": dataset_fingerprint,
+        "dataset_recipe_hash": dataset_recipe_hash,
         "resource_profile_id": resource_profile_id,
         "permission": permission.name,
         "budgets": budgets.to_dict(),

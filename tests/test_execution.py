@@ -23,9 +23,11 @@ from frontierwright.service import (
     calibrate_training_plan,
     create_training_plan,
     execute_training_plan,
+    get_data_view,
     get_paths_view,
     get_run_view,
     import_local_model,
+    prepare_dataset_snapshot,
     promote_candidate,
     reconcile_training_run,
     repair_run_receipt,
@@ -596,3 +598,47 @@ def test_tampered_sealed_candidate_cannot_be_promoted_with_override(
             completed.candidate_model_id,
             allow_unmeasured=True,
         )
+
+
+def test_sealed_candidate_manifest_binds_preparation_recipe(tmp_path: Path) -> None:
+    project, backend_spec = setup_project(tmp_path)
+    raw = get_data_view(project).datasets[0]
+    prepared_view = prepare_dataset_snapshot(
+        project,
+        dataset_id=str(raw["dataset_id"]),
+        name="Prepared SFT",
+    )
+    prepared = next(item for item in prepared_view.datasets if item["managed"] is True)
+
+    plan = create_training_plan(
+        project,
+        path_id=TrainingPathId.LORA_SFT,
+        backend_spec_path=backend_spec,
+        dataset_id=None,
+        permission=PermissionLevel.EXECUTE_SINGLE,
+        budgets=HardBudgets(max_runs=2, max_storage_bytes=4096),
+        config={"epochs": 1},
+    )
+    calibrate_training_plan(
+        project,
+        plan_id=plan.plan_id or "",
+        backend_spec_path=backend_spec,
+    )
+    completed = execute_training_plan(
+        project,
+        plan_id=plan.plan_id or "",
+        backend_spec_path=backend_spec,
+        dry_run=False,
+        rerun=False,
+    )
+
+    assert completed.candidate_model_id is not None
+    record = Registry(project).get_sealed_artifact(completed.candidate_model_id)
+    assert record is not None
+    manifest = json.loads(
+        Path(str(record["manifest_path"])).read_text(encoding="utf-8")
+    )
+    assert manifest["dataset_id"] == prepared["dataset_id"]
+    assert manifest["dataset_fingerprint"] == prepared["fingerprint"]
+    assert manifest["dataset_recipe_id"] == prepared["preparation_recipe_id"]
+    assert manifest["dataset_recipe_hash"] == prepared["preparation_recipe_hash"]

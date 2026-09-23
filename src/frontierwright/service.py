@@ -55,6 +55,11 @@ from frontierwright.local_executor import (
 )
 from frontierwright.models import discover_history_evidence, inspect_local_model
 from frontierwright.paths import PathAvailability, PathContext, TrainingPathId, assess_paths
+from frontierwright.recipes import (
+    BUILTIN_DATA_PREPARATION_PLUGINS,
+    SNAPSHOT_COPY_PLUGIN_ID,
+    data_preparation_plugin,
+)
 from frontierwright.reference_backend import PRESETS, REFERENCE_BACKEND_ID
 from frontierwright.registry import ProjectState, Registry
 from frontierwright.resources import detect_local_resources
@@ -190,6 +195,8 @@ class PlanView:
     backend_spec_hash: str | None = None
     model_id: str | None = None
     dataset_id: str | None = None
+    dataset_recipe_id: str | None = None
+    dataset_recipe_hash: str | None = None
     resource_profile_id: str | None = None
     permission: str | None = None
     budgets: dict[str, object] = field(default_factory=dict)
@@ -938,6 +945,10 @@ def get_data_view(root: Path) -> DataView:
                 "domain": item["domain"],
                 "language": item["language"],
                 "token_count": item["token_count"],
+                "source_dataset_id": item.get("source_dataset_id"),
+                "preparation_recipe_id": item.get("preparation_recipe_id"),
+                "preparation_recipe_hash": item.get("preparation_recipe_hash"),
+                "managed": isinstance(item.get("preparation_recipe_hash"), str),
             }
         )
     return DataView(datasets=datasets)
@@ -973,6 +984,104 @@ def add_local_dataset(
         token_count=token_count,
     )
     return get_data_view(root)
+
+
+def get_data_preparation_plugins() -> list[dict[str, object]]:
+    return [
+        {
+            "plugin_id": plugin.plugin_id,
+            "plugin_version": plugin.plugin_version,
+            "title": plugin.title,
+        }
+        for plugin in BUILTIN_DATA_PREPARATION_PLUGINS
+    ]
+
+
+def prepare_dataset(
+    root: Path,
+    *,
+    dataset_id: str,
+    plugin_id: str,
+    config: dict[str, object] | None = None,
+    name: str | None = None,
+) -> DataView:
+    """Materialize one reproducible managed dataset preparation recipe."""
+
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before preparing data.",
+            10,
+        )
+
+    state = registry.read()
+    source = next(
+        (
+            item
+            for item in state.datasets
+            if item.get("dataset_id") == dataset_id
+        ),
+        None,
+    )
+    if source is None:
+        raise FrontierwrightError(
+            "DATASET_NOT_FOUND",
+            "Source dataset is not active in this project.",
+            3,
+        )
+    if isinstance(source.get("preparation_recipe_hash"), str):
+        raise FrontierwrightError(
+            "DATASET_ALREADY_PREPARED",
+            "Managed prepared datasets are already immutable training inputs.",
+            13,
+        )
+
+    source_path = source.get("source_path")
+    source_fingerprint = source.get("fingerprint")
+    if not isinstance(source_path, str) or not isinstance(source_fingerprint, str):
+        raise FrontierwrightError(
+            "DATASET_INVALID",
+            "Source dataset registry metadata is incomplete.",
+            4,
+        )
+
+    descriptor = inspect_local_dataset(Path(source_path))
+    if descriptor.fingerprint != source_fingerprint:
+        raise FrontierwrightError(
+            "DATASET_CONTENT_DRIFT",
+            "Source dataset content changed after registration; register the new content first.",
+            13,
+        )
+
+    plugin = data_preparation_plugin(plugin_id)
+    recipe = plugin.build_recipe(
+        source_dataset_id=dataset_id,
+        source_fingerprint=source_fingerprint,
+        config=config,
+    )
+    prepared = plugin.materialize(
+        registry.state_dir,
+        source=descriptor,
+        recipe=recipe,
+    )
+    registry.register_prepared_dataset(recipe, prepared, name=name)
+    return get_data_view(root)
+
+
+def prepare_dataset_snapshot(
+    root: Path,
+    *,
+    dataset_id: str,
+    name: str | None = None,
+) -> DataView:
+    return prepare_dataset(
+        root,
+        dataset_id=dataset_id,
+        plugin_id=SNAPSHOT_COPY_PLUGIN_ID,
+        config=None,
+        name=name,
+    )
 
 
 def _required_dataset_role(path_id: TrainingPathId) -> DatasetRole:
@@ -1018,6 +1127,13 @@ def _find_dataset(
             12,
         )
     if len(matching) > 1:
+        prepared = [
+            item
+            for item in matching
+            if isinstance(item.get("preparation_recipe_hash"), str)
+        ]
+        if len(prepared) == 1:
+            return prepared[0]
         raise FrontierwrightError(
             "DATASET_AMBIGUOUS",
             f"Multiple {role.value} datasets are registered; choose --dataset explicitly.",
@@ -1071,6 +1187,10 @@ def _plan_input_blockers(
     else:
         if dataset.get("fingerprint") != plan.dataset_fingerprint:
             blockers.append("planned dataset registry fingerprint changed")
+        if dataset.get("preparation_recipe_id") != plan.dataset_recipe_id:
+            blockers.append("planned dataset preparation recipe identity changed")
+        if dataset.get("preparation_recipe_hash") != plan.dataset_recipe_hash:
+            blockers.append("planned dataset preparation recipe hash changed")
         source = dataset.get("source_path")
         if isinstance(source, str):
             try:
@@ -1186,6 +1306,8 @@ def get_plan_view(root: Path, plan_id: str) -> PlanView:
         backend_spec_hash=plan.backend_spec_hash,
         model_id=plan.model_id,
         dataset_id=plan.dataset_id,
+        dataset_recipe_id=plan.dataset_recipe_id,
+        dataset_recipe_hash=plan.dataset_recipe_hash,
         resource_profile_id=plan.resource_profile_id,
         permission=plan.permission.name,
         budgets=plan.budgets.to_dict(),
@@ -1253,6 +1375,11 @@ def create_training_plan(
                 state.champion.model.fingerprint if state.champion is not None else None
             ),
             dataset_fingerprint=str(dataset["fingerprint"]),
+            dataset_recipe_hash=(
+                str(dataset["preparation_recipe_hash"])
+                if isinstance(dataset.get("preparation_recipe_hash"), str)
+                else None
+            ),
             resource_profile_id=(
                 str(state.resource_profile["profile_id"])
                 if state.resource_profile is not None
@@ -1292,6 +1419,16 @@ def create_training_plan(
         dataset_id=str(dataset["dataset_id"]),
         dataset_fingerprint=str(dataset["fingerprint"]),
         dataset_source_path=str(dataset["source_path"]),
+        dataset_recipe_id=(
+            str(dataset["preparation_recipe_id"])
+            if isinstance(dataset.get("preparation_recipe_id"), str)
+            else None
+        ),
+        dataset_recipe_hash=(
+            str(dataset["preparation_recipe_hash"])
+            if isinstance(dataset.get("preparation_recipe_hash"), str)
+            else None
+        ),
         resource_profile_id=(
             str(state.resource_profile["profile_id"])
             if state.resource_profile is not None

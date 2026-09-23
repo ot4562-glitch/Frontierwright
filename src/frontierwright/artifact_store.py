@@ -119,6 +119,8 @@ def _manifest_payload(
         "parent_model_id": plan.model_id,
         "dataset_id": plan.dataset_id,
         "dataset_fingerprint": plan.dataset_fingerprint,
+        "dataset_recipe_id": plan.dataset_recipe_id,
+        "dataset_recipe_hash": plan.dataset_recipe_hash,
         "backend_id": plan.backend_id,
         "backend_spec_hash": plan.backend_spec_hash,
         "effective_config": plan.config,

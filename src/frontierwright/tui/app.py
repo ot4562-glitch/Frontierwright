@@ -344,6 +344,9 @@ class FrontierwrightApp(App[None]):
             lines.append(f"  Provenance: {item.get('provenance')}")
             lines.append(f"  Fingerprint: {item.get('fingerprint')}")
             lines.append(f"  License: {item.get('license') or 'UNKNOWN'}")
+            if item.get("managed"):
+                lines.append(f"  Managed from: {item.get('source_dataset_id')}")
+                lines.append(f"  Recipe: {item.get('preparation_recipe_id')}")
             lines.append("")
         return "\n".join(lines).rstrip()
 

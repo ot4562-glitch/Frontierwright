@@ -42,9 +42,10 @@ from frontierwright.execution import (
 )
 from frontierwright.models import HistoryEvidenceResult, ImportedModelDescriptor
 from frontierwright.paths import TrainingPathId
+from frontierwright.recipes import DataPreparationRecipe
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -149,7 +150,20 @@ CREATE TABLE datasets (
     language TEXT,
     token_count INTEGER,
     created_at TEXT NOT NULL,
-    active INTEGER NOT NULL CHECK (active IN (0,1))
+    active INTEGER NOT NULL CHECK (active IN (0,1)),
+    source_dataset_id TEXT REFERENCES datasets(dataset_id),
+    preparation_recipe_id TEXT,
+    preparation_recipe_hash TEXT
+);
+CREATE TABLE data_recipes (
+    recipe_id TEXT PRIMARY KEY,
+    recipe_hash TEXT NOT NULL UNIQUE,
+    plugin_id TEXT NOT NULL,
+    plugin_version TEXT NOT NULL,
+    source_dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
+    source_fingerprint TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 CREATE TABLE plans (
     plan_id TEXT PRIMARY KEY,
@@ -163,6 +177,8 @@ CREATE TABLE plans (
     dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
     dataset_fingerprint TEXT NOT NULL,
     dataset_source_path TEXT NOT NULL,
+    dataset_recipe_id TEXT,
+    dataset_recipe_hash TEXT,
     resource_profile_id TEXT,
     permission TEXT NOT NULL,
     budgets_json TEXT NOT NULL,
@@ -449,7 +465,6 @@ CREATE TABLE IF NOT EXISTS model_births (
 );
 """
 
-
 def timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -479,6 +494,8 @@ def decode_plan(row: sqlite3.Row) -> TrainingPlan:
         dataset_id=row["dataset_id"],
         dataset_fingerprint=row["dataset_fingerprint"],
         dataset_source_path=row["dataset_source_path"],
+        dataset_recipe_id=row["dataset_recipe_id"],
+        dataset_recipe_hash=row["dataset_recipe_hash"],
         resource_profile_id=row["resource_profile_id"],
         permission=PermissionLevel[row["permission"]],
         budgets=HardBudgets(**budgets_raw),
@@ -642,6 +659,55 @@ class Registry:
                 )
                 connection.commit()
                 version = 11
+
+            if version == 11:
+                dataset_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(datasets)")
+                }
+                plan_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(plans)")
+                }
+                connection.execute("BEGIN IMMEDIATE")
+                if "source_dataset_id" not in dataset_columns:
+                    connection.execute(
+                        "ALTER TABLE datasets ADD COLUMN source_dataset_id "
+                        "TEXT REFERENCES datasets(dataset_id)"
+                    )
+                if "preparation_recipe_id" not in dataset_columns:
+                    connection.execute(
+                        "ALTER TABLE datasets ADD COLUMN preparation_recipe_id TEXT"
+                    )
+                if "preparation_recipe_hash" not in dataset_columns:
+                    connection.execute(
+                        "ALTER TABLE datasets ADD COLUMN preparation_recipe_hash TEXT"
+                    )
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS data_recipes ("
+                    "recipe_id TEXT PRIMARY KEY, "
+                    "recipe_hash TEXT NOT NULL UNIQUE, "
+                    "plugin_id TEXT NOT NULL, "
+                    "plugin_version TEXT NOT NULL, "
+                    "source_dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id), "
+                    "source_fingerprint TEXT NOT NULL, "
+                    "config_json TEXT NOT NULL, "
+                    "created_at TEXT NOT NULL)"
+                )
+                if "dataset_recipe_id" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN dataset_recipe_id TEXT"
+                    )
+                if "dataset_recipe_hash" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN dataset_recipe_hash TEXT"
+                    )
+                connection.execute("PRAGMA user_version = 12")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 11, "to_version": 12},
+                )
+                connection.commit()
+                version = 12
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -1346,9 +1412,10 @@ class Registry:
                 "INSERT INTO plans ("
                 "plan_id, idempotency_key, path_id, backend_id, backend_spec_hash, "
                 "model_id, model_fingerprint, model_source_path, dataset_id, "
-                "dataset_fingerprint, dataset_source_path, resource_profile_id, "
-                "permission, budgets_json, config_json, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "dataset_fingerprint, dataset_source_path, dataset_recipe_id, "
+                "dataset_recipe_hash, resource_profile_id, permission, budgets_json, "
+                "config_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     plan.plan_id,
                     plan.idempotency_key,
@@ -1361,6 +1428,8 @@ class Registry:
                     plan.dataset_id,
                     plan.dataset_fingerprint,
                     plan.dataset_source_path,
+                    plan.dataset_recipe_id,
+                    plan.dataset_recipe_hash,
                     plan.resource_profile_id,
                     plan.permission.name,
                     json.dumps(plan.budgets.to_dict(), sort_keys=True, allow_nan=False),
@@ -1785,15 +1854,21 @@ class Registry:
         with self.connect(write=True) as connection:
             existing = connection.execute(
                 "SELECT dataset_id FROM datasets "
-                "WHERE fingerprint = ? AND role = ? AND active = 1 LIMIT 1",
-                (descriptor.fingerprint, role.value),
+                "WHERE fingerprint = ? AND role = ? AND provenance = ? "
+                "AND preparation_recipe_hash IS NULL AND active = 1 LIMIT 1",
+                (descriptor.fingerprint, role.value, provenance.value),
             ).fetchone()
             if existing is not None:
                 return str(existing["dataset_id"])
 
             dataset_id = f"dataset-{uuid4().hex}"
             connection.execute(
-                "INSERT INTO datasets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                "INSERT INTO datasets ("
+                "dataset_id, name, role, provenance, source_path, fingerprint, "
+                "total_bytes, file_count, manifest_json, license, domain, language, "
+                "token_count, created_at, active, source_dataset_id, "
+                "preparation_recipe_id, preparation_recipe_hash"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, NULL, NULL)",
                 (
                     dataset_id,
                     name,
@@ -1825,6 +1900,136 @@ class Registry:
                 },
             )
             return dataset_id
+
+    def register_prepared_dataset(
+        self,
+        recipe: DataPreparationRecipe,
+        descriptor: DatasetDescriptor,
+        *,
+        name: str | None = None,
+    ) -> str:
+        with self.connect(write=True) as connection:
+            source = connection.execute(
+                "SELECT * FROM datasets WHERE dataset_id = ? AND active = 1",
+                (recipe.source_dataset_id,),
+            ).fetchone()
+            if source is None:
+                raise FrontierwrightError(
+                    "DATASET_NOT_FOUND",
+                    "Preparation recipe source dataset is not active.",
+                    3,
+                )
+            if source["fingerprint"] != recipe.source_fingerprint:
+                raise FrontierwrightError(
+                    "DATA_RECIPE_SOURCE_DRIFT",
+                    "Preparation recipe source fingerprint does not match the registry.",
+                    13,
+                )
+            if descriptor.fingerprint != recipe.source_fingerprint:
+                raise FrontierwrightError(
+                    "DATA_PREP_COPY_MISMATCH",
+                    "Prepared dataset fingerprint differs from the byte-preserving recipe source.",
+                    13,
+                )
+
+            existing_recipe = connection.execute(
+                "SELECT * FROM data_recipes WHERE recipe_hash = ?",
+                (recipe.recipe_hash,),
+            ).fetchone()
+            if existing_recipe is None:
+                connection.execute(
+                    "INSERT INTO data_recipes ("
+                    "recipe_id, recipe_hash, plugin_id, plugin_version, source_dataset_id, "
+                    "source_fingerprint, config_json, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        recipe.recipe_id,
+                        recipe.recipe_hash,
+                        recipe.plugin_id,
+                        recipe.plugin_version,
+                        recipe.source_dataset_id,
+                        recipe.source_fingerprint,
+                        json.dumps(recipe.config, sort_keys=True, allow_nan=False),
+                        timestamp(),
+                    ),
+                )
+            elif (
+                existing_recipe["recipe_id"] != recipe.recipe_id
+                or existing_recipe["plugin_id"] != recipe.plugin_id
+                or existing_recipe["plugin_version"] != recipe.plugin_version
+                or existing_recipe["source_dataset_id"] != recipe.source_dataset_id
+                or existing_recipe["source_fingerprint"] != recipe.source_fingerprint
+                or json.loads(existing_recipe["config_json"]) != recipe.config
+            ):
+                raise FrontierwrightError(
+                    "DATA_RECIPE_CONFLICT",
+                    "Existing data recipe hash is bound to different recipe content.",
+                    13,
+                )
+
+            existing = connection.execute(
+                "SELECT dataset_id FROM datasets "
+                "WHERE preparation_recipe_hash = ? AND active = 1 LIMIT 1",
+                (recipe.recipe_hash,),
+            ).fetchone()
+            if existing is not None:
+                return str(existing["dataset_id"])
+
+            dataset_id = f"dataset-{uuid4().hex}"
+            prepared_name = name or f"{source['name']} · prepared"
+            connection.execute(
+                "INSERT INTO datasets ("
+                "dataset_id, name, role, provenance, source_path, fingerprint, "
+                "total_bytes, file_count, manifest_json, license, domain, language, "
+                "token_count, created_at, active, source_dataset_id, "
+                "preparation_recipe_id, preparation_recipe_hash"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                (
+                    dataset_id,
+                    prepared_name,
+                    source["role"],
+                    source["provenance"],
+                    str(descriptor.source_path),
+                    descriptor.fingerprint,
+                    descriptor.total_bytes,
+                    descriptor.file_count,
+                    json.dumps(descriptor.manifest(), sort_keys=True, allow_nan=False),
+                    source["license"],
+                    source["domain"],
+                    source["language"],
+                    source["token_count"],
+                    timestamp(),
+                    recipe.source_dataset_id,
+                    recipe.recipe_id,
+                    recipe.recipe_hash,
+                ),
+            )
+            self.event(
+                connection,
+                "DATASET_PREPARED",
+                {
+                    "dataset_id": dataset_id,
+                    "source_dataset_id": recipe.source_dataset_id,
+                    "recipe_id": recipe.recipe_id,
+                    "recipe_hash": recipe.recipe_hash,
+                    "plugin_id": recipe.plugin_id,
+                    "plugin_version": recipe.plugin_version,
+                    "fingerprint": descriptor.fingerprint,
+                },
+            )
+            return dataset_id
+
+    def get_data_recipe(self, recipe_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM data_recipes WHERE recipe_id = ?",
+                (recipe_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["config"] = json.loads(result.pop("config_json"))
+            return result
 
     def store_evaluation_receipt(self, receipt: EvaluationReceipt) -> None:
         with self.connect(write=True) as connection:

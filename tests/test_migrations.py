@@ -56,7 +56,7 @@ def test_previous_registry_versions_migrate_to_current(
             )
         }
 
-    assert version == SCHEMA_VERSION == 11
+    assert version == SCHEMA_VERSION == 12
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -70,6 +70,7 @@ def test_previous_registry_versions_migrate_to_current(
     assert "run_attempts" in tables
     assert "sealed_artifacts" in tables
     assert "model_births" in tables
+    assert "data_recipes" in tables
     assert state.project["edition_profile"] == "ACADEMY"
 
 
@@ -120,7 +121,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 11
+    assert version == SCHEMA_VERSION == 12
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -222,6 +223,8 @@ def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
         dataset_id="dataset-v7",
         dataset_fingerprint="sha256:v7-data",
         dataset_source_path="/tmp/v7-data",
+        dataset_recipe_id=None,
+        dataset_recipe_hash=None,
         resource_profile_id=None,
         permission=PermissionLevel.PLAN,
         budgets=HardBudgets(max_runs=1),
@@ -280,4 +283,40 @@ def test_v9_project_migrates_to_origin_appropriate_edition_profile(
     assert state.project["edition_profile"] == "ACADEMY"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 11
+    assert version == SCHEMA_VERSION == 12
+
+
+def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("NOVA", ModelOrigin.ZERO)
+
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute("DROP TABLE data_recipes")
+        connection.execute("PRAGMA user_version = 11")
+        connection.commit()
+
+    registry.read()
+
+    with sqlite3.connect(registry.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        dataset_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(datasets)")
+        }
+        plan_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(plans)")
+        }
+
+    assert version == SCHEMA_VERSION == 12
+    assert "data_recipes" in tables
+    assert {
+        "source_dataset_id",
+        "preparation_recipe_id",
+        "preparation_recipe_hash",
+    }.issubset(dataset_columns)
+    assert {"dataset_recipe_id", "dataset_recipe_hash"}.issubset(plan_columns)

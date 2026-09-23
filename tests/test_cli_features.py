@@ -33,6 +33,20 @@ def test_data_and_paths_machine_surface(tmp_path: Path) -> None:
     )
     assert init.exit_code == 0, init.output
 
+    recipes = runner.invoke(
+        app,
+        ["data", "recipes", "--json", "--non-interactive"],
+    )
+    assert recipes.exit_code == 0, recipes.output
+    recipe_payload = json.loads(recipes.stdout)
+    assert recipe_payload["plugins"] == [
+        {
+            "plugin_id": "frontierwright.data.snapshot-copy",
+            "plugin_version": "1",
+            "title": "Byte-preserving managed snapshot",
+        }
+    ]
+
     added = runner.invoke(
         app,
         [
@@ -55,6 +69,31 @@ def test_data_and_paths_machine_surface(tmp_path: Path) -> None:
     assert data_payload["ok"] is True
     assert data_payload["datasets"][0]["role"] == "PRETRAIN"
     assert data_payload["datasets"][0]["provenance"] == "LOCAL_USER"
+    raw_dataset_id = data_payload["datasets"][0]["dataset_id"]
+
+    prepared = runner.invoke(
+        app,
+        [
+            "data",
+            "prepare",
+            "--dataset",
+            raw_dataset_id,
+            "--path",
+            str(project),
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert prepared.exit_code == 0, prepared.output
+    prepared_payload = json.loads(prepared.stdout)
+    managed = next(
+        item for item in prepared_payload["datasets"] if item["managed"] is True
+    )
+    assert managed["source_dataset_id"] == raw_dataset_id
+    assert managed["fingerprint"] == data_payload["datasets"][0]["fingerprint"]
+    assert managed["preparation_recipe_id"].startswith("data-recipe-")
+    assert managed["preparation_recipe_hash"].startswith("sha256:")
 
     paths = runner.invoke(
         app,
