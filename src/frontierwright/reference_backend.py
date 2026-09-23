@@ -1,9 +1,9 @@
 """Frontierwright built-in PyTorch reference backend.
 
 This backend intentionally stays narrow: real causal language-model training for
-Frontierwright reference-model lineages, including initial/continued pretraining and
-full-parameter causal SFT over serialized text. It is not a compatibility layer for
-arbitrary Hugging Face architectures.
+Frontierwright reference-model lineages, including initial/continued pretraining,
+full-parameter causal SFT, and merged-output LoRA SFT over serialized text. It is not
+a compatibility layer for arbitrary Hugging Face architectures.
 
 The module is executed by a dedicated training Python environment:
     python -m frontierwright.reference_backend REQUEST_JSON
@@ -25,6 +25,7 @@ SUPPORTED_PATHS = (
     "FROM_SCRATCH_PRETRAINING",
     "CONTINUED_PRETRAINING",
     "FULL_SFT",
+    "LORA_SFT",
 )
 VOCAB_SIZE = 256
 
@@ -70,6 +71,8 @@ class ReferenceConfig:
     seed: int
     device: str
     max_dataset_bytes: int
+    lora_rank: int
+    lora_alpha: float
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -82,6 +85,8 @@ class ReferenceConfig:
             "seed": self.seed,
             "device": self.device,
             "max_dataset_bytes": self.max_dataset_bytes,
+            "lora_rank": self.lora_rank,
+            "lora_alpha": self.lora_alpha,
         }
 
 
@@ -202,6 +207,12 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("seed must be a nonnegative integer")
 
+    path_id = request.get("path_id")
+    if path_id != "LORA_SFT" and any(
+        key in raw for key in ("lora_rank", "lora_alpha")
+    ):
+        raise ValueError("lora_rank/lora_alpha are only valid for LORA_SFT")
+
     return ReferenceConfig(
         preset=preset,
         steps=_positive_int(raw.get("steps"), 20, "steps"),
@@ -228,6 +239,8 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
             64 * 1024 * 1024,
             "max_dataset_bytes",
         ),
+        lora_rank=_positive_int(raw.get("lora_rank"), 8, "lora_rank"),
+        lora_alpha=_positive_float(raw.get("lora_alpha"), 16.0, "lora_alpha"),
     )
 
 
@@ -306,6 +319,8 @@ def _objective_for_path(path_id: object) -> str:
         return "causal_lm_continued_pretraining"
     if path_id == "FULL_SFT":
         return "full_parameter_causal_sft"
+    if path_id == "LORA_SFT":
+        return "lora_causal_sft"
     raise ValueError(f"unsupported reference training path: {path_id!r}")
 
 
@@ -388,6 +403,141 @@ def _parameter_count(model: Any) -> int:
     return int(sum(parameter.numel() for parameter in model.parameters()))
 
 
+
+
+def _training_detail_int(details: dict[str, object], key: str) -> int:
+    value = details.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"training detail {key} must be a nonnegative integer")
+    return value
+
+
+def _trainable_parameter_count(model: Any) -> int:
+    return int(
+        sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+    )
+
+
+def _apply_lora_parametrizations(
+    torch: Any,
+    model: Any,
+    config: ReferenceConfig,
+) -> dict[str, object]:
+    """Freeze base weights and apply trainable low-rank deltas to transformer projections."""
+
+    nn = torch.nn
+    parametrize = torch.nn.utils.parametrize
+    rank = config.lora_rank
+    alpha = config.lora_alpha
+
+    class LoRAWeight(nn.Module):  # type: ignore[misc, name-defined]
+        def __init__(self, out_features: int, in_features: int) -> None:
+            super().__init__()
+            if rank > min(out_features, in_features):
+                raise ValueError(
+                    "lora_rank exceeds the smallest targeted projection dimension"
+                )
+            self.a = nn.Parameter(torch.empty(rank, in_features))
+            self.b = nn.Parameter(torch.zeros(out_features, rank))
+            self.scale = alpha / rank
+            nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
+
+        def forward(self, original: Any) -> Any:
+            return original + (self.b @ self.a) * self.scale
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    targets: list[tuple[Any, str, str]] = []
+    for block_index, block in enumerate(model.blocks):
+        targets.append(
+            (
+                block.attn,
+                "in_proj_weight",
+                f"blocks.{block_index}.attn.in_proj_weight",
+            )
+        )
+        targets.append(
+            (
+                block.attn.out_proj,
+                "weight",
+                f"blocks.{block_index}.attn.out_proj.weight",
+            )
+        )
+        targets.append(
+            (
+                block.mlp[0],
+                "weight",
+                f"blocks.{block_index}.mlp.0.weight",
+            )
+        )
+        targets.append(
+            (
+                block.mlp[2],
+                "weight",
+                f"blocks.{block_index}.mlp.2.weight",
+            )
+        )
+
+    target_names: list[str] = []
+    for module, parameter_name, target_name in targets:
+        weight = getattr(module, parameter_name)
+        if weight.ndim != 2:
+            raise ValueError(f"LoRA target is not a matrix: {target_name}")
+        out_features, in_features = weight.shape
+        parametrization = LoRAWeight(int(out_features), int(in_features))
+        parametrize.register_parametrization(
+            module,
+            parameter_name,
+            parametrization,
+            unsafe=False,
+        )
+        target_names.append(target_name)
+
+    trainable = _trainable_parameter_count(model)
+    if trainable <= 0:
+        raise ValueError("LoRA produced no trainable parameters")
+
+    return {
+        "method": "lora",
+        "rank": rank,
+        "alpha": alpha,
+        "target_count": len(target_names),
+        "targets": target_names,
+        "trainable_parameter_count": trainable,
+        "merged_output": True,
+    }
+
+
+def _merge_lora_parametrizations(torch: Any, model: Any) -> None:
+    parametrize = torch.nn.utils.parametrize
+    for block in model.blocks:
+        parametrize.remove_parametrizations(
+            block.attn,
+            "in_proj_weight",
+            leave_parametrized=True,
+        )
+        parametrize.remove_parametrizations(
+            block.attn.out_proj,
+            "weight",
+            leave_parametrized=True,
+        )
+        parametrize.remove_parametrizations(
+            block.mlp[0],
+            "weight",
+            leave_parametrized=True,
+        )
+        parametrize.remove_parametrizations(
+            block.mlp[2],
+            "weight",
+            leave_parametrized=True,
+        )
+
+
 def _sample_batch(
     torch: Any,
     corpus: Any,
@@ -438,8 +588,9 @@ def _training_objects(
     config: ReferenceConfig,
     corpus_bytes: bytes,
     *,
+    path_id: str,
     model_source_path: str | None = None,
-) -> tuple[Any, Any, Any, Any, str]:
+) -> tuple[Any, Any, Any, Any, str, dict[str, object]]:
     torch.manual_seed(config.seed)
     device = _select_device(torch, config.device)
     if device == "cuda":
@@ -473,16 +624,34 @@ def _training_objects(
             weights_only=True,
         )
         model.load_state_dict(state_dict)
+
+    base_parameter_count = _parameter_count(model)
+    training_details: dict[str, object] = {
+        "method": "full_parameter",
+        "base_parameter_count": base_parameter_count,
+        "trainable_parameter_count": base_parameter_count,
+    }
+    if path_id == "LORA_SFT":
+        training_details = {
+            **_apply_lora_parametrizations(torch, model, config),
+            "base_parameter_count": base_parameter_count,
+        }
+
     model = model.to(device)
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("training path produced no trainable parameters")
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
     corpus = torch.tensor(list(corpus_bytes), dtype=torch.long)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(config.seed)
-    return model, optimizer, corpus, generator, device
+    return model, optimizer, corpus, generator, device, training_details
 
 
 def _train_step(
@@ -610,7 +779,10 @@ def _birth(request: dict[str, Any]) -> dict[str, object]:
 
 def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, object]:
     torch = _import_torch()
-    objective = _objective_for_path(request.get("path_id"))
+    path_id = request.get("path_id")
+    if not isinstance(path_id, str):
+        raise ValueError("path_id must be a string")
+    objective = _objective_for_path(path_id)
     dataset_source = request.get("dataset_source_path")
     if not isinstance(dataset_source, str) or not dataset_source:
         raise ValueError("dataset_source_path is required")
@@ -621,10 +793,11 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
     model_source_path = request.get("model_source_path")
     if model_source_path is not None and not isinstance(model_source_path, str):
         raise ValueError("model_source_path must be a string when supplied")
-    model, optimizer, corpus, generator, device = _training_objects(
+    model, optimizer, corpus, generator, device, training_details = _training_objects(
         torch,
         config,
         corpus_bytes,
+        path_id=path_id,
         model_source_path=model_source_path,
     )
 
@@ -667,7 +840,7 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
     peak_vram = (
         int(torch.cuda.max_memory_allocated()) if device == "cuda" else None
     )
-    parameter_count = _parameter_count(model)
+    parameter_count = _training_detail_int(training_details, "base_parameter_count")
     projected_storage = int(parameter_count * 4 * 1.05) + 16 * 1024
 
     return {
@@ -686,6 +859,7 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
         "parameter_count": parameter_count,
         "preset": config.preset.name,
         "objective": objective,
+        "training": training_details,
     }
 
 
@@ -694,7 +868,10 @@ def _train(
     config: ReferenceConfig,
 ) -> dict[str, object]:
     torch = _import_torch()
-    objective = _objective_for_path(request.get("path_id"))
+    path_id = request.get("path_id")
+    if not isinstance(path_id, str):
+        raise ValueError("path_id must be a string")
+    objective = _objective_for_path(path_id)
     dataset_source = request.get("dataset_source_path")
     output_root = request.get("output_root")
     if not isinstance(dataset_source, str) or not dataset_source:
@@ -709,10 +886,11 @@ def _train(
     model_source_path = request.get("model_source_path")
     if model_source_path is not None and not isinstance(model_source_path, str):
         raise ValueError("model_source_path must be a string when supplied")
-    model, optimizer, corpus, generator, device = _training_objects(
+    model, optimizer, corpus, generator, device, training_details = _training_objects(
         torch,
         config,
         corpus_bytes,
+        path_id=path_id,
         model_source_path=model_source_path,
     )
     if device == "cuda":
@@ -737,9 +915,17 @@ def _train(
         torch.cuda.synchronize()
     elapsed = max(time.perf_counter() - start, 1e-9)
 
+    if path_id == "LORA_SFT":
+        _merge_lora_parametrizations(torch, model)
+    parameter_count = _parameter_count(model)
+    expected_parameter_count = _training_detail_int(training_details, "base_parameter_count")
+    if parameter_count != expected_parameter_count:
+        raise ValueError(
+            "merged LoRA checkpoint parameter count differs from the base model"
+        )
+
     output = (_native_path(output_root).expanduser().resolve() / "model")
     output.mkdir(parents=True, exist_ok=True)
-    parameter_count = _parameter_count(model)
 
     config_payload = {
         "architectures": ["FrontierwrightByteCausalLM"],
@@ -783,6 +969,7 @@ def _train(
                 "config": config.to_dict(),
                 "device": device,
                 "objective": objective,
+                "training": training_details,
                 "steps": config.steps,
                 "tokens_trained": token_count,
                 "initial_loss": losses[0],
@@ -805,6 +992,7 @@ def _train(
             "preset": config.preset.name,
             "device": device,
             "objective": objective,
+            "training": training_details,
             "parameter_count": parameter_count,
             "steps": config.steps,
             "tokens_trained": token_count,

@@ -9,13 +9,14 @@ from frontierwright.reference_backend import (
 )
 
 
-def test_reference_backend_declares_pretraining_and_full_sft() -> None:
+def test_reference_backend_declares_pretraining_full_sft_and_lora() -> None:
     payload = backend_spec_payload("python")
 
     assert payload["supported_paths"] == [
         "FROM_SCRATCH_PRETRAINING",
         "CONTINUED_PRETRAINING",
         "FULL_SFT",
+        "LORA_SFT",
     ]
 
 
@@ -25,6 +26,7 @@ def test_reference_backend_objective_labels_are_path_specific() -> None:
         "causal_lm_continued_pretraining"
     )
     assert _objective_for_path("FULL_SFT") == "full_parameter_causal_sft"
+    assert _objective_for_path("LORA_SFT") == "lora_causal_sft"
 
 
 def test_reference_config_infers_preset_from_materialized_model(
@@ -58,6 +60,43 @@ def test_reference_config_infers_preset_from_materialized_model(
 
     assert config.preset.name == "zero-25m"
     assert config.steps == 3
+
+
+def test_reference_lora_config_is_path_scoped(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "frontierwright_reference_backend": (
+                    "frontierwright-reference-pytorch-v1"
+                ),
+                "preset": "zero-8m",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    lora = _load_config(
+        {
+            "path_id": "LORA_SFT",
+            "model_source_path": str(model),
+            "config": {"lora_rank": 4, "lora_alpha": 8.0},
+        }
+    )
+    assert lora.lora_rank == 4
+    assert lora.lora_alpha == 8.0
+
+    import pytest
+
+    with pytest.raises(ValueError, match="only valid for LORA_SFT"):
+        _load_config(
+            {
+                "path_id": "FULL_SFT",
+                "model_source_path": str(model),
+                "config": {"lora_rank": 4},
+            }
+        )
 
 
 def test_reference_backend_concatenates_byte_shards_without_separator(
