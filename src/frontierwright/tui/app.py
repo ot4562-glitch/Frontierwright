@@ -75,6 +75,30 @@ def _compare_text(view: CompareView) -> str:
             f"{str(candidate) if candidate is not None else '?':>9}  "
             f"{delta_text:>5}"
         )
+    if view.raw_evaluation_comparisons:
+        lines.extend(["", "RAW EVALUATION"])
+        for evidence in view.raw_evaluation_comparisons:
+            lines.append(
+                f"{evidence.get('pack_id')}@{evidence.get('pack_version')} · "
+                f"dataset={evidence.get('dataset_id')}"
+            )
+            measurements = evidence.get("measurements")
+            if isinstance(measurements, list):
+                for item in measurements:
+                    if not isinstance(item, dict):
+                        continue
+                    improvement = item.get("improvement_delta")
+                    improvement_text = (
+                        f"{improvement:+g}"
+                        if isinstance(improvement, (int, float))
+                        and not isinstance(improvement, bool)
+                        else "?"
+                    )
+                    lines.append(
+                        f"  {item.get('metric')}: "
+                        f"{item.get('champion_value')} -> {item.get('candidate_value')} "
+                        f"(improvement {improvement_text})"
+                    )
     if view.build_constraints:
         lines.extend(["", "BUILD"])
         for item in view.build_constraints:

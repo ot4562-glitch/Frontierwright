@@ -353,6 +353,7 @@ class CompareView:
     promotion_eligible: bool = False
     promotion_blockers: list[dict[str, object]] = field(default_factory=list)
     build_scale_hash: str | None = None
+    raw_evaluation_comparisons: list[dict[str, object]] = field(default_factory=list)
     run: dict[str, object] | None = None
     calibration: dict[str, object] | None = None
 
@@ -969,6 +970,41 @@ def _receipt_from_registry_row(row: dict[str, object]) -> EvaluationReceipt:
         ) from exc
 
 
+def _raw_measurement_map(
+    items: list[dict[str, object]],
+) -> dict[tuple[str, str, str], tuple[float, bool]]:
+    result: dict[tuple[str, str, str], tuple[float, bool]] = {}
+    for item in items:
+        task_id = item.get("task_id")
+        task_version = item.get("task_version")
+        metric = item.get("metric")
+        value = item.get("value")
+        direction = item.get("higher_is_better")
+        if (
+            not isinstance(task_id, str)
+            or not isinstance(task_version, str)
+            or not isinstance(metric, str)
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or not isinstance(direction, bool)
+        ):
+            raise FrontierwrightError(
+                "EVALUATION_RECEIPT_INVALID",
+                "Evaluation comparison encountered malformed raw measurement evidence.",
+                4,
+            )
+        key = (task_id, task_version, metric)
+        if key in result:
+            raise FrontierwrightError(
+                "EVALUATION_RECEIPT_INVALID",
+                "Evaluation comparison encountered duplicate raw measurement evidence.",
+                4,
+            )
+        result[key] = (float(value), direction)
+    return result
+
+
 def run_reference_evaluation(
     root: Path,
     *,
@@ -1391,42 +1427,8 @@ def compare_candidate_evaluation(
             candidate_receipt_id=candidate_view.receipt_id,
         )
 
-    def measurement_map(
-        items: list[dict[str, object]],
-    ) -> dict[tuple[str, str, str], tuple[float, bool]]:
-        result: dict[tuple[str, str, str], tuple[float, bool]] = {}
-        for item in items:
-            task_id = item.get("task_id")
-            task_version = item.get("task_version")
-            metric = item.get("metric")
-            value = item.get("value")
-            direction = item.get("higher_is_better")
-            if (
-                not isinstance(task_id, str)
-                or not isinstance(task_version, str)
-                or not isinstance(metric, str)
-                or isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or not isinstance(direction, bool)
-            ):
-                raise FrontierwrightError(
-                    "EVALUATION_RECEIPT_INVALID",
-                    "Evaluation comparison encountered malformed raw measurement evidence.",
-                    4,
-                )
-            key = (task_id, task_version, metric)
-            if key in result:
-                raise FrontierwrightError(
-                    "EVALUATION_RECEIPT_INVALID",
-                    "Evaluation comparison encountered duplicate raw measurement evidence.",
-                    4,
-                )
-            result[key] = (float(value), direction)
-        return result
-
-    champion_measurements = measurement_map(champion_view.measurements)
-    candidate_measurements = measurement_map(candidate_view.measurements)
+    champion_measurements = _raw_measurement_map(champion_view.measurements)
+    candidate_measurements = _raw_measurement_map(candidate_view.measurements)
     if champion_measurements.keys() != candidate_measurements.keys():
         return EvaluationCompareView(
             pack_id=pack_id,
@@ -1493,6 +1495,116 @@ def compare_candidate_evaluation(
         candidate_receipt_id=candidate_view.receipt_id,
         measurements=comparisons,
     )
+
+
+def _stored_raw_evaluation_comparisons(
+    registry: Registry,
+    *,
+    champion_model_id: str,
+    candidate_model_id: str,
+) -> list[dict[str, object]]:
+    def keyed_receipts(
+        model_id: str,
+    ) -> dict[tuple[str, str, str, str, str, str, str], EvaluationReceipt]:
+        result: dict[
+            tuple[str, str, str, str, str, str, str],
+            EvaluationReceipt,
+        ] = {}
+        for row in registry.list_evaluation_receipts(model_id):
+            receipt = _receipt_from_registry_row(row)
+            conditions = receipt.conditions
+            pack_id = conditions.get("pack_id")
+            pack_version = conditions.get("pack_version")
+            dataset_id = conditions.get("dataset_id")
+            dataset_fingerprint = conditions.get("dataset_fingerprint")
+            config = conditions.get("config")
+            if (
+                not isinstance(pack_id, str)
+                or not isinstance(pack_version, str)
+                or not isinstance(dataset_id, str)
+                or not isinstance(dataset_fingerprint, str)
+                or not isinstance(config, dict)
+            ):
+                continue
+            try:
+                config_json = json.dumps(
+                    config,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                continue
+            key = (
+                pack_id,
+                pack_version,
+                receipt.evaluator_id,
+                receipt.evaluator_version,
+                dataset_id,
+                dataset_fingerprint,
+                config_json,
+            )
+            result.setdefault(key, receipt)
+        return result
+
+    champion_receipts = keyed_receipts(champion_model_id)
+    candidate_receipts = keyed_receipts(candidate_model_id)
+    comparisons: list[dict[str, object]] = []
+
+    for evidence_key in sorted(champion_receipts.keys() & candidate_receipts.keys()):
+        champion_receipt = champion_receipts[evidence_key]
+        candidate_receipt = candidate_receipts[evidence_key]
+        champion_map = _raw_measurement_map(
+            [asdict(item) for item in champion_receipt.measurements]
+        )
+        candidate_map = _raw_measurement_map(
+            [asdict(item) for item in candidate_receipt.measurements]
+        )
+        if champion_map.keys() != candidate_map.keys():
+            continue
+
+        measurements: list[dict[str, object]] = []
+        direction_mismatch = False
+        for measurement_key in sorted(champion_map):
+            champion_value, champion_direction = champion_map[measurement_key]
+            candidate_value, candidate_direction = candidate_map[measurement_key]
+            if champion_direction != candidate_direction:
+                direction_mismatch = True
+                break
+            raw_delta = candidate_value - champion_value
+            measurements.append(
+                {
+                    "task_id": measurement_key[0],
+                    "task_version": measurement_key[1],
+                    "metric": measurement_key[2],
+                    "higher_is_better": champion_direction,
+                    "champion_value": champion_value,
+                    "candidate_value": candidate_value,
+                    "raw_delta": raw_delta,
+                    "improvement_delta": (
+                        raw_delta if champion_direction else -raw_delta
+                    ),
+                }
+            )
+        if direction_mismatch:
+            continue
+
+        comparisons.append(
+            {
+                "pack_id": evidence_key[0],
+                "pack_version": evidence_key[1],
+                "evaluator_id": evidence_key[2],
+                "evaluator_version": evidence_key[3],
+                "dataset_id": evidence_key[4],
+                "dataset_fingerprint": evidence_key[5],
+                "config": json.loads(evidence_key[6]),
+                "champion_receipt_id": champion_receipt.receipt_id,
+                "candidate_receipt_id": candidate_receipt.receipt_id,
+                "measurements": measurements,
+            }
+        )
+    return comparisons
 
 
 def get_resource_view(root: Path) -> ResourceView:
@@ -3548,6 +3660,11 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
             str(build["scale_hash"])
             if build is not None and isinstance(build.get("scale_hash"), str)
             else None
+        ),
+        raw_evaluation_comparisons=_stored_raw_evaluation_comparisons(
+            registry,
+            champion_model_id=state.champion.model.model_id,
+            candidate_model_id=candidate.model.model_id,
         ),
         run=dict(run) if run is not None else None,
         calibration=dict(calibration) if calibration is not None else None,

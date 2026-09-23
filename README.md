@@ -140,7 +140,7 @@ Implemented now:
 - `frontierwright eval run` produces raw cross-entropy/perplexity receipts pinned to exact model and dataset fingerprints, preparation-recipe evidence, evaluation config, and Python/PyTorch runtime versions;
 - identical model/data/config evaluation requests replay the existing durable receipt without rerunning the evaluator, while dataset/model drift is rejected before execution;
 - generated raw evaluation evidence remains separate from capability stats: Frontierwright does not invent a player-facing stat until an explicit frozen capability scale maps the evidence;
-- `frontierwright eval compare` evaluates champion and candidate under the same pack/data/config and reports raw deltas plus direction-normalized `improvement_delta` without choosing or promoting a winner;
+- `frontierwright eval compare` evaluates champion and candidate under the same pack/data/config and reports raw deltas plus direction-normalized `improvement_delta` without choosing or promoting a winner; stored comparable raw receipts are also surfaced automatically in the normal Candidate compare view/TUI;
 - deterministic evaluation replay revalidates model/data/config/evaluator identity, so a conflicting receipt cannot silently occupy a generated receipt ID;
 - evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
 - training creates a `PENDING` candidate and never silently changes the champion;

@@ -2686,6 +2686,24 @@ class Registry:
             result["measurements"] = json.loads(result.pop("measurements_json"))
             return result
 
+    def list_evaluation_receipts(
+        self,
+        model_id: str,
+    ) -> tuple[dict[str, Any], ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM evaluation_receipts WHERE model_id = ? "
+                "ORDER BY imported_at DESC, receipt_id DESC",
+                (model_id,),
+            ).fetchall()
+            results: list[dict[str, Any]] = []
+            for row in rows:
+                result = dict(row)
+                result["conditions"] = json.loads(result.pop("conditions_json"))
+                result["measurements"] = json.loads(result.pop("measurements_json"))
+                results.append(result)
+            return tuple(results)
+
     def store_capability_scale(self, scale: CapabilityScale) -> None:
         with self.connect(write=True) as connection:
             existing = connection.execute(

@@ -11,6 +11,7 @@ from frontierwright.evaluations import REFERENCE_LM_PACK, EvaluationReceipt, Raw
 from frontierwright.registry import Registry
 from frontierwright.service import (
     add_local_dataset,
+    compare_candidate,
     compare_candidate_evaluation,
     get_evaluation_packs,
     get_stats_view,
@@ -391,6 +392,18 @@ def test_raw_candidate_compare_respects_metric_direction(
         assert item["higher_is_better"] is False
         assert item["raw_delta"] < 0
         assert item["improvement_delta"] > 0
+
+    standard_compare = compare_candidate(project, candidate.model_id)
+    assert standard_compare.scale_comparable is False
+    assert len(standard_compare.raw_evaluation_comparisons) == 1
+    stored = standard_compare.raw_evaluation_comparisons[0]
+    assert stored["pack_id"] == REFERENCE_LM_PACK.pack_id
+    assert stored["champion_receipt_id"] == view.champion_receipt_id
+    assert stored["candidate_receipt_id"] == view.candidate_receipt_id
+    assert all(
+        item["improvement_delta"] > 0
+        for item in stored["measurements"]
+    )
 
 
 def test_deterministic_evaluation_replay_rejects_poisoned_receipt_identity(

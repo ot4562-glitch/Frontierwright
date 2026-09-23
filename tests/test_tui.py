@@ -5,6 +5,7 @@ from textual.widgets import TabbedContent
 from frontierwright.domain import ModelOrigin, ModelState
 from frontierwright.registry import Registry
 from frontierwright.service import (
+    CompareView,
     StatusView,
     get_build_view,
     get_candidates_view,
@@ -15,7 +16,55 @@ from frontierwright.service import (
     get_status,
 )
 from frontierwright.tui import FrontierwrightApp
-from frontierwright.tui.app import CandidateScreen, HelpScreen
+from frontierwright.tui.app import CandidateScreen, HelpScreen, _compare_text
+
+
+def test_candidate_compare_text_includes_stored_raw_evaluation() -> None:
+    view = CompareView(
+        champion_model_id="champion",
+        candidate_model_id="candidate",
+        candidate_status="PENDING",
+        scale_comparable=False,
+        scale_reason="No frozen capability scale.",
+        champion_stats={
+            "general": None,
+            "reasoning": None,
+            "math": None,
+            "coding": None,
+        },
+        candidate_stats={
+            "general": None,
+            "reasoning": None,
+            "math": None,
+            "coding": None,
+        },
+        deltas={
+            "general": None,
+            "reasoning": None,
+            "math": None,
+            "coding": None,
+        },
+        raw_evaluation_comparisons=[
+            {
+                "pack_id": "frontierwright.eval.reference-heldout-lm",
+                "pack_version": "1",
+                "dataset_id": "dataset-eval",
+                "measurements": [
+                    {
+                        "metric": "perplexity",
+                        "champion_value": 50.0,
+                        "candidate_value": 40.0,
+                        "improvement_delta": 10.0,
+                    }
+                ],
+            }
+        ],
+    )
+
+    rendered = _compare_text(view)
+    assert "RAW EVALUATION" in rendered
+    assert "frontierwright.eval.reference-heldout-lm@1" in rendered
+    assert "perplexity: 50.0 -> 40.0 (improvement +10)" in rendered
 
 
 def make_view() -> StatusView:
