@@ -26,6 +26,7 @@ _HF_METADATA_NAMES = {
     "model.safetensors.index.json",
     "pytorch_model.bin.index.json",
     "adapter_config.json",
+    "frontierwright-transform.json",
 }
 _PARTIAL_HISTORY_NAMES = {
     "trainer_state.json",

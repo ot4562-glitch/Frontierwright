@@ -95,6 +95,17 @@ class BirthInterventionPlugin:
 
 
 @dataclass(frozen=True)
+class ArtifactTransformInterventionPlugin:
+    descriptor: InterventionDescriptor
+
+    def __post_init__(self) -> None:
+        if self.descriptor.surface is not InterventionSurface.ARTIFACT_TRANSFORM:
+            raise ValueError(
+                "Artifact transform intervention must use ARTIFACT_TRANSFORM surface"
+            )
+
+
+@dataclass(frozen=True)
 class BuiltinTrainingInterventionPlugin:
     descriptor: InterventionDescriptor
     path_plugin: TrainingPathPlugin
@@ -179,6 +190,16 @@ BUILTIN_INTERVENTION_PLUGINS: tuple[InterventionPlugin, ...] = (
         family=InterventionFamily.ALIGN,
         title="Direct Preference Optimization (DPO)",
         path_id=TrainingPathId.DPO,
+    ),
+    ArtifactTransformInterventionPlugin(
+        descriptor=InterventionDescriptor(
+            intervention_id="frontierwright.evolve.linear-merge",
+            family=InterventionFamily.EVOLVE,
+            title="Linear weight merge",
+            version="1",
+            provider="frontierwright",
+            surface=InterventionSurface.ARTIFACT_TRANSFORM,
+        )
     ),
 )
 

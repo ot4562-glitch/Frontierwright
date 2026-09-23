@@ -37,6 +37,7 @@ from frontierwright.service import (
     HistoryView,
     InterventionsView,
     LabAdaptersView,
+    MergeView,
     PathsView,
     PlanView,
     ResourceView,
@@ -70,6 +71,7 @@ from frontierwright.service import (
     get_status,
     import_local_model,
     ingest_stats,
+    merge_reference_models,
     prepare_dataset,
     prepare_dataset_mixture,
     promote_candidate,
@@ -96,6 +98,7 @@ data_app = typer.Typer(help="Register and inspect user/lab datasets.")
 plan_app = typer.Typer(help="Create and inspect pinned training plans.")
 backend_app = typer.Typer(help="Inspect and configure training backends.")
 birth_app = typer.Typer(help="Materialize and inspect zero-model birth state.")
+evolve_app = typer.Typer(help="Evolve models through artifact transforms.")
 lab_app = typer.Typer(help="Connect and inspect controlled private Lab infrastructure.")
 lab_adapters_app = typer.Typer(help="Manage Lab adapter manifests.")
 lab_app.add_typer(lab_adapters_app, name="adapters")
@@ -108,6 +111,7 @@ app.add_typer(data_app, name="data")
 app.add_typer(plan_app, name="plan")
 app.add_typer(backend_app, name="backend")
 app.add_typer(birth_app, name="birth")
+app.add_typer(evolve_app, name="evolve")
 app.add_typer(lab_app, name="lab")
 
 console = Console()
@@ -194,6 +198,10 @@ def _run_payload(view: RunView) -> dict[str, object]:
 
 
 def _candidate_payload(view: CandidateView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _merge_payload(view: MergeView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -515,6 +523,20 @@ def _print_candidates(view: CandidateView) -> None:
                 for axis, value in stats.items()
             )
             console.print(f"  {rendered}")
+
+
+def _print_merge(view: MergeView) -> None:
+    console.print("[bold]MODEL MERGE[/bold]")
+    console.print(f"Transform: {view.transform_id}")
+    console.print(
+        f"Primary: {view.primary_model_id} · weight={view.primary_weight}"
+    )
+    console.print(f"Other: {view.other_model_id} · weight={view.other_weight}")
+    console.print(f"Candidate: {view.candidate_model_id}")
+    console.print(f"Fingerprint: {view.model_fingerprint}")
+    console.print(f"Replay: {'YES' if view.replayed else 'NO'}")
+    if view.checkpoint:
+        console.print(f"Checkpoint: {view.checkpoint}")
 
 
 def _print_compare(view: CompareView) -> None:
@@ -885,6 +907,61 @@ def birth_zero(
         _emit_json(_birth_payload(view))
         return
     _print_birth(view)
+
+
+@evolve_app.command("merge")
+def evolve_merge(
+    other_model_id: Annotated[
+        str,
+        typer.Argument(help="Second registered model to merge with the current champion."),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    other_weight: Annotated[
+        float,
+        typer.Option(
+            "--other-weight",
+            min=0.0,
+            max=1.0,
+            help="Weight assigned to the second model; champion receives 1-weight.",
+        ),
+    ] = 0.5,
+    python_executable: Annotated[
+        str,
+        typer.Option(
+            "--python",
+            help="Python executable for the isolated PyTorch transform environment.",
+        ),
+    ] = sys.executable,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option("--timeout", help="Maximum merge backend wall time in seconds."),
+    ] = 300.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = merge_reference_models(
+            path,
+            other_model_id=other_model_id,
+            other_weight=other_weight,
+            python_executable=python_executable,
+            timeout_seconds=timeout_seconds,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_merge_payload(view))
+        return
+    _print_merge(view)
+    console.print(
+        "\nMerge created a PENDING candidate. Evaluate and compare it before promotion."
+    )
 
 
 @app.command("import")

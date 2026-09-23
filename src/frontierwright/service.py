@@ -63,6 +63,7 @@ from frontierwright.execution import (
 )
 from frontierwright.interventions import (
     assess_training_interventions,
+    intervention_by_id,
     intervention_for_training_path,
     intervention_plugins,
 )
@@ -334,6 +335,26 @@ class RunView:
 class CandidateView:
     schema_version: int = 1
     candidates: list[dict[str, object]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MergeView:
+    schema_version: int = 1
+    intervention_id: str = "frontierwright.evolve.linear-merge"
+    intervention_version: str = "1"
+    transform_id: str | None = None
+    replayed: bool = False
+    primary_model_id: str | None = None
+    other_model_id: str | None = None
+    primary_weight: float | None = None
+    other_weight: float | None = None
+    candidate_model_id: str | None = None
+    model_fingerprint: str | None = None
+    checkpoint: str | None = None
+    metrics: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -732,6 +753,337 @@ def birth_zero_model(
         raise
 
     return get_birth_view(root)
+
+
+def _merge_view_from_candidate(
+    registry: Registry,
+    *,
+    transform_id: str,
+    candidate_model_id: str,
+    primary_model_id: str,
+    other_model_id: str,
+    primary_weight: float,
+    other_weight: float,
+    replayed: bool,
+) -> MergeView:
+    candidate = registry.get_candidate(candidate_model_id)
+    _verify_model_artifact_integrity(registry, candidate_model_id)
+    metrics: dict[str, object] = {}
+    metadata_path = Path(candidate.model.checkpoint) / "frontierwright-transform.json"
+    try:
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raw = {}
+    if isinstance(raw, dict):
+        metrics = dict(raw)
+    return MergeView(
+        transform_id=transform_id,
+        replayed=replayed,
+        primary_model_id=primary_model_id,
+        other_model_id=other_model_id,
+        primary_weight=primary_weight,
+        other_weight=other_weight,
+        candidate_model_id=candidate.model.model_id,
+        model_fingerprint=candidate.model.fingerprint,
+        checkpoint=candidate.model.checkpoint,
+        metrics=metrics,
+    )
+
+
+def merge_reference_models(
+    root: Path,
+    *,
+    other_model_id: str,
+    other_weight: float,
+    python_executable: str,
+    timeout_seconds: float = 300.0,
+) -> MergeView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before merging models.",
+            10,
+        )
+    if (
+        isinstance(other_weight, bool)
+        or not isinstance(other_weight, (int, float))
+        or not math.isfinite(float(other_weight))
+        or not 0.0 < float(other_weight) < 1.0
+    ):
+        raise FrontierwrightError(
+            "MERGE_WEIGHT_INVALID",
+            "Merge other-model weight must be strictly between 0 and 1.",
+            2,
+        )
+    if timeout_seconds <= 0:
+        raise FrontierwrightError(
+            "INVALID_TIMEOUT",
+            "Merge timeout must be positive.",
+            2,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Training Python executable must be nonempty.",
+            2,
+        )
+
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required before model merge.",
+            12,
+        )
+    primary = state.champion.model
+    other = registry.get_model(other_model_id)
+    if other.model_id == primary.model_id:
+        raise FrontierwrightError(
+            "MERGE_PARENT_CONFLICT",
+            "Merge requires two different model identities.",
+            2,
+        )
+    if other.identity_id != primary.identity_id:
+        raise FrontierwrightError(
+            "IDENTITY_MISMATCH",
+            "Merge parents must belong to the same Frontierwright identity.",
+            13,
+        )
+
+    _verify_model_artifact_integrity(registry, primary.model_id)
+    _verify_model_artifact_integrity(registry, other.model_id)
+
+    intervention = intervention_by_id("frontierwright.evolve.linear-merge")
+    if intervention is None:
+        raise FrontierwrightError(
+            "INTERVENTION_NOT_FOUND",
+            "Built-in linear merge intervention is unavailable.",
+            4,
+        )
+
+    other_weight_value = float(other_weight)
+    primary_weight = 1.0 - other_weight_value
+    contract: dict[str, object] = {
+        "intervention_id": intervention.intervention_id,
+        "intervention_version": intervention.version,
+        "primary": {
+            "model_id": primary.model_id,
+            "fingerprint": primary.fingerprint,
+            "weight": primary_weight,
+        },
+        "other": {
+            "model_id": other.model_id,
+            "fingerprint": other.fingerprint,
+            "weight": other_weight_value,
+        },
+    }
+    contract_json = json.dumps(
+        contract,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(contract_json.encode("utf-8")).hexdigest()
+    transform_id = f"transform-merge-{digest[:32]}"
+    candidate_model_id = f"model-merge-{digest[:32]}"
+
+    try:
+        registry.get_candidate(candidate_model_id)
+    except FrontierwrightError as exc:
+        if exc.code != "CANDIDATE_NOT_FOUND":
+            raise
+    else:
+        return _merge_view_from_candidate(
+            registry,
+            transform_id=transform_id,
+            candidate_model_id=candidate_model_id,
+            primary_model_id=primary.model_id,
+            other_model_id=other.model_id,
+            primary_weight=primary_weight,
+            other_weight=other_weight_value,
+            replayed=True,
+        )
+
+    transforms_root = registry.state_dir / "transforms"
+    final_root = transforms_root / transform_id
+    request_path = transforms_root / "requests" / f"{transform_id}.json"
+
+    if final_root.exists():
+        final_descriptor = inspect_local_model(final_root / "model")
+        model = ModelState(
+            model_id=candidate_model_id,
+            identity_id=primary.identity_id,
+            origin=primary.origin,
+            checkpoint=str(final_descriptor.source_path),
+            fingerprint=final_descriptor.fingerprint,
+            parent_model_id=primary.model_id,
+            stats=(),
+            model_format=final_descriptor.model_format,
+            trainable=final_descriptor.trainable,
+        )
+        registry.register_transform_candidate(
+            model,
+            final_descriptor,
+            intervention_id=intervention.intervention_id,
+            intervention_version=intervention.version,
+            parents=(
+                (primary.model_id, primary_weight),
+                (other.model_id, other_weight_value),
+            ),
+            details={"transform_id": transform_id, "recovered_existing_artifact": True},
+        )
+        return _merge_view_from_candidate(
+            registry,
+            transform_id=transform_id,
+            candidate_model_id=candidate_model_id,
+            primary_model_id=primary.model_id,
+            other_model_id=other.model_id,
+            primary_weight=primary_weight,
+            other_weight=other_weight_value,
+            replayed=True,
+        )
+
+    staging_root = (
+        transforms_root
+        / ".staging"
+        / f"{transform_id}-{uuid4().hex}"
+    )
+    staging_root.mkdir(parents=True, exist_ok=False)
+    request: dict[str, object] = {
+        "schema_version": 1,
+        "backend_id": REFERENCE_BACKEND_ID,
+        "operation": "merge",
+        "model_source_path": primary.checkpoint,
+        "other_model_source_path": other.checkpoint,
+        "other_weight": other_weight_value,
+        "parents": [
+            {
+                "model_id": primary.model_id,
+                "fingerprint": primary.fingerprint,
+                "weight": primary_weight,
+            },
+            {
+                "model_id": other.model_id,
+                "fingerprint": other.fingerprint,
+                "weight": other_weight_value,
+            },
+        ],
+        "output_root": str(staging_root.resolve()),
+    }
+    _write_state_json(request_path, request)
+
+    try:
+        result = run_structured_command(
+            (
+                python_executable,
+                "-m",
+                "frontierwright.reference_backend",
+                "{request_json}",
+            ),
+            environment_overrides={"PYTHONUNBUFFERED": "1"},
+            request_path=request_path,
+            timeout_seconds=timeout_seconds,
+        )
+        if result.get("operation") != "merge":
+            raise FrontierwrightError(
+                "MERGE_RESULT_INVALID",
+                "Merge backend did not return a merge result.",
+                14,
+            )
+        output_raw = result.get("output_model_path")
+        metrics = result.get("metrics")
+        if not isinstance(output_raw, str) or not output_raw:
+            raise FrontierwrightError(
+                "MERGE_RESULT_INVALID",
+                "Merge backend result lacks output_model_path.",
+                14,
+            )
+        if not isinstance(metrics, dict):
+            raise FrontierwrightError(
+                "MERGE_RESULT_INVALID",
+                "Merge backend result metrics must be an object.",
+                14,
+            )
+        if metrics.get("intervention_id") != intervention.intervention_id:
+            raise FrontierwrightError(
+                "MERGE_RESULT_INVALID",
+                "Merge backend intervention identity does not match the request.",
+                14,
+            )
+
+        backend_model_path = Path(output_raw).expanduser().resolve()
+        try:
+            backend_model_path.relative_to(staging_root.resolve())
+        except ValueError as exc:
+            raise FrontierwrightError(
+                "MERGE_OUTPUT_ESCAPE",
+                "Merge backend output escaped the managed staging directory.",
+                14,
+            ) from exc
+
+        staged_descriptor = inspect_local_model(backend_model_path)
+        if final_root.exists():
+            final_descriptor = inspect_local_model(final_root / "model")
+            if final_descriptor.fingerprint != staged_descriptor.fingerprint:
+                raise FrontierwrightError(
+                    "MERGE_ARTIFACT_CONFLICT",
+                    "Existing merge artifact differs from the new transform result.",
+                    13,
+                )
+            shutil.rmtree(staging_root, ignore_errors=True)
+        else:
+            final_root.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staging_root, final_root)
+            final_descriptor = inspect_local_model(final_root / "model")
+            if final_descriptor.fingerprint != staged_descriptor.fingerprint:
+                raise FrontierwrightError(
+                    "MERGE_ARTIFACT_MISMATCH",
+                    "Merge artifact fingerprint changed during publication.",
+                    14,
+                )
+
+        model = ModelState(
+            model_id=candidate_model_id,
+            identity_id=primary.identity_id,
+            origin=primary.origin,
+            checkpoint=str(final_descriptor.source_path),
+            fingerprint=final_descriptor.fingerprint,
+            parent_model_id=primary.model_id,
+            stats=(),
+            model_format=final_descriptor.model_format,
+            trainable=final_descriptor.trainable,
+        )
+        registry.register_transform_candidate(
+            model,
+            final_descriptor,
+            intervention_id=intervention.intervention_id,
+            intervention_version=intervention.version,
+            parents=(
+                (primary.model_id, primary_weight),
+                (other.model_id, other_weight_value),
+            ),
+            details={
+                "transform_id": transform_id,
+                "metrics": dict(metrics),
+            },
+        )
+    except Exception:
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+
+    return _merge_view_from_candidate(
+        registry,
+        transform_id=transform_id,
+        candidate_model_id=candidate_model_id,
+        primary_model_id=primary.model_id,
+        other_model_id=other.model_id,
+        primary_weight=primary_weight,
+        other_weight=other_weight_value,
+        replayed=False,
+    )
 
 
 def get_stats_view(root: Path, model_id: str | None = None) -> StatsView:

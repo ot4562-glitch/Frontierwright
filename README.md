@@ -82,12 +82,13 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v18, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, Lab adapter manifests, durable run-usage receipts, and preference-dataset role support;
+- automatic registry migration through schema v19, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, Lab adapter manifests, durable run-usage receipts, preference-dataset role support, and multi-parent model lineage edges;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
 - history evidence states `UNKNOWN / PARTIAL / VERIFIED / COMPLETE`;
 - hash-checked `frontierwright-lineage.json` verification for imported model history;
+- native multi-parent lineage graph with `DERIVED_FROM / MERGED_FROM / DISTILLED_FROM / TRANSFORMED_FROM` relations while retaining the primary-parent compatibility field;
 - recommendation gating: only `COMPLETE / VERIFIED` history is eligible for a strong history-aware recommendation;
 - actual local CPU/RAM/disk/NVIDIA GPU detection with `DETECTED` provenance;
 - detected resource profiles persisted in SQLite and shown through CLI/JSON/TUI;
@@ -122,7 +123,7 @@ Implemented now:
 - extensible intervention taxonomy spanning `BIRTH / LEARN / SPECIALIZE / ALIGN / EVOLVE / OPTIMIZE / EVALUATE / OPERATE`;
 - discoverable InterventionPlugin registry with explicit execution surfaces; built-in training interventions wrap their real path-assessment plugins rather than acting as display-only labels;
 - `frontierwright interventions --json` exposes stable intervention ID/provider/version/family/surface metadata to automation;
-- the five v1 training paths remain registered built-in interventions, and the first post-v1 alignment intervention is `frontierwright.align.dpo`; the list is not the permanent top-level ontology;
+- the five v1 training paths remain registered built-in interventions; post-v1 built-ins now include `frontierwright.align.dpo` and the first EVOLVE artifact transform, `frontierwright.evolve.linear-merge`; the list is not the permanent top-level ontology;
 - factual path prerequisite evaluation using current model trainability, local data inventory, resources, birth state, and history confidence;
 - Academy zero-model birth via `frontierwright birth zero`, with deterministic `zero-8m` / `zero-25m` root checkpoint materialization, exact fingerprinting, runtime provenance, and idempotent repeated birth requests;
 - from-scratch pretraining now requires and pins a materialized zero-model birth root instead of silently reinitializing weights;
@@ -135,7 +136,9 @@ Implemented now:
 - measured output-size budget violations block candidate finalization even when the training backend itself reports success;
 - `max_money` keeps a plan non-ready until an executor with real runtime cost enforcement exists; a projected price alone is not treated as a hard budget;
 - built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` birth, from-scratch pretraining, continued pretraining, full-parameter causal SFT, merged-output LoRA SFT, merged-output QLoRA SFT, and full-parameter Direct Preference Optimization (DPO) for Frontierwright reference-model lineages;
-- reference QLoRA freezes the base model, packs targeted transformer projection matrices as blockwise NF4 4-bit values with float32 absmax scales, trains only LoRA parameters, records quantized-vs-full target storage evidence, and materializes a normal merged reference checkpoint after training; it does not claim bitsandbytes double quantization or paged optimizers;\n- reference DPO consumes UTF-8 JSONL `{prompt, chosen, rejected}` preference pairs, keeps an exact frozen reference copy of the current checkpoint, optimizes the policy with the pairwise log-ratio objective and pinned `dpo_beta`, and runs the same objective during calibration so readiness reflects the real alignment workload;
+- reference QLoRA freezes the base model, packs targeted transformer projection matrices as blockwise NF4 4-bit values with float32 absmax scales, trains only LoRA parameters, records quantized-vs-full target storage evidence, and materializes a normal merged reference checkpoint after training; it does not claim bitsandbytes double quantization or paged optimizers;
+- reference DPO consumes UTF-8 JSONL `{prompt, chosen, rejected}` preference pairs, keeps an exact frozen reference copy of the current checkpoint, optimizes the policy with the pairwise log-ratio objective and pinned `dpo_beta`, and runs the same objective during calibration so readiness reflects the real alignment workload;
+- `frontierwright evolve merge` performs deterministic linear weight merging for two compatible Frontierwright reference models, requires identical preset/tokenizer/state structure, fingerprints transform provenance into the model artifact, creates a PENDING candidate, and records both parents as weighted `MERGED_FROM` lineage edges; identical transform requests replay the existing candidate instead of recomputing;
 - successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
 - sealed artifact manifests bind the run, plan, intervention ID/version/family, dataset, dataset-preparation recipe, backend, effective config, model fingerprint, and exact file hashes;
 - built-in evaluation-pack registry exposed through `frontierwright eval packs`; the first pack runs deterministic held-out causal-LM evaluation for Frontierwright reference models;
@@ -148,7 +151,7 @@ Implemented now:
 - training creates a `PENDING` candidate and never silently changes the champion;
 - candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
 - promotion re-checks current champion/build/evaluation state transactionally, enforces frozen-scale build floors by default, and records explicit override evidence when a user intentionally accepts an unmeasured or build-violating candidate;
-- stable JSON/non-interactive machine surfaces for project/model/birth/resource/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter operations;
+- stable JSON/non-interactive machine surfaces for project/model/birth/evolve/resource/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter operations;
 - mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;
 - English/Korean human-string structure;
 - automated domain, migration, evaluation, execution recovery/idempotency, artifact integrity, candidate, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.

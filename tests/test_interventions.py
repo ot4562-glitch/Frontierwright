@@ -93,6 +93,14 @@ def test_training_assessment_executes_through_intervention_plugins() -> None:
     assert lora.recommendation_eligible is True
 
 
+def test_linear_merge_is_builtin_evolve_artifact_transform() -> None:
+    item = intervention_by_id("frontierwright.evolve.linear-merge")
+    assert item is not None
+    assert item.family is InterventionFamily.EVOLVE
+    assert item.surface is InterventionSurface.ARTIFACT_TRANSFORM
+    assert item.training_path_id is None
+
+
 def test_dpo_is_a_builtin_align_training_intervention() -> None:
     item = intervention_for_training_path(TrainingPathId.DPO)
     assert item.intervention_id == "frontierwright.align.dpo"

@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from frontierwright.reference_merge import merge_reference_models
+
 REFERENCE_BACKEND_ID = "frontierwright-reference-pytorch-v1"
 SUPPORTED_PATHS = (
     "FROM_SCRATCH_PRETRAINING",
@@ -1850,6 +1852,21 @@ def main(argv: list[str] | None = None) -> int:
         operation = request.get("operation")
         if operation == "birth":
             _emit(_birth(request))
+            return 0
+        if operation == "merge":
+            _emit(
+                merge_reference_models(
+                    torch=_import_torch(),
+                    backend_id=REFERENCE_BACKEND_ID,
+                    presets=PRESETS,
+                    build_model=_build_model,
+                    load_reference_model=_load_reference_model,
+                    parameter_count=_parameter_count,
+                    native_path=_native_path,
+                    reported_child_path=_reported_child_path,
+                    request=request,
+                )
+            )
             return 0
         if operation == "evaluate":
             model_source_path = request.get("model_source_path")

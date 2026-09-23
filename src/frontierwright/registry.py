@@ -1514,6 +1514,133 @@ WHERE parent_model_id IS NOT NULL;
             )
             self.event(connection, "CANDIDATE_REGISTERED", {"model_id": model.model_id})
 
+    def register_transform_candidate(
+        self,
+        model: ModelState,
+        descriptor: ImportedModelDescriptor,
+        *,
+        intervention_id: str,
+        intervention_version: str,
+        parents: tuple[tuple[str, float], ...],
+        details: dict[str, object],
+    ) -> None:
+        if len(parents) < 2:
+            raise FrontierwrightError(
+                "TRANSFORM_PARENTS_INVALID",
+                "Artifact transforms require at least two parent models.",
+                2,
+            )
+        with self.connect(write=True) as connection:
+            project = connection.execute(
+                "SELECT identity_id, history_confidence FROM project WHERE singleton = 1"
+            ).fetchone()
+            if project is None:
+                raise FrontierwrightError("REGISTRY_ERROR", "Missing project metadata.", 4)
+            if model.identity_id != project["identity_id"]:
+                raise FrontierwrightError(
+                    "IDENTITY_MISMATCH",
+                    "Transform candidate does not belong to this Frontierwright identity.",
+                    13,
+                )
+
+            for parent_model_id, weight in parents:
+                if (
+                    isinstance(weight, bool)
+                    or not isinstance(weight, (int, float))
+                    or not 0.0 < float(weight) < 1.0
+                ):
+                    raise FrontierwrightError(
+                        "TRANSFORM_WEIGHT_INVALID",
+                        "Transform parent weights must be strictly between 0 and 1.",
+                        2,
+                    )
+                row = connection.execute(
+                    "SELECT snapshot FROM models WHERE model_id = ?",
+                    (parent_model_id,),
+                ).fetchone()
+                if row is None:
+                    raise FrontierwrightError(
+                        "MODEL_NOT_FOUND",
+                        f"Transform parent does not exist: {parent_model_id}",
+                        3,
+                    )
+                parent = decode_model(row["snapshot"])
+                if parent.identity_id != project["identity_id"]:
+                    raise FrontierwrightError(
+                        "IDENTITY_MISMATCH",
+                        "Transform parents must stay inside one Frontierwright identity.",
+                        13,
+                    )
+
+            existing = connection.execute(
+                "SELECT m.snapshot, c.status FROM models m "
+                "LEFT JOIN candidates c USING(model_id) WHERE m.model_id = ?",
+                (model.model_id,),
+            ).fetchone()
+            if existing is not None:
+                existing_model = decode_model(existing["snapshot"])
+                if (
+                    existing_model.fingerprint == model.fingerprint
+                    and existing["status"] is not None
+                ):
+                    return
+                raise FrontierwrightError(
+                    "TRANSFORM_ID_CONFLICT",
+                    "Transform model ID already exists with different evidence.",
+                    13,
+                )
+
+            evidence = HistoryEvidenceResult(
+                confidence=HistoryConfidence(project["history_confidence"]),
+                evidence_files=(
+                    f"intervention:{intervention_id}@{intervention_version}",
+                    f"transform-fingerprint:{descriptor.fingerprint}",
+                ),
+                reason=(
+                    f"Candidate materialized by Frontierwright artifact transform "
+                    f"{intervention_id}@{intervention_version} with explicit parent lineage."
+                ),
+            )
+            self.insert_model(connection, model)
+            self.insert_model_artifact(
+                connection,
+                model.model_id,
+                descriptor,
+                evidence,
+            )
+            connection.execute(
+                "INSERT INTO candidates(model_id, status) VALUES (?, ?)",
+                (model.model_id, CandidateStatus.PENDING.value),
+            )
+            for ordinal, (parent_model_id, weight) in enumerate(parents):
+                Registry.insert_lineage_edge(
+                    connection,
+                    child_model_id=model.model_id,
+                    parent_model_id=parent_model_id,
+                    relation=LineageRelation.MERGED_FROM,
+                    ordinal=ordinal,
+                    details={
+                        "weight": float(weight),
+                        "intervention_id": intervention_id,
+                        "intervention_version": intervention_version,
+                    },
+                )
+            self.event(
+                connection,
+                "CANDIDATE_TRANSFORM_REGISTERED",
+                {
+                    "model_id": model.model_id,
+                    "fingerprint": model.fingerprint,
+                    "intervention_id": intervention_id,
+                    "intervention_version": intervention_version,
+                    "parents": [
+                        {"model_id": parent_id, "weight": float(weight)}
+                        for parent_id, weight in parents
+                    ],
+                    "details": details,
+                },
+            )
+
     def register_training_candidate(
         self,
         model: ModelState,
