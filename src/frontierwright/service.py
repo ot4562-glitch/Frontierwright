@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -36,7 +37,15 @@ from frontierwright.domain import (
 )
 from frontierwright.editions import EditionProfile, policy_for
 from frontierwright.errors import FrontierwrightError
-from frontierwright.evaluations import apply_scale, load_capability_scale, load_evaluation_receipt
+from frontierwright.evaluations import (
+    BUILTIN_EVALUATION_PACKS,
+    REFERENCE_LM_PACK,
+    EvaluationReceipt,
+    RawMeasurement,
+    apply_scale,
+    load_capability_scale,
+    load_evaluation_receipt,
+)
 from frontierwright.execution import (
     BackendDataBoundary,
     CommandBackendSpec,
@@ -183,6 +192,27 @@ class StatsView:
     raw_measurements: list[dict[str, object]] = field(default_factory=list)
     conditions: dict[str, object] = field(default_factory=dict)
     reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class EvaluationRunView:
+    schema_version: int = 1
+    pack_id: str | None = None
+    pack_version: str | None = None
+    receipt_id: str | None = None
+    receipt_sha256: str | None = None
+    model_id: str | None = None
+    model_fingerprint: str | None = None
+    dataset_id: str | None = None
+    dataset_fingerprint: str | None = None
+    evaluator_id: str | None = None
+    evaluator_version: str | None = None
+    replayed: bool = False
+    measurements: list[dict[str, object]] = field(default_factory=list)
+    conditions: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -843,6 +873,407 @@ def ingest_stats(
     stats = apply_scale(receipt, scale)
     registry.activate_capability_profile(receipt, scale, stats)
     return get_stats_view(root, receipt.model_id)
+
+
+def get_evaluation_packs() -> list[dict[str, object]]:
+    return [descriptor.to_dict() for descriptor in BUILTIN_EVALUATION_PACKS]
+
+
+def _evaluation_run_view(
+    receipt: EvaluationReceipt,
+    *,
+    dataset_id: str,
+    dataset_fingerprint: str,
+    replayed: bool,
+) -> EvaluationRunView:
+    pack_id = receipt.conditions.get("pack_id")
+    pack_version = receipt.conditions.get("pack_version")
+    return EvaluationRunView(
+        pack_id=str(pack_id) if isinstance(pack_id, str) else None,
+        pack_version=str(pack_version) if isinstance(pack_version, str) else None,
+        receipt_id=receipt.receipt_id,
+        receipt_sha256=receipt.sha256,
+        model_id=receipt.model_id,
+        model_fingerprint=receipt.model_fingerprint,
+        dataset_id=dataset_id,
+        dataset_fingerprint=dataset_fingerprint,
+        evaluator_id=receipt.evaluator_id,
+        evaluator_version=receipt.evaluator_version,
+        replayed=replayed,
+        measurements=[asdict(item) for item in receipt.measurements],
+        conditions=dict(receipt.conditions),
+    )
+
+
+def _receipt_from_registry_row(row: dict[str, object]) -> EvaluationReceipt:
+    measurements_raw = row.get("measurements")
+    conditions = row.get("conditions")
+    if not isinstance(measurements_raw, list) or not isinstance(conditions, dict):
+        raise FrontierwrightError(
+            "EVALUATION_RECEIPT_INVALID",
+            "Stored evaluation receipt is malformed.",
+            4,
+        )
+    try:
+        measurements_list: list[RawMeasurement] = []
+        for item in measurements_raw:
+            if not isinstance(item, dict):
+                raise ValueError("measurement must be an object")
+            direction = item["higher_is_better"]
+            if not isinstance(direction, bool):
+                raise ValueError("measurement.higher_is_better must be a boolean")
+            measurements_list.append(
+                RawMeasurement(
+                    task_id=str(item["task_id"]),
+                    task_version=str(item["task_version"]),
+                    metric=str(item["metric"]),
+                    value=float(item["value"]),
+                    higher_is_better=direction,
+                )
+            )
+        measurements = tuple(measurements_list)
+        return EvaluationReceipt(
+            receipt_id=str(row["receipt_id"]),
+            model_id=str(row["model_id"]),
+            model_fingerprint=str(row["model_fingerprint"]),
+            evaluator_id=str(row["evaluator_id"]),
+            evaluator_version=str(row["evaluator_version"]),
+            conditions=dict(conditions),
+            measurements=measurements,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FrontierwrightError(
+            "EVALUATION_RECEIPT_INVALID",
+            f"Stored evaluation receipt is malformed: {exc}",
+            4,
+        ) from exc
+
+
+def run_reference_evaluation(
+    root: Path,
+    *,
+    dataset_id: str,
+    model_id: str | None = None,
+    python_executable: str,
+    device: str = "auto",
+    batch_size: int = 4,
+    max_batches: int = 16,
+    max_dataset_bytes: int = 64 * 1024 * 1024,
+    timeout_seconds: float = 300.0,
+) -> EvaluationRunView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before evaluation.",
+            10,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Evaluation Python executable must be nonempty.",
+            2,
+        )
+    if device not in {"auto", "cpu", "cuda"}:
+        raise FrontierwrightError(
+            "EVALUATION_CONFIG_INVALID",
+            "device must be auto, cpu, or cuda.",
+            2,
+        )
+    for label, value in (
+        ("batch_size", batch_size),
+        ("max_batches", max_batches),
+        ("max_dataset_bytes", max_dataset_bytes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise FrontierwrightError(
+                "EVALUATION_CONFIG_INVALID",
+                f"{label} must be a positive integer.",
+                2,
+            )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
+        raise FrontierwrightError(
+            "EVALUATION_CONFIG_INVALID",
+            "timeout_seconds must be a positive finite number.",
+            2,
+        )
+
+    state = registry.read()
+    if model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "A current champion or explicit --model is required for evaluation.",
+                12,
+            )
+        model = state.champion.model
+    else:
+        model = registry.get_model(model_id)
+
+    _verify_model_artifact_integrity(registry, model.model_id)
+
+    dataset = next(
+        (
+            item
+            for item in state.datasets
+            if item.get("dataset_id") == dataset_id
+        ),
+        None,
+    )
+    if dataset is None:
+        raise FrontierwrightError(
+            "DATASET_NOT_FOUND",
+            f"Active evaluation dataset not found: {dataset_id}",
+            3,
+        )
+    source_path = dataset.get("source_path")
+    fingerprint = dataset.get("fingerprint")
+    if not isinstance(source_path, str) or not isinstance(fingerprint, str):
+        raise FrontierwrightError(
+            "DATASET_INVALID",
+            "Evaluation dataset registry metadata is incomplete.",
+            4,
+        )
+    descriptor = inspect_local_dataset(Path(source_path))
+    if descriptor.fingerprint != fingerprint:
+        raise FrontierwrightError(
+            "DATASET_CONTENT_DRIFT",
+            "Evaluation dataset content changed after registration.",
+            13,
+        )
+
+    config: dict[str, object] = {
+        "device": device,
+        "batch_size": batch_size,
+        "max_batches": max_batches,
+        "max_dataset_bytes": max_dataset_bytes,
+    }
+    identity_payload: dict[str, object] = {
+        "schema_version": 1,
+        "pack_id": REFERENCE_LM_PACK.pack_id,
+        "pack_version": REFERENCE_LM_PACK.pack_version,
+        "model_id": model.model_id,
+        "model_fingerprint": model.fingerprint,
+        "dataset_id": dataset_id,
+        "dataset_fingerprint": fingerprint,
+        "config": config,
+    }
+    identity_digest = hashlib.sha256(
+        json.dumps(
+            identity_payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt_id = f"receipt-eval-{identity_digest[:32]}"
+
+    existing = registry.get_evaluation_receipt(receipt_id)
+    if existing is not None:
+        receipt = _receipt_from_registry_row(existing)
+        return _evaluation_run_view(
+            receipt,
+            dataset_id=dataset_id,
+            dataset_fingerprint=fingerprint,
+            replayed=True,
+        )
+
+    request_path = (
+        registry.state_dir
+        / "evaluations"
+        / "requests"
+        / f"{receipt_id}.json"
+    )
+    request: dict[str, object] = {
+        "schema_version": 1,
+        "backend_id": REFERENCE_BACKEND_ID,
+        "operation": "evaluate",
+        "model_source_path": model.checkpoint,
+        "dataset_source_path": source_path,
+        "config": config,
+    }
+    _write_state_json(request_path, request)
+    result = run_structured_command(
+        (
+            python_executable,
+            "-m",
+            "frontierwright.reference_backend",
+            "{request_json}",
+        ),
+        environment_overrides={"PYTHONUNBUFFERED": "1"},
+        request_path=request_path,
+        timeout_seconds=float(timeout_seconds),
+    )
+    if result.get("operation") != "evaluate":
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Reference evaluator did not return an evaluate result.",
+            14,
+        )
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Reference evaluator metrics must be an object.",
+            14,
+        )
+
+    def finite_metric(name: str, *, positive: bool = False) -> float:
+        value = metrics.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise FrontierwrightError(
+                "EVALUATION_RESULT_INVALID",
+                f"Reference evaluator metric {name} must be numeric.",
+                14,
+            )
+        result_value = float(value)
+        if not math.isfinite(result_value) or (positive and result_value <= 0):
+            raise FrontierwrightError(
+                "EVALUATION_RESULT_INVALID",
+                f"Reference evaluator metric {name} is invalid.",
+                14,
+            )
+        return result_value
+
+    cross_entropy = finite_metric("cross_entropy_nats_per_token")
+    if cross_entropy < 0:
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Cross-entropy cannot be negative.",
+            14,
+        )
+    perplexity = finite_metric("perplexity", positive=True)
+    tokens_evaluated = metrics.get("tokens_evaluated")
+    windows_evaluated = metrics.get("windows_evaluated")
+    python_version = metrics.get("python_version")
+    torch_version = metrics.get("torch_version")
+    if (
+        not isinstance(python_version, str)
+        or not python_version
+        or not isinstance(torch_version, str)
+        or not torch_version
+    ):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Reference evaluator must report Python and PyTorch versions.",
+            14,
+        )
+    if (
+        isinstance(tokens_evaluated, bool)
+        or not isinstance(tokens_evaluated, int)
+        or tokens_evaluated <= 0
+        or isinstance(windows_evaluated, bool)
+        or not isinstance(windows_evaluated, int)
+        or windows_evaluated <= 0
+    ):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Reference evaluator must report positive token/window counts.",
+            14,
+        )
+
+    conditions: dict[str, object] = {
+        "pack_id": REFERENCE_LM_PACK.pack_id,
+        "pack_version": REFERENCE_LM_PACK.pack_version,
+        "backend_id": REFERENCE_BACKEND_ID,
+        "dataset_id": dataset_id,
+        "dataset_fingerprint": fingerprint,
+        "dataset_role": dataset.get("role"),
+        "dataset_classification": dataset.get("classification"),
+        "dataset_recipe_id": dataset.get("preparation_recipe_id"),
+        "dataset_recipe_hash": dataset.get("preparation_recipe_hash"),
+        "config": config,
+        "device": metrics.get("device"),
+        "tokens_evaluated": tokens_evaluated,
+        "windows_evaluated": windows_evaluated,
+        "parameter_count": metrics.get("parameter_count"),
+        "python_version": python_version,
+        "torch_version": torch_version,
+    }
+    receipt = EvaluationReceipt(
+        receipt_id=receipt_id,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        evaluator_id=REFERENCE_LM_PACK.evaluator_id,
+        evaluator_version=REFERENCE_LM_PACK.evaluator_version,
+        conditions=conditions,
+        measurements=(
+            RawMeasurement(
+                task_id=REFERENCE_LM_PACK.task_id,
+                task_version=REFERENCE_LM_PACK.task_version,
+                metric="cross_entropy_nats_per_token",
+                value=cross_entropy,
+                higher_is_better=False,
+            ),
+            RawMeasurement(
+                task_id=REFERENCE_LM_PACK.task_id,
+                task_version=REFERENCE_LM_PACK.task_version,
+                metric="perplexity",
+                value=perplexity,
+                higher_is_better=False,
+            ),
+        ),
+    )
+    registry.store_evaluation_receipt(receipt, provenance="GENERATED")
+
+    receipt_path = (
+        registry.state_dir
+        / "evaluations"
+        / "receipts"
+        / f"{receipt.receipt_id}.json"
+    )
+    _write_state_json(
+        receipt_path,
+        {
+            "schema_version": 1,
+            **receipt.canonical_payload(),
+            "receipt_sha256": receipt.sha256,
+        },
+    )
+    return _evaluation_run_view(
+        receipt,
+        dataset_id=dataset_id,
+        dataset_fingerprint=fingerprint,
+        replayed=False,
+    )
+
+
+def run_evaluation_pack(
+    root: Path,
+    *,
+    pack_id: str,
+    dataset_id: str,
+    model_id: str | None = None,
+    python_executable: str,
+    device: str = "auto",
+    batch_size: int = 4,
+    max_batches: int = 16,
+    max_dataset_bytes: int = 64 * 1024 * 1024,
+    timeout_seconds: float = 300.0,
+) -> EvaluationRunView:
+    if pack_id != REFERENCE_LM_PACK.pack_id:
+        raise FrontierwrightError(
+            "EVALUATION_PACK_UNSUPPORTED",
+            f"Evaluation pack is not executable in this build: {pack_id}",
+            12,
+        )
+    return run_reference_evaluation(
+        root,
+        dataset_id=dataset_id,
+        model_id=model_id,
+        python_executable=python_executable,
+        device=device,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        max_dataset_bytes=max_dataset_bytes,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def get_resource_view(root: Path) -> ResourceView:

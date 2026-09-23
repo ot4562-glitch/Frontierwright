@@ -84,6 +84,68 @@ class EvaluationReceipt:
 
 
 @dataclass(frozen=True)
+class EvaluationPackDescriptor:
+    pack_id: str
+    pack_version: str
+    title: str
+    evaluator_id: str
+    evaluator_version: str
+    task_id: str
+    task_version: str
+    metrics: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for field in (
+            "pack_id",
+            "pack_version",
+            "title",
+            "evaluator_id",
+            "evaluator_version",
+            "task_id",
+            "task_version",
+        ):
+            require_text(getattr(self, field), field)
+        if not self.metrics:
+            raise ValueError("evaluation pack must expose at least one metric")
+        if len(set(self.metrics)) != len(self.metrics):
+            raise ValueError("evaluation pack metrics must be unique")
+        for metric in self.metrics:
+            require_text(metric, "metric")
+
+    def to_dict(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["metrics"] = list(self.metrics)
+        return payload
+
+
+REFERENCE_LM_PACK = EvaluationPackDescriptor(
+    pack_id="frontierwright.eval.reference-heldout-lm",
+    pack_version="1",
+    title="Reference held-out causal language-model evaluation",
+    evaluator_id="frontierwright.reference-lm-evaluator",
+    evaluator_version="1",
+    task_id="frontierwright.reference.heldout-causal-lm",
+    task_version="1",
+    metrics=("cross_entropy_nats_per_token", "perplexity"),
+)
+
+BUILTIN_EVALUATION_PACKS: tuple[EvaluationPackDescriptor, ...] = (
+    REFERENCE_LM_PACK,
+)
+
+
+def evaluation_pack(pack_id: str) -> EvaluationPackDescriptor:
+    for descriptor in BUILTIN_EVALUATION_PACKS:
+        if descriptor.pack_id == pack_id:
+            return descriptor
+    raise FrontierwrightError(
+        "EVALUATION_PACK_NOT_FOUND",
+        f"Unknown evaluation pack: {pack_id}",
+        3,
+    )
+
+
+@dataclass(frozen=True)
 class ScaleTask:
     task_id: str
     task_version: str

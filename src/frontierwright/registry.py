@@ -2595,7 +2595,18 @@ class Registry:
             result["config"] = json.loads(result.pop("config_json"))
             return result
 
-    def store_evaluation_receipt(self, receipt: EvaluationReceipt) -> None:
+    def store_evaluation_receipt(
+        self,
+        receipt: EvaluationReceipt,
+        *,
+        provenance: str = "IMPORTED",
+    ) -> None:
+        if provenance not in {"IMPORTED", "GENERATED"}:
+            raise FrontierwrightError(
+                "EVALUATION_PROVENANCE_INVALID",
+                "Evaluation receipt provenance must be IMPORTED or GENERATED.",
+                2,
+            )
         with self.connect(write=True) as connection:
             model_row = connection.execute(
                 "SELECT snapshot FROM models WHERE model_id = ?",
@@ -2648,14 +2659,32 @@ class Registry:
             )
             self.event(
                 connection,
-                "EVALUATION_RECEIPT_IMPORTED",
+                (
+                    "EVALUATION_RECEIPT_GENERATED"
+                    if provenance == "GENERATED"
+                    else "EVALUATION_RECEIPT_IMPORTED"
+                ),
                 {
                     "receipt_id": receipt.receipt_id,
                     "model_id": receipt.model_id,
                     "receipt_sha256": receipt.sha256,
                     "measurement_count": len(receipt.measurements),
+                    "provenance": provenance,
                 },
             )
+
+    def get_evaluation_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM evaluation_receipts WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["conditions"] = json.loads(result.pop("conditions_json"))
+            result["measurements"] = json.loads(result.pop("measurements_json"))
+            return result
 
     def store_capability_scale(self, scale: CapabilityScale) -> None:
         with self.connect(write=True) as connection:

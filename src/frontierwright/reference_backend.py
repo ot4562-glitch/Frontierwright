@@ -61,6 +61,24 @@ PRESETS: dict[str, ModelPreset] = {
 
 
 @dataclass(frozen=True)
+class ReferenceEvaluationConfig:
+    preset: ModelPreset
+    batch_size: int
+    max_batches: int
+    device: str
+    max_dataset_bytes: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "preset": asdict(self.preset),
+            "batch_size": self.batch_size,
+            "max_batches": self.max_batches,
+            "device": self.device,
+            "max_dataset_bytes": self.max_dataset_bytes,
+        }
+
+
+@dataclass(frozen=True)
 class ReferenceConfig:
     preset: ModelPreset
     steps: int
@@ -241,6 +259,41 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
         ),
         lora_rank=_positive_int(raw.get("lora_rank"), 8, "lora_rank"),
         lora_alpha=_positive_float(raw.get("lora_alpha"), 16.0, "lora_alpha"),
+    )
+
+
+def _load_evaluation_config(
+    request: dict[str, Any],
+) -> ReferenceEvaluationConfig:
+    raw = request.get("config", {})
+    if not isinstance(raw, dict):
+        raise ValueError("config must be an object")
+
+    unknown = sorted(
+        set(raw) - {"preset", "batch_size", "max_batches", "device", "max_dataset_bytes"}
+    )
+    if unknown:
+        raise ValueError(
+            "evaluation config does not support keys: " + ", ".join(unknown)
+        )
+
+    preset_name = _preset_name_for_request(request, raw)
+    preset = PRESETS[preset_name]
+
+    device = raw.get("device", "auto")
+    if not isinstance(device, str) or device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device must be auto, cpu, or cuda")
+
+    return ReferenceEvaluationConfig(
+        preset=preset,
+        batch_size=_positive_int(raw.get("batch_size"), 4, "batch_size"),
+        max_batches=_positive_int(raw.get("max_batches"), 16, "max_batches"),
+        device=device,
+        max_dataset_bytes=_positive_int(
+            raw.get("max_dataset_bytes"),
+            64 * 1024 * 1024,
+            "max_dataset_bytes",
+        ),
     )
 
 
@@ -583,6 +636,44 @@ def _process_rss_bytes() -> int | None:
         return None
 
 
+def _load_reference_model(
+    torch: Any,
+    preset: ModelPreset,
+    *,
+    model_source_path: str,
+    device: str,
+) -> Any:
+    source = _native_path(model_source_path).expanduser().resolve()
+    if not source.is_dir():
+        raise ValueError("model_source_path must be a model directory")
+    weights_path = source / "pytorch_model.bin"
+    config_path = source / "config.json"
+    if not weights_path.is_file() or not config_path.is_file():
+        raise ValueError(
+            "reference model must contain config.json and pytorch_model.bin"
+        )
+
+    root_config = json.loads(config_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(root_config, dict)
+        or root_config.get("frontierwright_reference_backend") != REFERENCE_BACKEND_ID
+        or root_config.get("preset") != preset.name
+    ):
+        raise ValueError(
+            "model_source_path is not a compatible Frontierwright reference model "
+            f"for preset {preset.name}"
+        )
+
+    model = _build_model(torch, preset)
+    state_dict = torch.load(
+        weights_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    model.load_state_dict(state_dict)
+    return model.to(device)
+
+
 def _training_objects(
     torch: Any,
     config: ReferenceConfig,
@@ -596,34 +687,15 @@ def _training_objects(
     if device == "cuda":
         torch.cuda.manual_seed_all(config.seed)
 
-    model = _build_model(torch, config.preset)
-    if model_source_path is not None:
-        source = _native_path(model_source_path).expanduser().resolve()
-        if not source.is_dir():
-            raise ValueError("model_source_path must be a model directory")
-        weights_path = source / "pytorch_model.bin"
-        config_path = source / "config.json"
-        if not weights_path.is_file() or not config_path.is_file():
-            raise ValueError(
-                "born root model must contain config.json and pytorch_model.bin"
-            )
-        root_config = json.loads(config_path.read_text(encoding="utf-8"))
-        if (
-            not isinstance(root_config, dict)
-            or root_config.get("frontierwright_reference_backend")
-            != REFERENCE_BACKEND_ID
-            or root_config.get("preset") != config.preset.name
-        ):
-            raise ValueError(
-                "model_source_path is not a compatible Frontierwright birth root "
-                f"for preset {config.preset.name}"
-            )
-        state_dict = torch.load(
-            weights_path,
-            map_location="cpu",
-            weights_only=True,
+    if model_source_path is None:
+        model = _build_model(torch, config.preset).to(device)
+    else:
+        model = _load_reference_model(
+            torch,
+            config.preset,
+            model_source_path=model_source_path,
+            device=device,
         )
-        model.load_state_dict(state_dict)
 
     base_parameter_count = _parameter_count(model)
     training_details: dict[str, object] = {
@@ -683,6 +755,131 @@ def _train_step(
     optimizer.step()
     return float(loss.detach().cpu().item()), int(y.numel())
 
+
+
+def _evaluation_batches(
+    torch: Any,
+    corpus_bytes: bytes,
+    *,
+    config: ReferenceEvaluationConfig,
+    device: str,
+) -> list[tuple[Any, Any]]:
+    corpus = torch.tensor(list(corpus_bytes), dtype=torch.long)
+    required = config.preset.context_length + 1
+    if int(corpus.numel()) < required:
+        raise ValueError(
+            "evaluation corpus is too small for one full context window; "
+            f"need at least {required} bytes"
+        )
+
+    starts = list(
+        range(
+            0,
+            int(corpus.numel()) - required + 1,
+            config.preset.context_length,
+        )
+    )
+    maximum_windows = config.max_batches * config.batch_size
+    starts = starts[:maximum_windows]
+    if not starts:
+        raise ValueError("evaluation corpus produced no full context windows")
+
+    batches: list[tuple[Any, Any]] = []
+    for offset in range(0, len(starts), config.batch_size):
+        batch_starts = starts[offset : offset + config.batch_size]
+        xs: list[Any] = []
+        ys: list[Any] = []
+        for start in batch_starts:
+            chunk = corpus[start : start + required]
+            xs.append(chunk[:-1])
+            ys.append(chunk[1:])
+        batches.append(
+            (
+                torch.stack(xs).to(device=device, non_blocking=True),
+                torch.stack(ys).to(device=device, non_blocking=True),
+            )
+        )
+    return batches
+
+
+def _evaluate(
+    request: dict[str, Any],
+    config: ReferenceEvaluationConfig,
+) -> dict[str, object]:
+    torch = _import_torch()
+    model_source_path = request.get("model_source_path")
+    dataset_source = request.get("dataset_source_path")
+    if not isinstance(model_source_path, str) or not model_source_path:
+        raise ValueError("model_source_path is required")
+    if not isinstance(dataset_source, str) or not dataset_source:
+        raise ValueError("dataset_source_path is required")
+
+    device = _select_device(torch, config.device)
+    model = _load_reference_model(
+        torch,
+        config.preset,
+        model_source_path=model_source_path,
+        device=device,
+    )
+    model.eval()
+
+    corpus_bytes = _read_corpus(
+        _native_path(dataset_source),
+        max_bytes=config.max_dataset_bytes,
+    )
+    batches = _evaluation_batches(
+        torch,
+        corpus_bytes,
+        config=config,
+        device=device,
+    )
+
+    total_negative_log_likelihood = 0.0
+    tokens_evaluated = 0
+    windows_evaluated = 0
+    start = time.perf_counter()
+    with torch.no_grad():
+        for x, y in batches:
+            logits = model(x)
+            loss_sum = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, VOCAB_SIZE),
+                y.reshape(-1),
+                reduction="sum",
+            )
+            total_negative_log_likelihood += float(loss_sum.detach().cpu().item())
+            tokens_evaluated += int(y.numel())
+            windows_evaluated += int(y.shape[0])
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = max(time.perf_counter() - start, 1e-9)
+
+    if tokens_evaluated <= 0:
+        raise ValueError("evaluation produced no scored tokens")
+    cross_entropy = total_negative_log_likelihood / tokens_evaluated
+    perplexity = math.exp(cross_entropy)
+    if not math.isfinite(cross_entropy) or not math.isfinite(perplexity):
+        raise ValueError("evaluation produced non-finite metrics")
+
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "operation": "evaluate",
+        "metrics": {
+            "backend_id": REFERENCE_BACKEND_ID,
+            "preset": config.preset.name,
+            "device": device,
+            "cross_entropy_nats_per_token": cross_entropy,
+            "perplexity": perplexity,
+            "tokens_evaluated": tokens_evaluated,
+            "windows_evaluated": windows_evaluated,
+            "batches_evaluated": len(batches),
+            "elapsed_seconds": elapsed,
+            "tokens_per_second": tokens_evaluated / elapsed,
+            "parameter_count": _parameter_count(model),
+            "python_version": sys.version.split()[0],
+            "torch_version": str(torch.__version__),
+        },
+    }
 
 
 def _birth(request: dict[str, Any]) -> dict[str, object]:
@@ -1051,6 +1248,14 @@ def main(argv: list[str] | None = None) -> int:
         operation = request.get("operation")
         if operation == "birth":
             _emit(_birth(request))
+            return 0
+        if operation == "evaluate":
+            model_source_path = request.get("model_source_path")
+            if not isinstance(model_source_path, str) or not model_source_path:
+                raise ValueError(
+                    "reference evaluation requires a materialized model_source_path"
+                )
+            _emit(_evaluate(request, _load_evaluation_config(request)))
             return 0
         path_id = request.get("path_id")
         if path_id not in SUPPORTED_PATHS:

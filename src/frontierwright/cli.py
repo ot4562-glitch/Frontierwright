@@ -15,6 +15,7 @@ from frontierwright.data import DatasetClassification, DatasetRole
 from frontierwright.domain import ModelOrigin
 from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
+from frontierwright.evaluations import REFERENCE_LM_PACK
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import (
@@ -30,6 +31,7 @@ from frontierwright.service import (
     CandidateView,
     CompareView,
     DataView,
+    EvaluationRunView,
     HistoryView,
     InterventionsView,
     LabAdaptersView,
@@ -53,6 +55,7 @@ from frontierwright.service import (
     get_candidates_view,
     get_data_preparation_plugins,
     get_data_view,
+    get_evaluation_packs,
     get_history_view,
     get_interventions_view,
     get_lab_adapters,
@@ -70,6 +73,7 @@ from frontierwright.service import (
     reconcile_training_run,
     reject_candidate,
     repair_run_receipt,
+    run_evaluation_pack,
     set_build_intent,
     set_build_targets,
     set_project_edition,
@@ -84,6 +88,7 @@ project_app = typer.Typer(help="Create and inspect Frontierwright project state.
 resources_app = typer.Typer(help="Detect and inspect project compute resources.")
 build_app = typer.Typer(help="Inspect and edit the desired model build.")
 stats_app = typer.Typer(help="Inspect or ingest capability evaluation evidence.")
+evaluation_app = typer.Typer(help="Run and inspect raw evaluation packs.")
 data_app = typer.Typer(help="Register and inspect user/lab datasets.")
 plan_app = typer.Typer(help="Create and inspect pinned training plans.")
 backend_app = typer.Typer(help="Inspect and configure training backends.")
@@ -95,6 +100,7 @@ app.add_typer(project_app, name="project")
 app.add_typer(resources_app, name="resources")
 app.add_typer(build_app, name="build")
 app.add_typer(stats_app, name="stats")
+app.add_typer(evaluation_app, name="eval")
 app.add_typer(data_app, name="data")
 app.add_typer(plan_app, name="plan")
 app.add_typer(backend_app, name="backend")
@@ -147,6 +153,10 @@ def _build_payload(view: BuildView) -> dict[str, object]:
 
 
 def _stats_payload(view: StatsView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _evaluation_payload(view: EvaluationRunView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -308,6 +318,22 @@ def _print_stats(view: StatsView) -> None:
                 f"{item.get('task_id')}@{item.get('task_version')} "
                 f"{item.get('metric')}={item.get('value')}"
             )
+
+
+def _print_evaluation(view: EvaluationRunView) -> None:
+    console.print("[bold]EVALUATION[/bold]")
+    console.print(f"Pack: {view.pack_id}@{view.pack_version}")
+    console.print(f"Model: {view.model_id}")
+    console.print(f"Dataset: {view.dataset_id}")
+    console.print(f"Receipt: {view.receipt_id}")
+    console.print(f"Receipt hash: {view.receipt_sha256}")
+    console.print(f"Replay: {'YES' if view.replayed else 'NO'}")
+    console.print("")
+    for item in view.measurements:
+        console.print(
+            f"{item.get('task_id')}@{item.get('task_version')} "
+            f"{item.get('metric')}={item.get('value')}"
+        )
 
 
 def _print_data(view: DataView) -> None:
@@ -1095,6 +1121,110 @@ def stats_ingest(
         _emit_json(_stats_payload(view))
         return
     _print_stats(view)
+
+
+@evaluation_app.command("packs")
+def evaluation_packs(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    packs = get_evaluation_packs()
+    if json_output:
+        _emit_json(
+            {
+                "schema_version": 1,
+                "ok": True,
+                "packs": packs,
+            }
+        )
+        return
+
+    console.print("[bold]EVALUATION PACKS[/bold]")
+    for item in packs:
+        console.print(
+            f"{item.get('pack_id')}@{item.get('pack_version')} · "
+            f"{item.get('title')}"
+        )
+        metrics = item.get("metrics")
+        if isinstance(metrics, list):
+            console.print("  Metrics: " + ", ".join(str(value) for value in metrics))
+
+
+@evaluation_app.command("run")
+def evaluation_run(
+    dataset: Annotated[
+        str,
+        typer.Option("--dataset", help="Registered dataset ID used as evaluation input."),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    pack: Annotated[
+        str,
+        typer.Option("--pack", help="Evaluation pack ID."),
+    ] = REFERENCE_LM_PACK.pack_id,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Model ID. Defaults to current champion."),
+    ] = None,
+    python_executable: Annotated[
+        str,
+        typer.Option(
+            "--python",
+            help="Python executable for the isolated evaluator environment.",
+        ),
+    ] = sys.executable,
+    device: Annotated[
+        str,
+        typer.Option("--device", help="auto, cpu, or cuda."),
+    ] = "auto",
+    batch_size: Annotated[
+        int,
+        typer.Option("--batch-size", min=1, help="Evaluation windows per batch."),
+    ] = 4,
+    max_batches: Annotated[
+        int,
+        typer.Option("--max-batches", min=1, help="Maximum deterministic batches."),
+    ] = 16,
+    max_dataset_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-dataset-bytes",
+            min=1,
+            help="Maximum dataset bytes read by the evaluator.",
+        ),
+    ] = 64 * 1024 * 1024,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option("--timeout", min=0.001, help="Maximum evaluator wall time."),
+    ] = 300.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = run_evaluation_pack(
+            path,
+            pack_id=pack,
+            dataset_id=dataset,
+            model_id=model,
+            python_executable=python_executable,
+            device=device,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            max_dataset_bytes=max_dataset_bytes,
+            timeout_seconds=timeout_seconds,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_evaluation_payload(view))
+        return
+    _print_evaluation(view)
 
 
 @data_app.command("show")

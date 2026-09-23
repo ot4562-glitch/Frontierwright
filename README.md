@@ -136,18 +136,22 @@ Implemented now:
 - built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` birth, from-scratch pretraining, continued pretraining, full-parameter causal SFT, merged-output LoRA SFT, and calibration for Frontierwright reference-model lineages; prepared managed corpora can be consumed directly;
 - successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
 - sealed artifact manifests bind the run, plan, intervention ID/version/family, dataset, dataset-preparation recipe, backend, effective config, model fingerprint, and exact file hashes;
+- built-in evaluation-pack registry exposed through `frontierwright eval packs`; the first pack runs deterministic held-out causal-LM evaluation for Frontierwright reference models;
+- `frontierwright eval run` produces raw cross-entropy/perplexity receipts pinned to exact model and dataset fingerprints, preparation-recipe evidence, evaluation config, and Python/PyTorch runtime versions;
+- identical model/data/config evaluation requests replay the existing durable receipt without rerunning the evaluator, while dataset/model drift is rejected before execution;
+- generated raw evaluation evidence remains separate from capability stats: Frontierwright does not invent a player-facing stat until an explicit frozen capability scale maps the evidence;
 - evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
 - training creates a `PENDING` candidate and never silently changes the champion;
 - candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
 - promotion re-checks current champion/build/evaluation state transactionally, enforces frozen-scale build floors by default, and records explicit override evidence when a user intentionally accepts an unmeasured or build-violating candidate;
-- stable JSON/non-interactive machine surfaces for project/model/birth/resource/build/stats/data/path/plan/run/candidate/Lab-adapter operations;
+- stable JSON/non-interactive machine surfaces for project/model/birth/resource/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter operations;
 - mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;
 - English/Korean human-string structure;
 - automated domain, migration, evaluation, execution recovery/idempotency, artifact integrity, candidate, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.
 
 Not implemented yet:
 
-- an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and benchmark runner;
+- an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and its official capability runner; the generic raw evaluation-pack runner exists, but no official Capability v1 scale is claimed yet;
 - reference QLoRA training and broad arbitrary-Hugging-Face production adapters; the built-in reference backend currently covers from-scratch pretraining, continued pretraining, full-parameter causal SFT, and LoRA SFT for Frontierwright reference-model lineages;
 - live output-storage quota enforcement during backend execution, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
 - public dataset discovery/download adapters, trainable tokenizer artifacts beyond the built-in byte vocabulary, and richer tokenization/sharding formats beyond the implemented uint8 byte-ID shards;

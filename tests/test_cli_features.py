@@ -49,6 +49,25 @@ def test_data_and_paths_machine_surface(tmp_path: Path) -> None:
         "frontierwright.specialize.lora-sft",
     }
 
+    eval_packs = runner.invoke(
+        app,
+        ["eval", "packs", "--json", "--non-interactive"],
+    )
+    assert eval_packs.exit_code == 0, eval_packs.output
+    eval_payload = json.loads(eval_packs.stdout)
+    assert eval_payload["packs"] == [
+        {
+            "pack_id": "frontierwright.eval.reference-heldout-lm",
+            "pack_version": "1",
+            "title": "Reference held-out causal language-model evaluation",
+            "evaluator_id": "frontierwright.reference-lm-evaluator",
+            "evaluator_version": "1",
+            "task_id": "frontierwright.reference.heldout-causal-lm",
+            "task_version": "1",
+            "metrics": ["cross_entropy_nats_per_token", "perplexity"],
+        }
+    ]
+
     recipes = runner.invoke(
         app,
         ["data", "recipes", "--json", "--non-interactive"],
