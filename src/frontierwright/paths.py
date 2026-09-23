@@ -155,6 +155,11 @@ class _SFTPath:
         next_checks: list[str] = []
         if not context.champion_present:
             blockers.append("current model required")
+        elif context.champion_is_birth_root:
+            blockers.append(
+                "born root has not completed initial pretraining; "
+                "fine-tuning requires a trained descendant"
+            )
         elif context.champion_trainable is not True:
             blockers.append("trainable model representation required")
         if DatasetRole.SFT not in context.dataset_roles:

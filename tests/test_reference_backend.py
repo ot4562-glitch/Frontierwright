@@ -3,18 +3,28 @@ from pathlib import Path
 
 from frontierwright.reference_backend import (
     _load_config,
+    _objective_for_path,
     _read_corpus,
     backend_spec_payload,
 )
 
 
-def test_reference_backend_declares_initial_and_continued_pretraining() -> None:
+def test_reference_backend_declares_pretraining_and_full_sft() -> None:
     payload = backend_spec_payload("python")
 
     assert payload["supported_paths"] == [
         "FROM_SCRATCH_PRETRAINING",
         "CONTINUED_PRETRAINING",
+        "FULL_SFT",
     ]
+
+
+def test_reference_backend_objective_labels_are_path_specific() -> None:
+    assert _objective_for_path("FROM_SCRATCH_PRETRAINING") == "causal_lm_pretraining"
+    assert _objective_for_path("CONTINUED_PRETRAINING") == (
+        "causal_lm_continued_pretraining"
+    )
+    assert _objective_for_path("FULL_SFT") == "full_parameter_causal_sft"
 
 
 def test_reference_config_infers_preset_from_materialized_model(

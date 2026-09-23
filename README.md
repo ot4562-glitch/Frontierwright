@@ -133,7 +133,7 @@ Implemented now:
 - budget enforcement modes are explicit in plan views: run-count registry admission, wall-time timeout, accounted GPU-hour timeout, storage admission/finalization gate, and currently unavailable runtime money enforcement;
 - measured output-size budget violations block candidate finalization even when the training backend itself reports success;
 - `max_money` keeps a plan non-ready until an executor with real runtime cost enforcement exists; a projected price alone is not treated as a hard budget;
-- built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` birth, from-scratch pretraining, continued pretraining, and calibration; prepared managed corpora can be consumed directly;
+- built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` birth, from-scratch pretraining, continued pretraining, full-parameter causal SFT, and calibration for Frontierwright reference-model lineages; prepared managed corpora can be consumed directly;
 - successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
 - sealed artifact manifests bind the run, plan, intervention ID/version/family, dataset, dataset-preparation recipe, backend, effective config, model fingerprint, and exact file hashes;
 - evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
@@ -148,7 +148,7 @@ Implemented now:
 Not implemented yet:
 
 - an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and benchmark runner;
-- production built-in training backends for all five paths beyond the narrow from-scratch reference backend and structured external command adapter;
+- reference LoRA/QLoRA training and broad arbitrary-Hugging-Face production adapters; the built-in reference backend currently covers from-scratch pretraining, continued pretraining, and full-parameter causal SFT for Frontierwright reference-model lineages;
 - live output-storage quota enforcement during backend execution, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
 - public dataset discovery/download adapters, trainable tokenizer artifacts beyond the built-in byte vocabulary, and richer tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
 - remote/server/Slurm executor implementations and concrete private Lab adapters;

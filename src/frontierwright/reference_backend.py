@@ -1,7 +1,8 @@
 """Frontierwright built-in PyTorch reference backend.
 
-This backend intentionally starts narrow: real from-scratch causal language-model
-pretraining for the bundled zero-model path. It is not a compatibility layer for
+This backend intentionally stays narrow: real causal language-model training for
+Frontierwright reference-model lineages, including initial/continued pretraining and
+full-parameter causal SFT over serialized text. It is not a compatibility layer for
 arbitrary Hugging Face architectures.
 
 The module is executed by a dedicated training Python environment:
@@ -23,6 +24,7 @@ REFERENCE_BACKEND_ID = "frontierwright-reference-pytorch-v1"
 SUPPORTED_PATHS = (
     "FROM_SCRATCH_PRETRAINING",
     "CONTINUED_PRETRAINING",
+    "FULL_SFT",
 )
 VOCAB_SIZE = 256
 
@@ -294,6 +296,17 @@ def _read_corpus(source: Path, *, max_bytes: int) -> bytes:
     if not corpus:
         raise ValueError("dataset corpus is empty")
     return corpus
+
+
+
+def _objective_for_path(path_id: object) -> str:
+    if path_id == "FROM_SCRATCH_PRETRAINING":
+        return "causal_lm_pretraining"
+    if path_id == "CONTINUED_PRETRAINING":
+        return "causal_lm_continued_pretraining"
+    if path_id == "FULL_SFT":
+        return "full_parameter_causal_sft"
+    raise ValueError(f"unsupported reference training path: {path_id!r}")
 
 
 def _build_model(torch: Any, preset: ModelPreset) -> Any:
@@ -597,6 +610,7 @@ def _birth(request: dict[str, Any]) -> dict[str, object]:
 
 def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, object]:
     torch = _import_torch()
+    objective = _objective_for_path(request.get("path_id"))
     dataset_source = request.get("dataset_source_path")
     if not isinstance(dataset_source, str) or not dataset_source:
         raise ValueError("dataset_source_path is required")
@@ -671,6 +685,7 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
         "device": device,
         "parameter_count": parameter_count,
         "preset": config.preset.name,
+        "objective": objective,
     }
 
 
@@ -679,6 +694,7 @@ def _train(
     config: ReferenceConfig,
 ) -> dict[str, object]:
     torch = _import_torch()
+    objective = _objective_for_path(request.get("path_id"))
     dataset_source = request.get("dataset_source_path")
     output_root = request.get("output_root")
     if not isinstance(dataset_source, str) or not dataset_source:
@@ -766,6 +782,7 @@ def _train(
                 "dataset_fingerprint": request.get("dataset_fingerprint"),
                 "config": config.to_dict(),
                 "device": device,
+                "objective": objective,
                 "steps": config.steps,
                 "tokens_trained": token_count,
                 "initial_loss": losses[0],
@@ -787,6 +804,7 @@ def _train(
             "backend_id": REFERENCE_BACKEND_ID,
             "preset": config.preset.name,
             "device": device,
+            "objective": objective,
             "parameter_count": parameter_count,
             "steps": config.steps,
             "tokens_trained": token_count,

@@ -136,6 +136,30 @@ def test_zero_birth_plus_pretrain_data_unlocks_from_scratch_path(tmp_path: Path)
     assert path["intervention_id"] == "frontierwright.learn.pretrain"
 
 
+def test_zero_birth_root_cannot_skip_initial_pretraining_into_sft(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    registry = Registry(project)
+    registry.initialize("ZERO", ModelOrigin.ZERO)
+    materialize_zero_birth(registry, tmp_path / "birth-root")
+    add_local_dataset(
+        project,
+        make_dataset(tmp_path / "sft"),
+        name="SFT",
+        role=DatasetRole.SFT,
+    )
+
+    view = get_paths_view(project)
+    for path_id in ("FULL_SFT", "LORA_SFT", "QLORA_SFT"):
+        item = by_id(view, path_id)
+        assert item["availability"] == "LOCKED"
+        assert (
+            "born root has not completed initial pretraining; "
+            "fine-tuning requires a trained descendant"
+        ) in item["blockers"]
+
+
 def test_sft_data_unlocks_trainable_imported_sft_paths_only_to_plannable(
     tmp_path: Path,
 ) -> None:
