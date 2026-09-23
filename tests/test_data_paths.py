@@ -1,7 +1,8 @@
 from pathlib import Path
 
 from frontierwright.data import DatasetRole, inspect_local_dataset
-from frontierwright.domain import HistoryConfidence, ModelOrigin
+from frontierwright.domain import HistoryConfidence, ModelOrigin, ModelState
+from frontierwright.models import inspect_local_model
 from frontierwright.registry import Registry
 from frontierwright.service import (
     add_local_dataset,
@@ -22,6 +23,32 @@ def make_dataset(root: Path, content: str = "sample\n") -> Path:
     root.mkdir(parents=True)
     (root / "data.jsonl").write_text(content, encoding="utf-8")
     return root
+
+
+def materialize_zero_birth(registry: Registry, root: Path) -> ModelState:
+    source = fake_hf_model(root)
+    descriptor = inspect_local_model(source)
+    state = registry.read()
+    model = ModelState(
+        model_id="zero-root",
+        identity_id=state.project["identity_id"],
+        origin=ModelOrigin.ZERO,
+        checkpoint=str(descriptor.source_path),
+        fingerprint=descriptor.fingerprint,
+        parent_model_id=None,
+        stats=(),
+        model_format=descriptor.model_format,
+        trainable=descriptor.trainable,
+    )
+    registry.register_birth_model(
+        model,
+        descriptor,
+        preset="zero-8m",
+        seed=42,
+        backend_id="fixture-birth",
+        runtime={"trained_steps": 0, "parameter_count": 8_000_000},
+    )
+    return model
 
 
 def by_id(view, path_id: str) -> dict[str, object]:
@@ -66,13 +93,14 @@ def test_same_local_dataset_role_is_idempotent(tmp_path: Path) -> None:
     assert view.datasets[0]["provenance"] == "LOCAL_USER"
 
 
-def test_zero_model_pretraining_unlocks_to_plannable_with_user_data(tmp_path: Path) -> None:
+def test_zero_model_pretraining_requires_birth_even_with_user_data(tmp_path: Path) -> None:
     project = tmp_path / "project"
     Registry(project).initialize("ZERO", ModelOrigin.ZERO)
 
     before = get_paths_view(project)
     path = by_id(before, "FROM_SCRATCH_PRETRAINING")
     assert path["availability"] == "LOCKED"
+    assert "zero-model birth required before from-scratch pretraining" in path["blockers"]
     assert "pretraining dataset required" in path["blockers"]
 
     add_local_dataset(
@@ -84,10 +112,28 @@ def test_zero_model_pretraining_unlocks_to_plannable_with_user_data(tmp_path: Pa
 
     after = get_paths_view(project)
     path = by_id(after, "FROM_SCRATCH_PRETRAINING")
+    assert path["availability"] == "LOCKED"
+    assert path["blockers"] == ["zero-model birth required before from-scratch pretraining"]
+
+
+def test_zero_birth_plus_pretrain_data_unlocks_from_scratch_path(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    registry = Registry(project)
+    registry.initialize("ZERO", ModelOrigin.ZERO)
+    add_local_dataset(
+        project,
+        make_dataset(tmp_path / "pretrain"),
+        name="My pretrain data",
+        role=DatasetRole.PRETRAIN,
+    )
+
+    materialize_zero_birth(registry, tmp_path / "birth-root")
+
+    path = by_id(get_paths_view(project), "FROM_SCRATCH_PRETRAINING")
     assert path["availability"] == "PLANNABLE"
     assert path["blockers"] == []
-    assert "training backend implementation" in path["next_checks"]
-    assert "representative calibration" in path["next_checks"]
+    assert path["intervention_family"] == "LEARN"
+    assert path["intervention_id"] == "frontierwright.learn.pretrain"
 
 
 def test_sft_data_unlocks_trainable_imported_sft_paths_only_to_plannable(

@@ -378,13 +378,43 @@ def _training_objects(
     torch: Any,
     config: ReferenceConfig,
     corpus_bytes: bytes,
+    *,
+    model_source_path: str | None = None,
 ) -> tuple[Any, Any, Any, Any, str]:
     torch.manual_seed(config.seed)
     device = _select_device(torch, config.device)
     if device == "cuda":
         torch.cuda.manual_seed_all(config.seed)
 
-    model = _build_model(torch, config.preset).to(device)
+    model = _build_model(torch, config.preset)
+    if model_source_path is not None:
+        source = _native_path(model_source_path).expanduser().resolve()
+        if not source.is_dir():
+            raise ValueError("model_source_path must be a model directory")
+        weights_path = source / "pytorch_model.bin"
+        config_path = source / "config.json"
+        if not weights_path.is_file() or not config_path.is_file():
+            raise ValueError(
+                "born root model must contain config.json and pytorch_model.bin"
+            )
+        root_config = json.loads(config_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(root_config, dict)
+            or root_config.get("frontierwright_reference_backend")
+            != REFERENCE_BACKEND_ID
+            or root_config.get("preset") != config.preset.name
+        ):
+            raise ValueError(
+                "model_source_path is not a compatible Frontierwright birth root "
+                f"for preset {config.preset.name}"
+            )
+        state_dict = torch.load(
+            weights_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        model.load_state_dict(state_dict)
+    model = model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -426,6 +456,99 @@ def _train_step(
     return float(loss.detach().cpu().item()), int(y.numel())
 
 
+
+def _birth(request: dict[str, Any]) -> dict[str, object]:
+    """Materialize exact initial bytes for a Frontierwright zero-model root."""
+
+    torch = _import_torch()
+    preset_name = request.get("preset", "zero-8m")
+    seed = request.get("seed", 42)
+    output_root = request.get("output_root")
+
+    if not isinstance(preset_name, str) or preset_name not in PRESETS:
+        raise ValueError(f"unknown zero-model preset: {preset_name}")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("birth seed must be a nonnegative integer")
+    if not isinstance(output_root, str) or not output_root:
+        raise ValueError("output_root is required")
+
+    preset = PRESETS[preset_name]
+    torch.manual_seed(seed)
+    model = _build_model(torch, preset).to("cpu")
+    parameter_count = _parameter_count(model)
+
+    output = _native_path(output_root).expanduser().resolve() / "model"
+    output.mkdir(parents=True, exist_ok=False)
+
+    config_payload = {
+        "architectures": ["FrontierwrightByteCausalLM"],
+        "model_type": "frontierwright_byte_causal_lm",
+        "frontierwright_reference_backend": REFERENCE_BACKEND_ID,
+        "preset": preset.name,
+        "vocab_size": VOCAB_SIZE,
+        "d_model": preset.d_model,
+        "n_layers": preset.n_layers,
+        "n_heads": preset.n_heads,
+        "d_ff": preset.d_ff,
+        "context_length": preset.context_length,
+        "parameter_count": parameter_count,
+    }
+    (output / "config.json").write_text(
+        json.dumps(config_payload, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (output / "tokenizer.json").write_text(
+        json.dumps(
+            {
+                "type": "frontierwright-byte-level",
+                "version": 1,
+                "vocab_size": VOCAB_SIZE,
+                "mapping": "token id equals byte value 0..255",
+            },
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    torch.save(model.state_dict(), output / "pytorch_model.bin")
+    (output / "birth_metadata.json").write_text(
+        json.dumps(
+            {
+                "backend_id": REFERENCE_BACKEND_ID,
+                "preset": preset.name,
+                "seed": seed,
+                "parameter_count": parameter_count,
+                "torch_version": str(torch.__version__),
+                "python_version": sys.version.split()[0],
+                "device": "cpu",
+                "trained_steps": 0,
+            },
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "operation": "birth",
+        "output_model_path": _reported_child_path(output_root, "model"),
+        "metrics": {
+            "backend_id": REFERENCE_BACKEND_ID,
+            "preset": preset.name,
+            "seed": seed,
+            "parameter_count": parameter_count,
+            "torch_version": str(torch.__version__),
+            "python_version": sys.version.split()[0],
+            "device": "cpu",
+            "trained_steps": 0,
+        },
+    }
+
+
 def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, object]:
     torch = _import_torch()
     dataset_source = request.get("dataset_source_path")
@@ -435,10 +558,14 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
         _native_path(dataset_source),
         max_bytes=config.max_dataset_bytes,
     )
+    model_source_path = request.get("model_source_path")
+    if model_source_path is not None and not isinstance(model_source_path, str):
+        raise ValueError("model_source_path must be a string when supplied")
     model, optimizer, corpus, generator, device = _training_objects(
         torch,
         config,
         corpus_bytes,
+        model_source_path=model_source_path,
     )
 
     # Warm-up once so initialization/runtime setup is not charged to steady-state timing.
@@ -517,10 +644,14 @@ def _train(
         _native_path(dataset_source),
         max_bytes=config.max_dataset_bytes,
     )
+    model_source_path = request.get("model_source_path")
+    if model_source_path is not None and not isinstance(model_source_path, str):
+        raise ValueError("model_source_path must be a string when supplied")
     model, optimizer, corpus, generator, device = _training_objects(
         torch,
         config,
         corpus_bytes,
+        model_source_path=model_source_path,
     )
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -664,20 +795,23 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("request schema_version must be 1")
         if request.get("backend_id") != REFERENCE_BACKEND_ID:
             raise ValueError("request backend_id does not match reference backend")
+        operation = request.get("operation")
+        if operation == "birth":
+            _emit(_birth(request))
+            return 0
         if request.get("path_id") != SUPPORTED_PATH:
             raise ValueError(
                 "reference backend currently supports only "
                 "FROM_SCRATCH_PRETRAINING"
             )
         config = _load_config(request)
-        operation = request.get("operation")
         if operation == "calibrate":
             _emit(_calibrate(request, config))
             return 0
         if operation == "train":
             _emit(_train(request, config))
             return 0
-        raise ValueError("operation must be calibrate or train")
+        raise ValueError("operation must be birth, calibrate, or train")
     except Exception as exc:
         return _fail(type(exc).__name__.upper(), str(exc))
 

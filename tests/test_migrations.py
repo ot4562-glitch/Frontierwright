@@ -56,7 +56,7 @@ def test_previous_registry_versions_migrate_to_current(
             )
         }
 
-    assert version == SCHEMA_VERSION == 10
+    assert version == SCHEMA_VERSION == 11
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -69,6 +69,7 @@ def test_previous_registry_versions_migrate_to_current(
     assert "runs" in tables
     assert "run_attempts" in tables
     assert "sealed_artifacts" in tables
+    assert "model_births" in tables
     assert state.project["edition_profile"] == "ACADEMY"
 
 
@@ -119,7 +120,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 10
+    assert version == SCHEMA_VERSION == 11
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -279,4 +280,4 @@ def test_v9_project_migrates_to_origin_appropriate_edition_profile(
     assert state.project["edition_profile"] == "ACADEMY"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 10
+    assert version == SCHEMA_VERSION == 11

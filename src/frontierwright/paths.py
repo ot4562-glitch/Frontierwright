@@ -32,6 +32,7 @@ class PathContext:
     history_confidence: HistoryConfidence
     resource_profile_available: bool
     dataset_roles: frozenset[DatasetRole]
+    champion_is_birth_root: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,8 +96,13 @@ class FromScratchPretrainingPath:
         next_checks: list[str] = []
         if context.origin is not ModelOrigin.ZERO:
             blockers.append("project is not a Frontierwright zero-model project")
-        if context.champion_present:
-            blockers.append("current model already exists; use continued pretraining instead")
+        if not context.champion_present:
+            blockers.append("zero-model birth required before from-scratch pretraining")
+        elif not context.champion_is_birth_root:
+            blockers.append(
+                "current model is not an untrained zero-model birth root; "
+                "use continued pretraining instead"
+            )
         if DatasetRole.PRETRAIN not in context.dataset_roles:
             blockers.append("pretraining dataset required")
         if not context.resource_profile_available:
@@ -120,6 +126,10 @@ class ContinuedPretrainingPath:
         next_checks: list[str] = []
         if not context.champion_present:
             blockers.append("current model required")
+        elif context.champion_is_birth_root:
+            blockers.append(
+                "born root has not completed initial pretraining; use from-scratch pretraining"
+            )
         elif context.champion_trainable is not True:
             blockers.append("trainable model representation required")
         if DatasetRole.PRETRAIN not in context.dataset_roles:

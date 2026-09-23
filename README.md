@@ -82,7 +82,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v10, including persisted edition profiles;
+- automatic registry migration through schema v11, including persisted edition profiles and zero-model birth provenance;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
@@ -103,8 +103,11 @@ Implemented now:
   - measured model -> `TARGETS_FLOORS`;
 - persisted build archetypes/relative priorities plus numeric targets/floors with validation;
 - user/lab-first local dataset inventory with content fingerprints, role, license/domain/language metadata, and optional token count;
-- v1 training-path plugin protocol for From-scratch pretraining, Continued pretraining, Full SFT, LoRA SFT, and QLoRA SFT;
-- factual path prerequisite evaluation using current model trainability, local data inventory, resources, and history confidence;
+- extensible intervention taxonomy spanning `BIRTH / LEARN / SPECIALIZE / ALIGN / EVOLVE / OPTIMIZE / EVALUATE / OPERATE`;
+- the five v1 training paths are registered built-in interventions rather than the permanent top-level ontology;
+- factual path prerequisite evaluation using current model trainability, local data inventory, resources, birth state, and history confidence;
+- Academy zero-model birth via `frontierwright birth zero`, with deterministic `zero-8m` / `zero-25m` root checkpoint materialization, exact fingerprinting, runtime provenance, and idempotent repeated birth requests;
+- from-scratch pretraining now requires and pins a materialized zero-model birth root instead of silently reinitializing weights;
 - hard-missing prerequisites show `LOCKED`; calibrated accepted plans can project `READY` only after pinned model/data/backend/resource checks;
 - immutable `TrainingPlan` identity with pinned model fingerprint, dataset fingerprint, backend spec hash, resource profile, config, permission, and hard budgets;
 - representative calibration receipts with step time, throughput, peak memory, projected storage, and projected wall time;
@@ -115,7 +118,7 @@ Implemented now:
 - evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
 - training creates a `PENDING` candidate and never silently changes the champion;
 - candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
-- stable JSON/non-interactive machine surfaces for project/model/resource/build/stats/data/path/plan/run/candidate operations;
+- stable JSON/non-interactive machine surfaces for project/model/birth/resource/build/stats/data/path/plan/run/candidate operations;
 - mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;
 - English/Korean human-string structure;
 - automated domain, migration, evaluation, execution recovery/idempotency, artifact integrity, candidate, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.
@@ -125,7 +128,6 @@ Not implemented yet:
 - an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and benchmark runner;
 - production built-in training backends for all five paths beyond the narrow from-scratch reference backend and structured external command adapter;
 - full execution-time enforcement/accounting for every hard-budget dimension across calibration and repeated attempts;
-- explicit zero-model birth/materialization as a root checkpoint before first training;
 - prepared-dataset recipe artifacts and public dataset discovery/download adapters;
 - remote/server/Slurm executor implementations;
 - full candidate evaluation-eligibility policy and build-floor enforcement transaction.
@@ -139,6 +141,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
 
 .venv/bin/frontierwright project init . --name NOVA --origin ZERO --edition ACADEMY
+.venv/bin/frontierwright birth zero --path . --preset zero-8m --seed 42 --python /path/to/training-python
 .venv/bin/frontierwright project edition --path . --set STUDIO --json --non-interactive --yes
 .venv/bin/frontierwright status --json --non-interactive --yes
 .venv/bin/frontierwright play

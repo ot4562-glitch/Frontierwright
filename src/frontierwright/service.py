@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -40,7 +41,9 @@ from frontierwright.execution import (
     compute_plan_idempotency_key,
     load_command_backend_spec,
     run_calibration_backend,
+    run_structured_command,
 )
+from frontierwright.interventions import intervention_for_training_path
 from frontierwright.local_executor import (
     LocalAttemptSpec,
     atomic_write_json,
@@ -52,6 +55,7 @@ from frontierwright.local_executor import (
 )
 from frontierwright.models import discover_history_evidence, inspect_local_model
 from frontierwright.paths import PathAvailability, PathContext, TrainingPathId, assess_paths
+from frontierwright.reference_backend import PRESETS, REFERENCE_BACKEND_ID
 from frontierwright.registry import ProjectState, Registry
 from frontierwright.resources import detect_local_resources
 
@@ -83,6 +87,23 @@ class StatusView:
     candidate_count: int = 0
     stats: dict[str, float | None] = field(default_factory=dict)
     resource_profile_available: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class BirthView:
+    schema_version: int = 1
+    born: bool = False
+    model_id: str | None = None
+    model_fingerprint: str | None = None
+    checkpoint: str | None = None
+    preset: str | None = None
+    seed: int | None = None
+    backend_id: str | None = None
+    parameter_count: int | None = None
+    runtime: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -321,6 +342,225 @@ def set_project_edition(root: Path, edition: EditionProfile) -> StatusView:
     return get_status(root)
 
 
+
+def get_birth_view(root: Path) -> BirthView:
+    registry = Registry(root)
+    if not registry.exists:
+        return BirthView()
+    state = registry.read()
+    if state.champion is None:
+        return BirthView()
+
+    birth = registry.get_model_birth(state.champion.model.model_id)
+    if birth is None:
+        return BirthView()
+
+    runtime = birth.get("runtime")
+    runtime_map = runtime if isinstance(runtime, dict) else {}
+    parameter_count = runtime_map.get("parameter_count")
+    return BirthView(
+        born=True,
+        model_id=state.champion.model.model_id,
+        model_fingerprint=state.champion.model.fingerprint,
+        checkpoint=state.champion.model.checkpoint,
+        preset=str(birth["preset"]),
+        seed=int(birth["seed"]),
+        backend_id=str(birth["backend_id"]),
+        parameter_count=(
+            parameter_count
+            if isinstance(parameter_count, int) and not isinstance(parameter_count, bool)
+            else None
+        ),
+        runtime=dict(runtime_map),
+    )
+
+
+def birth_zero_model(
+    root: Path,
+    *,
+    preset: str,
+    seed: int,
+    python_executable: str,
+    timeout_seconds: float = 300.0,
+) -> BirthView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a ZERO-origin Frontierwright project before model birth.",
+            10,
+        )
+    if preset not in PRESETS:
+        raise FrontierwrightError(
+            "BIRTH_PRESET_UNKNOWN",
+            f"Unknown zero-model preset: {preset}",
+            2,
+        )
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise FrontierwrightError(
+            "BIRTH_SEED_INVALID",
+            "Birth seed must be a nonnegative integer.",
+            2,
+        )
+    if timeout_seconds <= 0:
+        raise FrontierwrightError(
+            "INVALID_TIMEOUT",
+            "Birth timeout must be positive.",
+            2,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Training Python executable must be nonempty.",
+            2,
+        )
+
+    state = registry.read()
+    if ModelOrigin(state.project["origin"]) is not ModelOrigin.ZERO:
+        raise FrontierwrightError(
+            "BIRTH_ORIGIN_MISMATCH",
+            "Model birth is only valid for ZERO-origin projects.",
+            13,
+        )
+    if state.champion is not None:
+        existing = registry.get_model_birth(state.champion.model.model_id)
+        if (
+            existing is not None
+            and existing.get("preset") == preset
+            and existing.get("seed") == seed
+        ):
+            return get_birth_view(root)
+        raise FrontierwrightError(
+            "MODEL_ALREADY_BORN",
+            "Project already has a materialized current model.",
+            13,
+        )
+
+    birth_token = uuid4().hex
+    births_root = registry.state_dir / "births"
+    staging_root = births_root / ".staging" / birth_token
+    request_path = births_root / "requests" / f"{birth_token}.json"
+    staging_root.mkdir(parents=True, exist_ok=False)
+
+    request: dict[str, object] = {
+        "schema_version": 1,
+        "backend_id": REFERENCE_BACKEND_ID,
+        "operation": "birth",
+        "preset": preset,
+        "seed": seed,
+        "output_root": str(staging_root.resolve()),
+    }
+    _write_state_json(request_path, request)
+
+    try:
+        result = run_structured_command(
+            (
+                python_executable,
+                "-m",
+                "frontierwright.reference_backend",
+                "{request_json}",
+            ),
+            environment_overrides={"PYTHONUNBUFFERED": "1"},
+            request_path=request_path,
+            timeout_seconds=timeout_seconds,
+        )
+        if result.get("operation") != "birth":
+            raise FrontierwrightError(
+                "BIRTH_RESULT_INVALID",
+                "Birth backend did not return a birth result.",
+                14,
+            )
+        output_raw = result.get("output_model_path")
+        metrics = result.get("metrics")
+        if not isinstance(output_raw, str) or not output_raw:
+            raise FrontierwrightError(
+                "BIRTH_RESULT_INVALID",
+                "Birth backend result lacks output_model_path.",
+                14,
+            )
+        if not isinstance(metrics, dict):
+            raise FrontierwrightError(
+                "BIRTH_RESULT_INVALID",
+                "Birth backend result metrics must be an object.",
+                14,
+            )
+        if metrics.get("preset") != preset or metrics.get("seed") != seed:
+            raise FrontierwrightError(
+                "BIRTH_RESULT_INVALID",
+                "Birth backend result does not match the requested preset/seed.",
+                14,
+            )
+
+        backend_model_path = Path(output_raw).expanduser().resolve()
+        try:
+            backend_model_path.relative_to(staging_root.resolve())
+        except ValueError as exc:
+            raise FrontierwrightError(
+                "BIRTH_OUTPUT_ESCAPE",
+                "Birth backend output escaped the managed staging directory.",
+                14,
+            ) from exc
+
+        staged_descriptor = inspect_local_model(backend_model_path)
+        digest = hashlib.sha256(
+            (
+                str(state.project["project_id"])
+                + "\0"
+                + staged_descriptor.fingerprint
+            ).encode("utf-8")
+        ).hexdigest()
+        model_id = f"model-birth-{digest[:32]}"
+        final_root = births_root / model_id
+
+        if final_root.exists():
+            final_model_path = final_root / "model"
+            final_descriptor = inspect_local_model(final_model_path)
+            if final_descriptor.fingerprint != staged_descriptor.fingerprint:
+                raise FrontierwrightError(
+                    "BIRTH_ARTIFACT_CONFLICT",
+                    "Existing birth artifact differs from the newly materialized root.",
+                    13,
+                )
+            shutil.rmtree(staging_root, ignore_errors=True)
+        else:
+            final_root.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staging_root, final_root)
+            final_model_path = final_root / "model"
+            final_descriptor = inspect_local_model(final_model_path)
+            if final_descriptor.fingerprint != staged_descriptor.fingerprint:
+                raise FrontierwrightError(
+                    "BIRTH_ARTIFACT_MISMATCH",
+                    "Materialized root fingerprint changed during publication.",
+                    14,
+                )
+
+        model = ModelState(
+            model_id=model_id,
+            identity_id=str(state.project["identity_id"]),
+            origin=ModelOrigin.ZERO,
+            checkpoint=str(final_descriptor.source_path),
+            fingerprint=final_descriptor.fingerprint,
+            parent_model_id=None,
+            stats=(),
+            model_format=final_descriptor.model_format,
+            trainable=final_descriptor.trainable,
+        )
+        registry.register_birth_model(
+            model,
+            final_descriptor,
+            preset=preset,
+            seed=seed,
+            backend_id=REFERENCE_BACKEND_ID,
+            runtime=dict(metrics),
+        )
+    except Exception:
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+
+    return get_birth_view(root)
+
+
 def get_stats_view(root: Path, model_id: str | None = None) -> StatsView:
     registry = Registry(root)
     if not registry.exists:
@@ -386,10 +626,40 @@ def get_stats_view(root: Path, model_id: str | None = None) -> StatsView:
 
 
 def _verify_model_artifact_integrity(registry: Registry, model_id: str) -> None:
+    model = registry.get_model(model_id)
     record = registry.get_sealed_artifact(model_id)
     if record is None:
-        # Imported/current models may legitimately live outside the managed
-        # candidate store. Training-produced candidates must have a record.
+        artifact = registry.get_model_artifact(model_id)
+        if artifact is None:
+            # Synthetic/test-only registry models may have no artifact row.
+            return
+        source = artifact.get("source_path")
+        if not isinstance(source, str):
+            raise FrontierwrightError(
+                "ARTIFACT_REGISTRY_MISMATCH",
+                "Registered model artifact lacks a source path.",
+                13,
+            )
+        try:
+            current = inspect_local_model(Path(source))
+        except FrontierwrightError as exc:
+            raise FrontierwrightError(
+                "ARTIFACT_TAMPERED",
+                "Registered model artifact is no longer readable.",
+                13,
+            ) from exc
+        if current.fingerprint != model.fingerprint:
+            raise FrontierwrightError(
+                "ARTIFACT_TAMPERED",
+                "Registered model artifact bytes no longer match its fingerprint.",
+                13,
+            )
+        if Path(model.checkpoint).resolve() != current.source_path.resolve():
+            raise FrontierwrightError(
+                "ARTIFACT_REGISTRY_MISMATCH",
+                "Registered model checkpoint does not match its artifact source.",
+                13,
+            )
         return
 
     manifest_path = Path(str(record["manifest_path"]))
@@ -397,7 +667,6 @@ def _verify_model_artifact_integrity(registry: Registry, model_id: str) -> None:
     verify_manifest_digest(manifest_path, str(record["manifest_sha256"]))
     sealed = verify_sealed_artifact(artifact_root)
 
-    model = registry.get_model(model_id)
     if sealed.model_id != model_id:
         raise FrontierwrightError(
             "ARTIFACT_ID_CONFLICT",
@@ -1806,6 +2075,11 @@ def get_paths_view(root: Path) -> PathsView:
     origin = ModelOrigin(state.project["origin"])
     confidence = HistoryConfidence(state.project["history_confidence"])
     roles = frozenset(DatasetRole(item["role"]) for item in state.datasets)
+    champion_birth = (
+        registry.get_model_birth(state.champion.model.model_id)
+        if state.champion is not None
+        else None
+    )
 
     context = PathContext(
         origin=origin,
@@ -1816,13 +2090,18 @@ def get_paths_view(root: Path) -> PathsView:
         history_confidence=confidence,
         resource_profile_available=state.resource_profile is not None,
         dataset_roles=roles,
+        champion_is_birth_root=champion_birth is not None,
     )
     assessments = assess_paths(context)
 
     paths: list[dict[str, object]] = []
     for item in assessments:
+        intervention = intervention_for_training_path(item.path_id)
         payload: dict[str, object] = {
             "path_id": item.path_id.value,
+            "intervention_id": intervention.intervention_id,
+            "intervention_family": intervention.family.value,
+            "intervention_version": intervention.version,
             "title": item.title,
             "availability": item.availability.value,
             "blockers": list(item.blockers),

@@ -20,6 +20,7 @@ from frontierwright.paths import TrainingPathId
 from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.registry import Registry
 from frontierwright.service import (
+    BirthView,
     BuildView,
     CandidateView,
     CompareView,
@@ -32,11 +33,13 @@ from frontierwright.service import (
     StatsView,
     StatusView,
     add_local_dataset,
+    birth_zero_model,
     calibrate_training_plan,
     compare_candidate,
     create_training_plan,
     detect_resources,
     execute_training_plan,
+    get_birth_view,
     get_build_view,
     get_candidates_view,
     get_data_view,
@@ -70,6 +73,7 @@ stats_app = typer.Typer(help="Inspect or ingest capability evaluation evidence."
 data_app = typer.Typer(help="Register and inspect user/lab datasets.")
 plan_app = typer.Typer(help="Create and inspect pinned training plans.")
 backend_app = typer.Typer(help="Inspect and configure training backends.")
+birth_app = typer.Typer(help="Materialize and inspect zero-model birth state.")
 app.add_typer(project_app, name="project")
 app.add_typer(resources_app, name="resources")
 app.add_typer(build_app, name="build")
@@ -77,6 +81,7 @@ app.add_typer(stats_app, name="stats")
 app.add_typer(data_app, name="data")
 app.add_typer(plan_app, name="plan")
 app.add_typer(backend_app, name="backend")
+app.add_typer(birth_app, name="birth")
 
 console = Console()
 
@@ -108,6 +113,10 @@ def _fail(exc: FrontierwrightError, *, json_output: bool) -> NoReturn:
 
 
 def _status_payload(view: StatusView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _birth_payload(view: BirthView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -438,6 +447,21 @@ def _print_status(view: StatusView) -> None:
         console.print(f"{axis.title():10} {value if value is not None else '?'}")
 
 
+def _print_birth(view: BirthView) -> None:
+    if not view.born:
+        console.print("No materialized zero-model root.")
+        return
+    console.print("[bold]MODEL BIRTH[/bold]")
+    console.print(f"Preset: {view.preset}")
+    console.print(f"Seed: {view.seed}")
+    parameter_count = view.parameter_count if view.parameter_count is not None else "?"
+    console.print(f"Parameters: {parameter_count}")
+    console.print(f"Model: {view.model_id}")
+    console.print(f"Fingerprint: {view.model_fingerprint}")
+    console.print(f"Checkpoint: {view.checkpoint}")
+    console.print("Training steps: 0")
+
+
 def _human_bytes(value: object) -> str:
     if not isinstance(value, int):
         return "UNKNOWN"
@@ -582,6 +606,71 @@ def project_edition(
         console.print(view.edition_tagline)
     if view.edition_starting_point:
         console.print(f"Starting point: {view.edition_starting_point}")
+
+
+@birth_app.command("show")
+def birth_show(
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = get_birth_view(path)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_birth_payload(view))
+        return
+    _print_birth(view)
+
+
+@birth_app.command("zero")
+def birth_zero(
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    preset: Annotated[
+        str,
+        typer.Option("--preset", help="Built-in zero-model preset: zero-8m or zero-25m."),
+    ] = "zero-8m",
+    seed: Annotated[int, typer.Option("--seed", help="Initialization seed.")] = 42,
+    python_executable: Annotated[
+        str,
+        typer.Option(
+            "--python",
+            help="Python executable for the isolated PyTorch training environment.",
+        ),
+    ] = sys.executable,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option("--timeout", help="Maximum birth backend wall time in seconds."),
+    ] = 300.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = birth_zero_model(
+            path,
+            preset=preset,
+            seed=seed,
+            python_executable=python_executable,
+            timeout_seconds=timeout_seconds,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_birth_payload(view))
+        return
+    _print_birth(view)
 
 
 @app.command("import")

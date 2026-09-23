@@ -67,7 +67,10 @@ def test_data_and_paths_machine_surface(tmp_path: Path) -> None:
         for item in paths_payload["paths"]
         if item["path_id"] == "FROM_SCRATCH_PRETRAINING"
     )
-    assert zero["availability"] == "PLANNABLE"
+    assert zero["availability"] == "LOCKED"
+    assert zero["intervention_family"] == "LEARN"
+    assert zero["intervention_id"] == "frontierwright.learn.pretrain"
+    assert "zero-model birth required before from-scratch pretraining" in zero["blockers"]
 
 
 def test_stats_machine_surface_ingests_frozen_evidence(tmp_path: Path) -> None:

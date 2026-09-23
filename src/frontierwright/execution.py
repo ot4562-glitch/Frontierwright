@@ -361,16 +361,18 @@ def _read_bounded_output(handle: BinaryIO, label: str) -> str:
         ) from exc
 
 
-def _run_backend(
-    spec: CommandBackendSpec,
+def run_structured_command(
     argv_template: tuple[str, ...],
     *,
+    environment_overrides: dict[str, str],
     request_path: Path,
     timeout_seconds: float,
 ) -> dict[str, Any]:
+    """Run one structured JSON request/result command without shell interpolation."""
+
     argv = _substitute_argv(argv_template, request_json=request_path)
     environment = os.environ.copy()
-    environment.update(spec.environment)
+    environment.update(environment_overrides)
 
     try:
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
@@ -434,6 +436,21 @@ def _run_backend(
             14,
         )
     return payload
+
+
+def _run_backend(
+    spec: CommandBackendSpec,
+    argv_template: tuple[str, ...],
+    *,
+    request_path: Path,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    return run_structured_command(
+        argv_template,
+        environment_overrides=spec.environment,
+        request_path=request_path,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def run_calibration_backend(

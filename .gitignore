@@ -9,6 +9,7 @@ __pycache__/
 build/
 dist/
 .frontierwright/
+.academy-smoke/
 .train-install*
 ASTRA_*.txt
 *.log

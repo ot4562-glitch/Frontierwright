@@ -44,7 +44,7 @@ from frontierwright.models import HistoryEvidenceResult, ImportedModelDescriptor
 from frontierwright.paths import TrainingPathId
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -222,6 +222,14 @@ CREATE TABLE sealed_artifacts (
     manifest_path TEXT NOT NULL,
     manifest_sha256 TEXT NOT NULL,
     model_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE model_births (
+    model_id TEXT PRIMARY KEY REFERENCES models(model_id),
+    preset TEXT NOT NULL,
+    seed INTEGER NOT NULL CHECK (seed >= 0),
+    backend_id TEXT NOT NULL,
+    runtime_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 """
@@ -430,6 +438,17 @@ SET edition_profile = CASE origin
 END;
 """
 
+MIGRATION_10_TO_11 = """
+CREATE TABLE IF NOT EXISTS model_births (
+    model_id TEXT PRIMARY KEY REFERENCES models(model_id),
+    preset TEXT NOT NULL,
+    seed INTEGER NOT NULL CHECK (seed >= 0),
+    backend_id TEXT NOT NULL,
+    runtime_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
 
 def timestamp() -> str:
     return datetime.now(UTC).isoformat()
@@ -612,6 +631,17 @@ class Registry:
                 )
                 connection.commit()
                 version = 10
+
+            if version == 10:
+                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_10_TO_11)
+                connection.execute("PRAGMA user_version = 11")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 10, "to_version": 11},
+                )
+                connection.commit()
+                version = 11
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -901,6 +931,113 @@ class Registry:
                 },
             )
 
+    def register_birth_model(
+        self,
+        model: ModelState,
+        descriptor: ImportedModelDescriptor,
+        *,
+        preset: str,
+        seed: int,
+        backend_id: str,
+        runtime: dict[str, object],
+    ) -> None:
+        with self.connect(write=True) as connection:
+            project = connection.execute(
+                "SELECT identity_id, origin, champion_id FROM project WHERE singleton = 1"
+            ).fetchone()
+            if project is None:
+                raise FrontierwrightError("REGISTRY_ERROR", "Missing project metadata.", 4)
+            if project["origin"] != ModelOrigin.ZERO.value:
+                raise FrontierwrightError(
+                    "BIRTH_ORIGIN_MISMATCH",
+                    "Model birth is only valid for ZERO-origin projects.",
+                    13,
+                )
+            if model.identity_id != project["identity_id"]:
+                raise FrontierwrightError(
+                    "IDENTITY_MISMATCH",
+                    "Born model does not belong to this Frontierwright identity.",
+                    13,
+                )
+            if model.origin is not ModelOrigin.ZERO:
+                raise FrontierwrightError(
+                    "ORIGIN_MISMATCH",
+                    "Born root model must have ZERO origin.",
+                    13,
+                )
+
+            champion_id = project["champion_id"]
+            if champion_id is not None:
+                if champion_id == model.model_id:
+                    existing = connection.execute(
+                        "SELECT model_id FROM model_births WHERE model_id = ?",
+                        (model.model_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        return
+                raise FrontierwrightError(
+                    "MODEL_ALREADY_BORN",
+                    "Project already has a materialized current model.",
+                    13,
+                )
+
+            evidence = HistoryEvidenceResult(
+                confidence=HistoryConfidence.COMPLETE,
+                evidence_files=(
+                    f"birth-backend:{backend_id}",
+                    f"birth-preset:{preset}",
+                    f"birth-seed:{seed}",
+                ),
+                reason=(
+                    "Root model bytes were materialized by Frontierwright birth and "
+                    "fingerprinted before becoming the current model."
+                ),
+            )
+            self.insert_model(connection, model)
+            self.insert_model_artifact(connection, model.model_id, descriptor, evidence)
+            connection.execute(
+                "INSERT INTO model_births "
+                "(model_id, preset, seed, backend_id, runtime_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    model.model_id,
+                    preset,
+                    seed,
+                    backend_id,
+                    json.dumps(runtime, sort_keys=True, allow_nan=False),
+                    timestamp(),
+                ),
+            )
+            connection.execute(
+                "UPDATE project SET champion_id = ?, history_confidence = ? "
+                "WHERE singleton = 1",
+                (model.model_id, HistoryConfidence.COMPLETE.value),
+            )
+            self.event(
+                connection,
+                "MODEL_BORN",
+                {
+                    "model_id": model.model_id,
+                    "fingerprint": model.fingerprint,
+                    "preset": preset,
+                    "seed": seed,
+                    "backend_id": backend_id,
+                    "trained_steps": 0,
+                },
+            )
+
+    def get_model_birth(self, model_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM model_births WHERE model_id = ?",
+                (model_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["runtime"] = json.loads(result.pop("runtime_json"))
+            return result
+
     def register_candidate(self, model: ModelState) -> None:
         with self.connect(write=True) as connection:
             project = connection.execute(
@@ -1073,6 +1210,20 @@ class Registry:
             if row is None:
                 raise FrontierwrightError("MODEL_NOT_FOUND", "Model does not exist.", 3)
             return decode_model(row["snapshot"])
+
+    def get_model_artifact(self, model_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM model_artifacts WHERE model_id = ?",
+                (model_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["trainable"] = bool(result["trainable"])
+            result["files"] = json.loads(result.pop("files_json"))
+            result["evidence_files"] = json.loads(result.pop("evidence_files_json"))
+            return result
 
     def get_sealed_artifact(self, model_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
