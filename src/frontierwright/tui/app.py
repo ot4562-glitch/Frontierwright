@@ -82,6 +82,16 @@ def _compare_text(view: CompareView) -> str:
                 f"{str(item.get('axis')).title():10} {item.get('kind')} "
                 f"{item.get('threshold')}  {item.get('status')}"
             )
+    lines.extend(
+        [
+            "",
+            f"Promotion eligible: {'YES' if view.promotion_eligible else 'NO'}",
+        ]
+    )
+    for blocker in view.promotion_blockers:
+        override = blocker.get("override")
+        suffix = f" · {override}" if override else ""
+        lines.append(f"Blocked: {blocker.get('code')}{suffix}")
     lines.extend(["", "[P] Promote   [R] Reject   [Esc] Back"])
     return "\n".join(lines)
 

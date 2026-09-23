@@ -56,7 +56,7 @@ def test_previous_registry_versions_migrate_to_current(
             )
         }
 
-    assert version == SCHEMA_VERSION == 13
+    assert version == SCHEMA_VERSION == 14
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -121,7 +121,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 13
+    assert version == SCHEMA_VERSION == 14
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -286,7 +286,7 @@ def test_v9_project_migrates_to_origin_appropriate_edition_profile(
     assert state.project["edition_profile"] == "ACADEMY"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 13
+    assert version == SCHEMA_VERSION == 14
 
 
 def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
@@ -315,7 +315,7 @@ def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(plans)")
         }
 
-    assert version == SCHEMA_VERSION == 13
+    assert version == SCHEMA_VERSION == 14
     assert "data_recipes" in tables
     assert {
         "source_dataset_id",
@@ -377,4 +377,56 @@ def test_v12_backfills_intervention_identity_for_existing_plan(tmp_path: Path) -
     assert plan.intervention_family == "SPECIALIZE"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 13
+    assert version == SCHEMA_VERSION == 14
+
+
+def test_v13_binds_numeric_build_schema_without_inventing_scale(
+    tmp_path: Path,
+) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("NOVA", ModelOrigin.ZERO)
+
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute("DROP TABLE build_state")
+        connection.execute(
+            """
+            CREATE TABLE build_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                mode TEXT NOT NULL CHECK (mode IN ('INTENT','TARGETS_FLOORS')),
+                archetype TEXT,
+                priorities_json TEXT,
+                targets_json TEXT,
+                floors_json TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO build_state VALUES "
+            "(1, 'TARGETS_FLOORS', NULL, NULL, ?, ?, ?)",
+            (
+                '{"coding": 140}',
+                '{"general": 100}',
+                "2026-09-23T00:00:00+00:00",
+            ),
+        )
+        connection.execute("PRAGMA user_version = 13")
+        connection.commit()
+
+    state = registry.read()
+
+    assert state.build_state is not None
+    assert state.build_state["targets"] == {"coding": 140}
+    assert state.build_state["floors"] == {"general": 100}
+    assert state.build_state["scale_hash"] is None
+    assert state.build_state["scale_id"] is None
+    assert state.build_state["scale_version"] is None
+
+    with sqlite3.connect(registry.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(build_state)")
+        }
+
+    assert version == SCHEMA_VERSION == 14
+    assert {"scale_hash", "scale_id", "scale_version"}.issubset(columns)

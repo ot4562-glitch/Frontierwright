@@ -197,6 +197,79 @@ def test_compare_uses_same_scale_and_checks_build_constraints(tmp_path: Path) ->
     )
     assert floor["status"] == "FAIL"
     assert target["status"] == "NOT_REACHED"
+    assert view.promotion_eligible is False
+    assert any(
+        item["code"] == "BUILD_FLOOR_VIOLATION"
+        and item["axis"] == "general"
+        and item["override"] == "--allow-build-violations"
+        for item in view.promotion_blockers
+    )
+    assert view.build_scale_hash is not None
+
+
+def test_build_floor_blocks_promotion_until_explicit_override(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+    set_build_targets(
+        project,
+        targets={"coding": 145},
+        floors={"general": 125},
+    )
+
+    with pytest.raises(FrontierwrightError, match="below the configured build floor"):
+        promote_candidate(project, candidate.model_id)
+
+    promoted = promote_candidate(
+        project,
+        candidate.model_id,
+        allow_build_violations=True,
+    )
+    assert promoted.champion_model_id == candidate.model_id
+
+    event = next(
+        item
+        for item in reversed(get_history_view(project).events)
+        if item["kind"] == "CANDIDATE_PROMOTED"
+    )
+    assert event["details"]["gate_default_eligible"] is False
+    assert event["details"]["allow_build_violations"] is True
+    assert event["details"]["overridden_blockers"] == [
+        {"axis": "general", "code": "BUILD_FLOOR_VIOLATION"}
+    ]
+    assert registry.read().project["champion_id"] == candidate.model_id
+
+
+def test_promotion_transaction_rejects_build_state_change_after_gate(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+
+    champion_profile = registry.get_active_capability_profile(champion.model_id)
+    candidate_profile = registry.get_active_capability_profile(candidate.model_id)
+    assert champion_profile is not None
+    assert candidate_profile is not None
+
+    expected_state = {
+        "champion_id": champion.model_id,
+        "build_updated_at": None,
+        "champion_profile_id": str(champion_profile["profile_id"]),
+        "candidate_profile_id": str(candidate_profile["profile_id"]),
+    }
+
+    set_build_targets(
+        project,
+        targets={"coding": 145},
+        floors={"general": 100},
+    )
+
+    with pytest.raises(FrontierwrightError, match="changed after the promotion gate"):
+        registry.promote_candidate(
+            candidate.model_id,
+            expected_state=expected_state,
+        )
 
 
 def test_different_scale_never_produces_fake_delta_or_default_promotion(

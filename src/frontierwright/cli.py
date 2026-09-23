@@ -251,6 +251,15 @@ def _print_build(view: BuildView) -> None:
         console.print("Floors:")
         for axis, value in sorted(view.floors.items()):
             console.print(f"  {axis.title():10} {value}")
+    if view.targets or view.floors:
+        console.print(
+            "Scale binding: "
+            + (
+                f"{view.scale_id} {view.scale_version} · {view.scale_hash}"
+                if view.scale_bound
+                else "UNBOUND"
+            )
+        )
     if view.reason:
         console.print(view.reason)
 
@@ -334,6 +343,10 @@ def _print_paths(view: PathsView) -> None:
 def _print_plan(view: PlanView) -> None:
     console.print(f"[bold]PLAN[/bold] · {view.plan_id}")
     console.print(f"Path: {view.path_id}")
+    console.print(
+        f"Intervention: {view.intervention_id}@{view.intervention_version} "
+        f"· {view.intervention_family}"
+    )
     console.print(f"Backend: {view.backend_id}")
     console.print(f"Permission: {view.permission}")
     console.print(f"Dataset: {view.dataset_id}")
@@ -424,6 +437,17 @@ def _print_compare(view: CompareView) -> None:
                 f"{item.get('axis')} {item.get('kind')} "
                 f"{item.get('threshold')} -> {item.get('status')}"
             )
+
+    console.print("")
+    console.print(
+        f"Promotion eligible: {'YES' if view.promotion_eligible else 'NO'}"
+    )
+    for blocker in view.promotion_blockers:
+        override = blocker.get("override")
+        suffix = f" · override {override}" if override else ""
+        console.print(
+            f"  Blocked: {blocker.get('code')} · {blocker.get('message')}{suffix}"
+        )
 
 
 def _print_history(view: HistoryView) -> None:
@@ -1602,6 +1626,13 @@ def promote_command(
     candidate_model_id: Annotated[str, typer.Argument()],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     allow_unmeasured: Annotated[bool, typer.Option("--allow-unmeasured")] = False,
+    allow_build_violations: Annotated[
+        bool,
+        typer.Option(
+            "--allow-build-violations",
+            help="Explicitly override build-floor or build-scale promotion blockers.",
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
@@ -1612,6 +1643,7 @@ def promote_command(
             path,
             candidate_model_id,
             allow_unmeasured=allow_unmeasured,
+            allow_build_violations=allow_build_violations,
         )
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)

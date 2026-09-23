@@ -82,7 +82,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v13, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, and intervention identity backfill;
+- automatic registry migration through schema v14, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, and frozen-scale Build binding;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;

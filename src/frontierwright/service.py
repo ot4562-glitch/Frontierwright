@@ -141,6 +141,10 @@ class BuildView:
     priorities: dict[str, int] = field(default_factory=dict)
     targets: dict[str, int] = field(default_factory=dict)
     floors: dict[str, int] = field(default_factory=dict)
+    scale_bound: bool = False
+    scale_hash: str | None = None
+    scale_id: str | None = None
+    scale_version: str | None = None
     reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -267,6 +271,9 @@ class CompareView:
     candidate_stats: dict[str, float | None] = field(default_factory=dict)
     deltas: dict[str, float | None] = field(default_factory=dict)
     build_constraints: list[dict[str, object]] = field(default_factory=list)
+    promotion_eligible: bool = False
+    promotion_blockers: list[dict[str, object]] = field(default_factory=list)
+    build_scale_hash: str | None = None
     run: dict[str, object] | None = None
     calibration: dict[str, object] | None = None
 
@@ -893,11 +900,29 @@ def get_build_view(root: Path) -> BuildView:
         )
 
     if saved is not None and saved.get("mode") == BuildMode.TARGETS_FLOORS.value:
+        scale_hash = saved.get("scale_hash")
+        scale_id = saved.get("scale_id")
+        scale_version = saved.get("scale_version")
+        bound = all(
+            isinstance(value, str) and bool(value)
+            for value in (scale_hash, scale_id, scale_version)
+        )
         return BuildView(
             mode=mode.value,
             configured=True,
             targets=saved.get("targets", {}),
             floors=saved.get("floors", {}),
+            scale_bound=bound,
+            scale_hash=scale_hash if isinstance(scale_hash, str) else None,
+            scale_id=scale_id if isinstance(scale_id, str) else None,
+            scale_version=(
+                scale_version if isinstance(scale_version, str) else None
+            ),
+            reason=(
+                None
+                if bound
+                else "Numeric build predates frozen-scale binding; re-save targets/floors."
+            ),
         )
     return BuildView(
         mode=mode.value,
@@ -928,6 +953,16 @@ def set_build_targets(
     floors: dict[str, int],
 ) -> BuildView:
     registry = Registry(root)
+    current_build = get_build_view(root)
+    if current_build.mode != BuildMode.TARGETS_FLOORS.value:
+        raise FrontierwrightError(
+            "BUILD_MODE_MISMATCH",
+            (
+                "Numeric targets/floors are unavailable while current build mode is "
+                f"{current_build.mode or BuildMode.NOT_READY.value}."
+            ),
+            13,
+        )
     try:
         build = BuildTargets(
             targets=_axis_pairs(targets),
@@ -935,7 +970,28 @@ def set_build_targets(
         )
     except ValueError as exc:
         raise FrontierwrightError("INVALID_BUILD", str(exc), 2) from exc
-    registry.set_build_targets(build)
+
+    stats = get_stats_view(root)
+    if (
+        not stats.measured
+        or stats.scale_hash is None
+        or stats.scale_id is None
+        or stats.scale_version is None
+    ):
+        raise FrontierwrightError(
+            "BUILD_SCALE_REQUIRED",
+            (
+                "Numeric targets/floors require the current champion to have an active "
+                "frozen capability profile with exact scale identity."
+            ),
+            13,
+        )
+    registry.set_build_targets(
+        build,
+        scale_hash=stats.scale_hash,
+        scale_id=stats.scale_id,
+        scale_version=stats.scale_version,
+    )
     return get_build_view(root)
 
 
@@ -2048,6 +2104,152 @@ def get_candidates_view(root: Path) -> CandidateView:
     return CandidateView(candidates=items)
 
 
+def _candidate_build_constraints(
+    build: dict[str, object] | None,
+    candidate_stats: StatsView,
+) -> list[dict[str, object]]:
+    constraints: list[dict[str, object]] = []
+    if build is None or build.get("mode") != BuildMode.TARGETS_FLOORS.value:
+        return constraints
+
+    for kind, values in (
+        ("FLOOR", build.get("floors", {})),
+        ("TARGET", build.get("targets", {})),
+    ):
+        if not isinstance(values, dict):
+            continue
+        for axis, threshold in sorted(values.items()):
+            value = candidate_stats.stats.get(str(axis))
+            if value is None:
+                result = "UNKNOWN"
+            elif kind == "FLOOR":
+                result = "PASS" if value >= float(threshold) else "FAIL"
+            else:
+                result = "REACHED" if value >= float(threshold) else "NOT_REACHED"
+            constraints.append(
+                {
+                    "axis": axis,
+                    "kind": kind,
+                    "threshold": threshold,
+                    "candidate_value": value,
+                    "status": result,
+                }
+            )
+    return constraints
+
+
+def _promotion_blockers(
+    *,
+    candidate_status: CandidateStatus,
+    champion_stats: StatsView,
+    candidate_stats: StatsView,
+    build: dict[str, object] | None,
+    constraints: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    blockers: list[dict[str, object]] = []
+
+    if candidate_status is not CandidateStatus.PENDING:
+        blockers.append(
+            {
+                "code": "CANDIDATE_STATE_CONFLICT",
+                "message": (
+                    "Only PENDING candidates can be promoted; current status is "
+                    f"{candidate_status.value}."
+                ),
+                "override": None,
+            }
+        )
+
+    if not candidate_stats.measured:
+        blockers.append(
+            {
+                "code": "CANDIDATE_NOT_MEASURED",
+                "message": (
+                    "Candidate must be evaluated before promotion; use "
+                    "--allow-unmeasured explicitly to override."
+                ),
+                "override": "--allow-unmeasured",
+            }
+        )
+
+    if (
+        candidate_stats.measured
+        and champion_stats.measured
+        and (
+            candidate_stats.scale_hash is None
+            or champion_stats.scale_hash is None
+            or candidate_stats.scale_hash != champion_stats.scale_hash
+        )
+    ):
+        blockers.append(
+            {
+                "code": "CAPABILITY_SCALE_MISMATCH",
+                "message": (
+                    "Champion and candidate do not use the same frozen capability scale."
+                ),
+                "override": "--allow-unmeasured",
+            }
+        )
+
+    floors = (
+        build.get("floors", {})
+        if build is not None and build.get("mode") == BuildMode.TARGETS_FLOORS.value
+        else {}
+    )
+    if isinstance(floors, dict) and floors:
+        build_scale_hash = build.get("scale_hash") if build is not None else None
+        if not isinstance(build_scale_hash, str) or not build_scale_hash:
+            blockers.append(
+                {
+                    "code": "BUILD_SCALE_UNBOUND",
+                    "message": (
+                        "Build floors are not bound to an exact frozen capability scale; "
+                        "re-save the numeric build before promotion."
+                    ),
+                    "override": "--allow-build-violations",
+                }
+            )
+        elif candidate_stats.scale_hash != build_scale_hash:
+            blockers.append(
+                {
+                    "code": "BUILD_SCALE_MISMATCH",
+                    "message": (
+                        "Candidate capability scale does not match the scale pinned by "
+                        "the current build floors."
+                    ),
+                    "override": "--allow-build-violations",
+                }
+            )
+        else:
+            for item in constraints:
+                if item.get("kind") != "FLOOR":
+                    continue
+                status = item.get("status")
+                axis = str(item.get("axis"))
+                if status == "UNKNOWN":
+                    blockers.append(
+                        {
+                            "code": "BUILD_FLOOR_UNMEASURED",
+                            "message": f"Build floor axis {axis} is not measured.",
+                            "axis": axis,
+                            "override": "--allow-build-violations",
+                        }
+                    )
+                elif status == "FAIL":
+                    blockers.append(
+                        {
+                            "code": "BUILD_FLOOR_VIOLATION",
+                            "message": (
+                                f"Candidate is below the configured build floor for {axis}."
+                            ),
+                            "axis": axis,
+                            "override": "--allow-build-violations",
+                        }
+                    )
+
+    return blockers
+
+
 def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
     registry = Registry(root)
     state = registry.read()
@@ -2088,32 +2290,15 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
             if champion_value is not None and candidate_value is not None:
                 deltas[axis] = candidate_value - champion_value
 
-    constraints: list[dict[str, object]] = []
     build = state.build_state
-    if build is not None and build.get("mode") == BuildMode.TARGETS_FLOORS.value:
-        for kind, values in (
-            ("FLOOR", build.get("floors", {})),
-            ("TARGET", build.get("targets", {})),
-        ):
-            if not isinstance(values, dict):
-                continue
-            for axis, threshold in sorted(values.items()):
-                value = candidate_stats.stats.get(str(axis))
-                if value is None:
-                    result = "UNKNOWN"
-                elif kind == "FLOOR":
-                    result = "PASS" if value >= float(threshold) else "FAIL"
-                else:
-                    result = "REACHED" if value >= float(threshold) else "NOT_REACHED"
-                constraints.append(
-                    {
-                        "axis": axis,
-                        "kind": kind,
-                        "threshold": threshold,
-                        "candidate_value": value,
-                        "status": result,
-                    }
-                )
+    constraints = _candidate_build_constraints(build, candidate_stats)
+    promotion_blockers = _promotion_blockers(
+        candidate_status=candidate.status,
+        champion_stats=champion_stats,
+        candidate_stats=candidate_stats,
+        build=build,
+        constraints=constraints,
+    )
 
     run = next(
         (
@@ -2145,6 +2330,13 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
         candidate_stats=candidate_stats.stats,
         deltas=deltas,
         build_constraints=constraints,
+        promotion_eligible=not promotion_blockers,
+        promotion_blockers=promotion_blockers,
+        build_scale_hash=(
+            str(build["scale_hash"])
+            if build is not None and isinstance(build.get("scale_hash"), str)
+            else None
+        ),
         run=dict(run) if run is not None else None,
         calibration=dict(calibration) if calibration is not None else None,
     )
@@ -2155,6 +2347,7 @@ def promote_candidate(
     candidate_model_id: str,
     *,
     allow_unmeasured: bool = False,
+    allow_build_violations: bool = False,
 ) -> StatusView:
     registry = Registry(root)
     state = registry.read()
@@ -2164,44 +2357,80 @@ def promote_candidate(
             "A current champion is required before promotion.",
             12,
         )
+
     candidate = registry.get_candidate(candidate_model_id)
     _verify_model_artifact_integrity(registry, state.champion.model.model_id)
     _verify_model_artifact_integrity(registry, candidate.model.model_id)
-    if candidate.status is not CandidateStatus.PENDING:
-        raise FrontierwrightError(
-            "CANDIDATE_STATE_CONFLICT",
-            f"Only PENDING candidates can be promoted; current status is {candidate.status.value}.",
-            13,
-        )
 
-    candidate_stats = get_stats_view(root, candidate_model_id)
     champion_stats = get_stats_view(root, state.champion.model.model_id)
-    if not candidate_stats.measured and not allow_unmeasured:
+    candidate_stats = get_stats_view(root, candidate_model_id)
+    constraints = _candidate_build_constraints(state.build_state, candidate_stats)
+    blockers = _promotion_blockers(
+        candidate_status=candidate.status,
+        champion_stats=champion_stats,
+        candidate_stats=candidate_stats,
+        build=state.build_state,
+        constraints=constraints,
+    )
+
+    overridden: list[dict[str, object]] = []
+    unresolved: list[dict[str, object]] = []
+    for blocker in blockers:
+        override = blocker.get("override")
+        if override == "--allow-unmeasured" and allow_unmeasured:
+            overridden.append(blocker)
+        elif override == "--allow-build-violations" and allow_build_violations:
+            overridden.append(blocker)
+        else:
+            unresolved.append(blocker)
+
+    if unresolved:
+        first = unresolved[0]
         raise FrontierwrightError(
-            "CANDIDATE_NOT_MEASURED",
-            (
-                "Candidate must be evaluated before promotion; use "
-                "--allow-unmeasured explicitly to override."
-            ),
-            13,
-        )
-    if (
-        candidate_stats.measured
-        and champion_stats.measured
-        and not allow_unmeasured
-        and (
-            candidate_stats.scale_hash is None
-            or champion_stats.scale_hash is None
-            or candidate_stats.scale_hash != champion_stats.scale_hash
-        )
-    ):
-        raise FrontierwrightError(
-            "CAPABILITY_SCALE_MISMATCH",
-            "Champion and candidate must use the same frozen capability scale before promotion.",
+            str(first.get("code") or "PROMOTION_BLOCKED"),
+            str(first.get("message") or "Candidate promotion is blocked."),
             13,
         )
 
-    registry.promote_candidate(candidate_model_id)
+    build_updated_at = (
+        str(state.build_state["updated_at"])
+        if state.build_state is not None
+        and isinstance(state.build_state.get("updated_at"), str)
+        else None
+    )
+    expected_state = {
+        "champion_id": state.champion.model.model_id,
+        "build_updated_at": build_updated_at,
+        "champion_profile_id": champion_stats.profile_id,
+        "candidate_profile_id": candidate_stats.profile_id,
+    }
+    decision_details: dict[str, object] = {
+        "gate_default_eligible": not blockers,
+        "allow_unmeasured": allow_unmeasured,
+        "allow_build_violations": allow_build_violations,
+        "overridden_blockers": [
+            {
+                "code": item.get("code"),
+                "axis": item.get("axis"),
+            }
+            for item in overridden
+        ],
+        "champion_profile_id": champion_stats.profile_id,
+        "candidate_profile_id": candidate_stats.profile_id,
+        "champion_scale_hash": champion_stats.scale_hash,
+        "candidate_scale_hash": candidate_stats.scale_hash,
+        "build_scale_hash": (
+            state.build_state.get("scale_hash")
+            if state.build_state is not None
+            else None
+        ),
+        "build_updated_at": build_updated_at,
+    }
+    registry.promote_candidate(
+        candidate_model_id,
+        expected_state=expected_state,
+        decision_details=decision_details,
+    )
     return get_status(root)
 
 

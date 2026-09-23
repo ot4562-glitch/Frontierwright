@@ -9,6 +9,14 @@ from frontierwright.domain import (
     ModelState,
 )
 from frontierwright.errors import FrontierwrightError
+from frontierwright.evaluations import (
+    AxisScale,
+    CapabilityScale,
+    EvaluationReceipt,
+    RawMeasurement,
+    ScaleTask,
+    apply_scale,
+)
 from frontierwright.registry import Registry
 from frontierwright.service import (
     get_build_view,
@@ -40,6 +48,63 @@ def measured_candidate(registry: Registry, model_id: str = "measured") -> ModelS
             ),
         ),
     )
+
+
+
+
+
+def activate_frozen_profile(registry: Registry, model: ModelState) -> None:
+    receipt = EvaluationReceipt(
+        receipt_id=f"receipt-{model.model_id}",
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        evaluator_id="build-fixture",
+        evaluator_version="1",
+        conditions={"seed": 1},
+        measurements=(
+            RawMeasurement("general", "1", "accuracy", 0.5),
+            RawMeasurement("coding", "1", "pass_rate", 0.6),
+        ),
+    )
+    scale = CapabilityScale(
+        scale_id="build-test-scale",
+        scale_version="1",
+        frozen=True,
+        axes=(
+            AxisScale(
+                axis=Axis.GENERAL,
+                display_anchor=100,
+                tasks=(
+                    ScaleTask(
+                        "general",
+                        "1",
+                        "accuracy",
+                        1,
+                        0.5,
+                        0.1,
+                        10,
+                    ),
+                ),
+            ),
+            AxisScale(
+                axis=Axis.CODING,
+                display_anchor=100,
+                tasks=(
+                    ScaleTask(
+                        "coding",
+                        "1",
+                        "pass_rate",
+                        1,
+                        0.5,
+                        0.1,
+                        10,
+                    ),
+                ),
+            ),
+        ),
+    )
+    registry.activate_capability_profile(receipt, scale, apply_scale(receipt, scale))
+
 
 
 def test_zero_model_starts_with_unconfigured_intent(tmp_path: Path) -> None:
@@ -84,6 +149,7 @@ def test_measured_model_unlocks_targets_and_floors(tmp_path: Path) -> None:
     model = measured_candidate(registry)
     registry.register_candidate(model)
     registry.promote_candidate(model.model_id)
+    activate_frozen_profile(registry, model)
 
     view = set_build_targets(
         tmp_path,
@@ -94,6 +160,10 @@ def test_measured_model_unlocks_targets_and_floors(tmp_path: Path) -> None:
     assert view.configured is True
     assert view.targets == {"coding": 140}
     assert view.floors == {"general": 95}
+    assert view.scale_bound is True
+    assert view.scale_id == "build-test-scale"
+    assert view.scale_version == "1"
+    assert isinstance(view.scale_hash, str)
 
 
 def test_old_intent_does_not_masquerade_as_numeric_build_after_measurement(
@@ -110,6 +180,7 @@ def test_old_intent_does_not_masquerade_as_numeric_build_after_measurement(
     model = measured_candidate(registry)
     registry.register_candidate(model)
     registry.promote_candidate(model.model_id)
+    activate_frozen_profile(registry, model)
 
     view = get_build_view(tmp_path)
     assert view.mode == "TARGETS_FLOORS"
@@ -118,12 +189,34 @@ def test_old_intent_does_not_masquerade_as_numeric_build_after_measurement(
     assert view.targets == {}
 
 
+
+
+
+def test_legacy_embedded_stats_cannot_define_unbound_numeric_build(
+    tmp_path: Path,
+) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("ZERO", ModelOrigin.ZERO)
+    model = measured_candidate(registry, model_id="legacy-measured")
+    registry.register_candidate(model)
+    registry.promote_candidate(model.model_id)
+
+    with pytest.raises(FrontierwrightError, match="active frozen capability profile"):
+        set_build_targets(
+            tmp_path,
+            targets={"coding": 120},
+            floors={"general": 90},
+        )
+
+
+
 def test_target_cannot_be_below_same_axis_floor(tmp_path: Path) -> None:
     registry = Registry(tmp_path)
     registry.initialize("ZERO", ModelOrigin.ZERO)
     model = measured_candidate(registry)
     registry.register_candidate(model)
     registry.promote_candidate(model.model_id)
+    activate_frozen_profile(registry, model)
 
     with pytest.raises(FrontierwrightError, match="cannot be below"):
         set_build_targets(

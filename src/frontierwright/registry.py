@@ -45,7 +45,7 @@ from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import DataPreparationRecipe
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -105,6 +105,9 @@ CREATE TABLE build_state (
     priorities_json TEXT,
     targets_json TEXT,
     floors_json TEXT,
+    scale_hash TEXT,
+    scale_id TEXT,
+    scale_version TEXT,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE evaluation_receipts (
@@ -765,6 +768,33 @@ class Registry:
                 connection.commit()
                 version = 13
 
+            if version == 13:
+                build_columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(build_state)")
+                }
+                connection.execute("BEGIN IMMEDIATE")
+                if "scale_hash" not in build_columns:
+                    connection.execute(
+                        "ALTER TABLE build_state ADD COLUMN scale_hash TEXT"
+                    )
+                if "scale_id" not in build_columns:
+                    connection.execute(
+                        "ALTER TABLE build_state ADD COLUMN scale_id TEXT"
+                    )
+                if "scale_version" not in build_columns:
+                    connection.execute(
+                        "ALTER TABLE build_state ADD COLUMN scale_version TEXT"
+                    )
+                connection.execute("PRAGMA user_version = 14")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 13, "to_version": 14},
+                )
+                connection.commit()
+                version = 14
+
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
                     "UNSUPPORTED_SCHEMA",
@@ -1395,8 +1425,73 @@ class Registry:
                 CandidateStatus(row["status"]),
             )
 
-    def promote_candidate(self, model_id: str) -> None:
+    def promote_candidate(
+        self,
+        model_id: str,
+        *,
+        expected_state: dict[str, str | None] | None = None,
+        decision_details: dict[str, Any] | None = None,
+    ) -> None:
         with self.connect(write=True) as connection:
+            if expected_state is not None:
+                project = connection.execute(
+                    "SELECT champion_id FROM project WHERE singleton = 1"
+                ).fetchone()
+                if project is None:
+                    raise FrontierwrightError(
+                        "REGISTRY_ERROR",
+                        "Missing project metadata.",
+                        4,
+                    )
+                build = connection.execute(
+                    "SELECT updated_at FROM build_state WHERE singleton = 1"
+                ).fetchone()
+                champion_id = project["champion_id"]
+                champion_profile = (
+                    connection.execute(
+                        "SELECT profile_id FROM capability_profiles "
+                        "WHERE model_id = ? AND active = 1 "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (champion_id,),
+                    ).fetchone()
+                    if champion_id is not None
+                    else None
+                )
+                candidate_profile = connection.execute(
+                    "SELECT profile_id FROM capability_profiles "
+                    "WHERE model_id = ? AND active = 1 "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (model_id,),
+                ).fetchone()
+                actual_state: dict[str, str | None] = {
+                    "champion_id": (
+                        str(champion_id) if champion_id is not None else None
+                    ),
+                    "build_updated_at": (
+                        str(build["updated_at"]) if build is not None else None
+                    ),
+                    "champion_profile_id": (
+                        str(champion_profile["profile_id"])
+                        if champion_profile is not None
+                        else None
+                    ),
+                    "candidate_profile_id": (
+                        str(candidate_profile["profile_id"])
+                        if candidate_profile is not None
+                        else None
+                    ),
+                }
+                for key, expected in expected_state.items():
+                    if key not in actual_state or actual_state[key] != expected:
+                        raise FrontierwrightError(
+                            "PROMOTION_STATE_CHANGED",
+                            (
+                                "Champion/build/evaluation evidence changed after the "
+                                "promotion gate was evaluated; compare again."
+                            ),
+                            13,
+                        )
+
             row = connection.execute(
                 "SELECT status FROM candidates WHERE model_id = ?",
                 (model_id,),
@@ -1428,7 +1523,14 @@ class Registry:
                 "UPDATE project SET champion_id = ? WHERE singleton = 1",
                 (model_id,),
             )
-            self.event(connection, "CANDIDATE_PROMOTED", {"model_id": model_id})
+            self.event(
+                connection,
+                "CANDIDATE_PROMOTED",
+                {
+                    "model_id": model_id,
+                    **(decision_details or {}),
+                },
+            )
 
     def reject_candidate(self, model_id: str) -> None:
         with self.connect(write=True) as connection:
@@ -2291,7 +2393,10 @@ class Registry:
             payload = intent.to_dict()
             connection.execute("DELETE FROM build_state WHERE singleton = 1")
             connection.execute(
-                "INSERT INTO build_state VALUES (1, 'INTENT', ?, ?, NULL, NULL, ?)",
+                "INSERT INTO build_state ("
+                "singleton, mode, archetype, priorities_json, targets_json, floors_json, "
+                "scale_hash, scale_id, scale_version, updated_at"
+                ") VALUES (1, 'INTENT', ?, ?, NULL, NULL, NULL, NULL, NULL, ?)",
                 (
                     intent.archetype,
                     json.dumps(payload["priorities"], sort_keys=True),
@@ -2300,7 +2405,21 @@ class Registry:
             )
             self.event(connection, "BUILD_INTENT_SET", payload)
 
-    def set_build_targets(self, targets: BuildTargets) -> None:
+    def set_build_targets(
+        self,
+        targets: BuildTargets,
+        *,
+        scale_hash: str,
+        scale_id: str,
+        scale_version: str,
+    ) -> None:
+        for name, value in (
+            ("scale_hash", scale_hash),
+            ("scale_id", scale_id),
+            ("scale_version", scale_version),
+        ):
+            if not value.strip():
+                raise ValueError(f"{name} must be nonempty")
         with self.connect(write=True) as connection:
             mode = self._current_build_mode(connection)
             if mode.value != "TARGETS_FLOORS":
@@ -2315,15 +2434,29 @@ class Registry:
             payload = targets.to_dict()
             connection.execute("DELETE FROM build_state WHERE singleton = 1")
             connection.execute(
-                "INSERT INTO build_state VALUES "
-                "(1, 'TARGETS_FLOORS', NULL, NULL, ?, ?, ?)",
+                "INSERT INTO build_state ("
+                "singleton, mode, archetype, priorities_json, targets_json, floors_json, "
+                "scale_hash, scale_id, scale_version, updated_at"
+                ") VALUES (1, 'TARGETS_FLOORS', NULL, NULL, ?, ?, ?, ?, ?, ?)",
                 (
                     json.dumps(payload["targets"], sort_keys=True),
                     json.dumps(payload["floors"], sort_keys=True),
+                    scale_hash,
+                    scale_id,
+                    scale_version,
                     timestamp(),
                 ),
             )
-            self.event(connection, "BUILD_TARGETS_SET", payload)
+            self.event(
+                connection,
+                "BUILD_TARGETS_SET",
+                {
+                    **payload,
+                    "scale_hash": scale_hash,
+                    "scale_id": scale_id,
+                    "scale_version": scale_version,
+                },
+            )
 
     def save_resource_snapshot(
         self,
