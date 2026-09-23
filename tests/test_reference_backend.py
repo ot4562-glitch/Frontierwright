@@ -2,9 +2,16 @@ import json
 from pathlib import Path
 
 from frontierwright.reference_backend import (
+    PRESETS,
+    ReferenceConfig,
+    _apply_qlora_parametrizations,
+    _build_model,
     _load_config,
+    _merge_lora_parametrizations,
     _objective_for_path,
+    _parameter_count,
     _read_corpus,
+    _trainable_parameter_count,
     backend_spec_payload,
 )
 
@@ -17,6 +24,7 @@ def test_reference_backend_declares_pretraining_full_sft_and_lora() -> None:
         "CONTINUED_PRETRAINING",
         "FULL_SFT",
         "LORA_SFT",
+        "QLORA_SFT",
     ]
 
 
@@ -27,6 +35,7 @@ def test_reference_backend_objective_labels_are_path_specific() -> None:
     )
     assert _objective_for_path("FULL_SFT") == "full_parameter_causal_sft"
     assert _objective_for_path("LORA_SFT") == "lora_causal_sft"
+    assert _objective_for_path("QLORA_SFT") == "qlora_nf4_causal_sft"
 
 
 def test_reference_config_infers_preset_from_materialized_model(
@@ -87,9 +96,19 @@ def test_reference_lora_config_is_path_scoped(tmp_path: Path) -> None:
     assert lora.lora_rank == 4
     assert lora.lora_alpha == 8.0
 
+    qlora = _load_config(
+        {
+            "path_id": "QLORA_SFT",
+            "model_source_path": str(model),
+            "config": {"lora_rank": 2, "lora_alpha": 4.0},
+        }
+    )
+    assert qlora.lora_rank == 2
+    assert qlora.lora_alpha == 4.0
+
     import pytest
 
-    with pytest.raises(ValueError, match="only valid for LORA_SFT"):
+    with pytest.raises(ValueError, match="only valid for LORA_SFT or QLORA_SFT"):
         _load_config(
             {
                 "path_id": "FULL_SFT",
@@ -121,3 +140,53 @@ def test_reference_backend_still_separates_multiple_plain_files(
     (corpus / "b.txt").write_bytes(b"beta")
 
     assert _read_corpus(corpus, max_bytes=100) == b"alpha\nbeta"
+
+
+def test_reference_qlora_packs_nf4_and_merges_when_torch_available() -> None:
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    preset = PRESETS["zero-8m"]
+    config = ReferenceConfig(
+        preset=preset,
+        steps=1,
+        calibration_steps=1,
+        batch_size=1,
+        learning_rate=3e-4,
+        weight_decay=0.0,
+        seed=7,
+        device="cpu",
+        max_dataset_bytes=1024,
+        lora_rank=2,
+        lora_alpha=4.0,
+    )
+    torch.manual_seed(config.seed)
+    model = _build_model(torch, preset)
+    base_parameter_count = _parameter_count(model)
+
+    details = _apply_qlora_parametrizations(torch, model, config)
+
+    packed = model.blocks[0].mlp[0].parametrizations.weight.original
+    assert packed.dtype == torch.uint8
+    assert packed.ndim == 1
+    assert details["method"] == "qlora"
+    assert details["quantization_type"] == "nf4"
+    assert details["quantization_bits"] == 4
+    assert (
+        details["quantized_target_storage_bytes"]
+        < details["full_precision_target_storage_bytes"]
+    )
+    assert _trainable_parameter_count(model) == details["trainable_parameter_count"]
+
+    tokens = torch.randint(0, 256, (1, 8), dtype=torch.long)
+    loss = model(tokens).square().mean()
+    loss.backward()
+    assert any(
+        parameter.grad is not None
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+    _merge_lora_parametrizations(torch, model)
+    assert _parameter_count(model) == base_parameter_count
+    assert not hasattr(model.blocks[0].mlp[0], "parametrizations")

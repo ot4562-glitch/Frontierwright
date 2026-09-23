@@ -133,7 +133,8 @@ Implemented now:
 - budget enforcement modes are explicit in plan views: run-count registry admission, wall-time timeout, accounted GPU-hour timeout, storage admission/finalization gate, and currently unavailable runtime money enforcement;
 - measured output-size budget violations block candidate finalization even when the training backend itself reports success;
 - `max_money` keeps a plan non-ready until an executor with real runtime cost enforcement exists; a projected price alone is not treated as a hard budget;
-- built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` birth, from-scratch pretraining, continued pretraining, full-parameter causal SFT, merged-output LoRA SFT, and calibration for Frontierwright reference-model lineages; prepared managed corpora can be consumed directly;
+- built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` birth, from-scratch pretraining, continued pretraining, full-parameter causal SFT, merged-output LoRA SFT, and merged-output QLoRA SFT for Frontierwright reference-model lineages; prepared managed corpora can be consumed directly;
+- reference QLoRA freezes the base model, packs targeted transformer projection matrices as blockwise NF4 4-bit values with float32 absmax scales, trains only LoRA parameters, records quantized-vs-full target storage evidence, and materializes a normal merged reference checkpoint after training; it does not claim bitsandbytes double quantization or paged optimizers;
 - successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
 - sealed artifact manifests bind the run, plan, intervention ID/version/family, dataset, dataset-preparation recipe, backend, effective config, model fingerprint, and exact file hashes;
 - built-in evaluation-pack registry exposed through `frontierwright eval packs`; the first pack runs deterministic held-out causal-LM evaluation for Frontierwright reference models;
@@ -154,7 +155,7 @@ Implemented now:
 Not implemented yet:
 
 - an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and its official capability runner; the generic raw evaluation-pack runner exists, but no official Capability v1 scale is claimed yet;
-- reference QLoRA training and broad arbitrary-Hugging-Face production adapters; the built-in reference backend currently covers from-scratch pretraining, continued pretraining, full-parameter causal SFT, and LoRA SFT for Frontierwright reference-model lineages;
+- broad arbitrary-Hugging-Face production adapters; the built-in QLoRA path is intentionally a narrow Frontierwright-reference implementation rather than a claim of arbitrary-architecture compatibility;
 - live output-storage quota enforcement during backend execution, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
 - public dataset discovery/download adapters, trainable tokenizer artifacts beyond the built-in byte vocabulary, and richer tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
 - remote/server/Slurm executor implementations and concrete private Lab adapters;

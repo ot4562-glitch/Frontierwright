@@ -2,8 +2,9 @@
 
 This backend intentionally stays narrow: real causal language-model training for
 Frontierwright reference-model lineages, including initial/continued pretraining,
-full-parameter causal SFT, and merged-output LoRA SFT over serialized text. It is not
-a compatibility layer for arbitrary Hugging Face architectures.
+full-parameter causal SFT, merged-output LoRA SFT, and merged-output NF4 QLoRA SFT
+over serialized text. It is not a compatibility layer for arbitrary Hugging Face
+architectures.
 
 The module is executed by a dedicated training Python environment:
     python -m frontierwright.reference_backend REQUEST_JSON
@@ -26,8 +27,28 @@ SUPPORTED_PATHS = (
     "CONTINUED_PRETRAINING",
     "FULL_SFT",
     "LORA_SFT",
+    "QLORA_SFT",
 )
 VOCAB_SIZE = 256
+QLORA_BLOCK_SIZE = 64
+NF4_CODEBOOK: tuple[float, ...] = (
+    -1.0,
+    -0.6961928009986877,
+    -0.5250730514526367,
+    -0.39491748809814453,
+    -0.28444138169288635,
+    -0.18477343022823334,
+    -0.09105003625154495,
+    0.0,
+    0.07958029955625534,
+    0.16093020141124725,
+    0.24611230194568634,
+    0.33791524171829224,
+    0.44070982933044434,
+    0.5626170039176941,
+    0.7229568362236023,
+    1.0,
+)
 
 
 @dataclass(frozen=True)
@@ -226,10 +247,12 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
         raise ValueError("seed must be a nonnegative integer")
 
     path_id = request.get("path_id")
-    if path_id != "LORA_SFT" and any(
+    if path_id not in {"LORA_SFT", "QLORA_SFT"} and any(
         key in raw for key in ("lora_rank", "lora_alpha")
     ):
-        raise ValueError("lora_rank/lora_alpha are only valid for LORA_SFT")
+        raise ValueError(
+            "lora_rank/lora_alpha are only valid for LORA_SFT or QLORA_SFT"
+        )
 
     return ReferenceConfig(
         preset=preset,
@@ -374,6 +397,8 @@ def _objective_for_path(path_id: object) -> str:
         return "full_parameter_causal_sft"
     if path_id == "LORA_SFT":
         return "lora_causal_sft"
+    if path_id == "QLORA_SFT":
+        return "qlora_nf4_causal_sft"
     raise ValueError(f"unsupported reference training path: {path_id!r}")
 
 
@@ -566,29 +591,253 @@ def _apply_lora_parametrizations(
     }
 
 
+def _quantize_nf4_matrix(
+    torch: Any,
+    weight: Any,
+    *,
+    block_size: int = QLORA_BLOCK_SIZE,
+) -> tuple[Any, Any]:
+    """Pack a matrix into blockwise NF4 indices plus float32 absmax scales."""
+
+    if weight.ndim != 2:
+        raise ValueError("NF4 quantization requires a matrix")
+    flat = weight.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    value_count = int(flat.numel())
+    if value_count <= 0:
+        raise ValueError("NF4 quantization requires a nonempty matrix")
+
+    block_count = math.ceil(value_count / block_size)
+    padded_count = block_count * block_size
+    if padded_count != value_count:
+        padded = torch.zeros(padded_count, dtype=torch.float32)
+        padded[:value_count] = flat
+    else:
+        padded = flat
+
+    blocks = padded.reshape(block_count, block_size)
+    scales = blocks.abs().amax(dim=1)
+    scales = torch.where(scales > 0, scales, torch.ones_like(scales))
+    normalized = blocks / scales[:, None]
+    codebook = torch.tensor(NF4_CODEBOOK, dtype=torch.float32)
+    distances = (normalized[:, :, None] - codebook[None, None, :]).abs()
+    indices = distances.argmin(dim=2).to(dtype=torch.uint8).reshape(-1)[:value_count]
+
+    if int(indices.numel()) % 2:
+        indices = torch.cat(
+            [indices, torch.tensor([7], dtype=torch.uint8)],
+            dim=0,
+        )
+
+    low = indices[0::2]
+    high = indices[1::2] << 4
+    packed = low | high
+    return packed.contiguous(), scales.contiguous()
+
+
+def _apply_qlora_parametrizations(
+    torch: Any,
+    model: Any,
+    config: ReferenceConfig,
+) -> dict[str, object]:
+    """Apply real frozen blockwise-NF4 base weights with trainable LoRA deltas.
+
+    This reference path implements the defining QLoRA property used by the product:
+    gradients update only low-rank adapters while targeted base projection matrices are
+    stored as packed 4-bit NF4 values. It intentionally does not claim bitsandbytes
+    double-quantization or paged-optimizer behavior.
+    """
+
+    nn = torch.nn
+    parametrize = torch.nn.utils.parametrize
+    rank = config.lora_rank
+    alpha = config.lora_alpha
+    codebook_values = NF4_CODEBOOK
+    block_size = QLORA_BLOCK_SIZE
+
+    class QLoRAWeight(nn.Module):  # type: ignore[misc, name-defined]
+        def __init__(
+            self,
+            out_features: int,
+            in_features: int,
+            scales: Any,
+        ) -> None:
+            super().__init__()
+            if rank > min(out_features, in_features):
+                raise ValueError(
+                    "lora_rank exceeds the smallest targeted projection dimension"
+                )
+            self.out_features = out_features
+            self.in_features = in_features
+            self.value_count = out_features * in_features
+            self.block_size = block_size
+            self.a = nn.Parameter(torch.empty(rank, in_features))
+            self.b = nn.Parameter(torch.zeros(out_features, rank))
+            self.scale = alpha / rank
+            self.register_buffer("nf4_scales", scales.to(dtype=torch.float32))
+            self.register_buffer(
+                "nf4_codebook",
+                torch.tensor(codebook_values, dtype=torch.float32),
+            )
+            nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
+
+        def _dequantize(self, packed: Any) -> Any:
+            packed = packed.reshape(-1)
+            low = packed & 0x0F
+            high = (packed >> 4) & 0x0F
+            indices = torch.empty(
+                int(packed.numel()) * 2,
+                dtype=torch.long,
+                device=packed.device,
+            )
+            indices[0::2] = low.to(dtype=torch.long)
+            indices[1::2] = high.to(dtype=torch.long)
+            indices = indices[: self.value_count]
+            values = self.nf4_codebook[indices]
+            block_ids = torch.arange(
+                self.value_count,
+                dtype=torch.long,
+                device=packed.device,
+            ) // self.block_size
+            base = values * self.nf4_scales[block_ids]
+            return base.reshape(self.out_features, self.in_features)
+
+        def forward(self, original: Any) -> Any:
+            if original.dtype == torch.uint8 and original.ndim == 1:
+                base = self._dequantize(original)
+            else:
+                # Registration may inspect the original full-precision tensor before
+                # Frontierwright replaces it with packed NF4 storage.
+                base = original
+            delta = (self.b @ self.a) * self.scale
+            return base.to(dtype=delta.dtype) + delta
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    targets: list[tuple[Any, str, str]] = []
+    for block_index, block in enumerate(model.blocks):
+        targets.append(
+            (
+                block.attn,
+                "in_proj_weight",
+                f"blocks.{block_index}.attn.in_proj_weight",
+            )
+        )
+        targets.append(
+            (
+                block.attn.out_proj,
+                "weight",
+                f"blocks.{block_index}.attn.out_proj.weight",
+            )
+        )
+        targets.append(
+            (
+                block.mlp[0],
+                "weight",
+                f"blocks.{block_index}.mlp.0.weight",
+            )
+        )
+        targets.append(
+            (
+                block.mlp[2],
+                "weight",
+                f"blocks.{block_index}.mlp.2.weight",
+            )
+        )
+
+    target_names: list[str] = []
+    quantized_storage_bytes = 0
+    full_precision_target_bytes = 0
+    for module, parameter_name, target_name in targets:
+        weight = getattr(module, parameter_name)
+        if weight.ndim != 2:
+            raise ValueError(f"QLoRA target is not a matrix: {target_name}")
+        out_features, in_features = weight.shape
+        packed, scales = _quantize_nf4_matrix(
+            torch,
+            weight,
+            block_size=block_size,
+        )
+        parametrization = QLoRAWeight(
+            int(out_features),
+            int(in_features),
+            scales,
+        )
+        parametrize.register_parametrization(
+            module,
+            parameter_name,
+            parametrization,
+            unsafe=True,
+        )
+        parametrization_list = getattr(module.parametrizations, parameter_name)
+        parametrization_list.original = nn.Parameter(
+            packed,
+            requires_grad=False,
+        )
+        quantized_storage_bytes += int(packed.numel() * packed.element_size())
+        quantized_storage_bytes += int(scales.numel() * scales.element_size())
+        quantized_storage_bytes += len(codebook_values) * 4
+        full_precision_target_bytes += int(
+            int(out_features) * int(in_features) * 4
+        )
+        target_names.append(target_name)
+
+    trainable = _trainable_parameter_count(model)
+    if trainable <= 0:
+        raise ValueError("QLoRA produced no trainable parameters")
+
+    return {
+        "method": "qlora",
+        "rank": rank,
+        "alpha": alpha,
+        "quantization_type": "nf4",
+        "quantization_bits": 4,
+        "quantization_block_size": block_size,
+        "double_quantization": False,
+        "paged_optimizer": False,
+        "target_count": len(target_names),
+        "targets": target_names,
+        "trainable_parameter_count": trainable,
+        "quantized_target_storage_bytes": quantized_storage_bytes,
+        "full_precision_target_storage_bytes": full_precision_target_bytes,
+        "merged_output": True,
+    }
+
+
 def _merge_lora_parametrizations(torch: Any, model: Any) -> None:
     parametrize = torch.nn.utils.parametrize
+    nn = torch.nn
+
+    def merge(module: Any, parameter_name: str) -> None:
+        parametrizations = getattr(module.parametrizations, parameter_name)
+        original = parametrizations.original
+        if original.dtype == torch.uint8:
+            # QLoRA stores the frozen base tensor as packed NF4. Materialize the
+            # dequantized base plus trained LoRA delta before removing the packing
+            # parametrization; PyTorch cannot set a float tensor into uint8 storage.
+            materialized = getattr(module, parameter_name).detach().clone()
+            parametrize.remove_parametrizations(
+                module,
+                parameter_name,
+                leave_parametrized=False,
+            )
+            setattr(
+                module,
+                parameter_name,
+                nn.Parameter(materialized, requires_grad=False),
+            )
+            return
+        parametrize.remove_parametrizations(
+            module,
+            parameter_name,
+            leave_parametrized=True,
+        )
+
     for block in model.blocks:
-        parametrize.remove_parametrizations(
-            block.attn,
-            "in_proj_weight",
-            leave_parametrized=True,
-        )
-        parametrize.remove_parametrizations(
-            block.attn.out_proj,
-            "weight",
-            leave_parametrized=True,
-        )
-        parametrize.remove_parametrizations(
-            block.mlp[0],
-            "weight",
-            leave_parametrized=True,
-        )
-        parametrize.remove_parametrizations(
-            block.mlp[2],
-            "weight",
-            leave_parametrized=True,
-        )
+        merge(block.attn, "in_proj_weight")
+        merge(block.attn.out_proj, "weight")
+        merge(block.mlp[0], "weight")
+        merge(block.mlp[2], "weight")
 
 
 def _sample_batch(
@@ -706,6 +955,11 @@ def _training_objects(
     if path_id == "LORA_SFT":
         training_details = {
             **_apply_lora_parametrizations(torch, model, config),
+            "base_parameter_count": base_parameter_count,
+        }
+    elif path_id == "QLORA_SFT":
+        training_details = {
+            **_apply_qlora_parametrizations(torch, model, config),
             "base_parameter_count": base_parameter_count,
         }
 
@@ -1112,13 +1366,13 @@ def _train(
         torch.cuda.synchronize()
     elapsed = max(time.perf_counter() - start, 1e-9)
 
-    if path_id == "LORA_SFT":
+    if path_id in {"LORA_SFT", "QLORA_SFT"}:
         _merge_lora_parametrizations(torch, model)
     parameter_count = _parameter_count(model)
     expected_parameter_count = _training_detail_int(training_details, "base_parameter_count")
     if parameter_count != expected_parameter_count:
         raise ValueError(
-            "merged LoRA checkpoint parameter count differs from the base model"
+            "merged adapter checkpoint parameter count differs from the base model"
         )
 
     output = (_native_path(output_root).expanduser().resolve() / "model")
