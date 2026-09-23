@@ -2606,6 +2606,7 @@ def _required_dataset_role(path_id: TrainingPathId) -> DatasetRole:
     if path_id in (
         TrainingPathId.FROM_SCRATCH_PRETRAINING,
         TrainingPathId.CONTINUED_PRETRAINING,
+        TrainingPathId.DISTILL,
     ):
         return DatasetRole.PRETRAIN
     if path_id is TrainingPathId.DPO:

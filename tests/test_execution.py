@@ -726,6 +726,140 @@ def test_tampered_sealed_candidate_cannot_be_promoted_with_override(
         )
 
 
+
+
+def test_distillation_run_records_explicit_distilled_from_lineage(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "distill-project"
+    teacher = make_model(tmp_path / "distill-teacher")
+    import_local_model(
+        project,
+        teacher,
+        origin=ModelOrigin.IMPORTED_LOCAL,
+        project_name="Teacher",
+    )
+    corpus = tmp_path / "distill-data"
+    corpus.mkdir()
+    (corpus / "train.txt").write_text(
+        "knowledge distillation corpus\n" * 20,
+        encoding="utf-8",
+    )
+    add_local_dataset(
+        project,
+        corpus,
+        name="Distillation corpus",
+        role=DatasetRole.PRETRAIN,
+        token_count=1000,
+    )
+
+    backend_root = tmp_path / "distill-backend"
+    backend_root.mkdir()
+    script = backend_root / "backend.py"
+    script.write_text(
+        """
+import json
+import sys
+from pathlib import Path
+
+request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if request["operation"] == "calibrate":
+    print(json.dumps({
+        "schema_version": 1,
+        "ok": True,
+        "feasible": True,
+        "representative_steps": 1,
+        "step_time_seconds": 0.01,
+        "tokens_per_second": 1000.0,
+        "peak_vram_bytes": None,
+        "peak_ram_bytes": 1024,
+        "projected_storage_bytes": 256,
+        "projected_wall_seconds": 0.1,
+        "gpu_count": 0
+    }))
+elif request["operation"] == "train":
+    output = Path(request["output_root"]) / "model"
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "config.json").write_text(
+        json.dumps({"model_type": "fixture-distilled"}),
+        encoding="utf-8",
+    )
+    (output / "model.safetensors").write_bytes(b"distilled-student-weights")
+    print(json.dumps({
+        "schema_version": 1,
+        "ok": True,
+        "output_model_path": str(output),
+        "metrics": {
+            "method": "knowledge_distillation",
+            "student_preset": "fixture-small"
+        }
+    }))
+else:
+    raise SystemExit(2)
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    spec = backend_root / "backend.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "backend_id": "fixture-distill-backend",
+                "supported_paths": ["DISTILL"],
+                "calibrate_argv": [sys.executable, str(script), "{request_json}"],
+                "train_argv": [sys.executable, str(script), "{request_json}"],
+                "environment": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = Registry(project)
+    teacher_id = registry.read().project["champion_id"]
+    assert isinstance(teacher_id, str)
+
+    plan = create_training_plan(
+        project,
+        path_id=TrainingPathId.DISTILL,
+        backend_spec_path=spec,
+        dataset_id=None,
+        permission=PermissionLevel.EXECUTE_SINGLE,
+        budgets=HardBudgets(max_runs=1, max_storage_bytes=4096),
+        config={
+            "student_preset": "fixture-small",
+            "distill_temperature": 2.0,
+            "distill_alpha": 0.7,
+        },
+    )
+    assert plan.intervention_id == "frontierwright.evolve.distill"
+    calibrate_training_plan(
+        project,
+        plan_id=plan.plan_id or "",
+        backend_spec_path=spec,
+    )
+    completed = execute_training_plan(
+        project,
+        plan_id=plan.plan_id or "",
+        backend_spec_path=spec,
+        dry_run=False,
+        rerun=False,
+    )
+    assert completed.status == "COMPLETED"
+    assert completed.candidate_model_id is not None
+
+    lineage = registry.get_model_lineage(completed.candidate_model_id)
+    distilled = [
+        item for item in lineage if item["relation"] == "DISTILLED_FROM"
+    ]
+    assert len(distilled) == 1
+    assert distilled[0]["parent_model_id"] == teacher_id
+    assert distilled[0]["details"]["intervention_id"] == (
+        "frontierwright.evolve.distill"
+    )
+    assert distilled[0]["details"]["run_id"] == completed.run_id
+
+
 def test_sealed_candidate_manifest_binds_preparation_recipe(tmp_path: Path) -> None:
     project, backend_spec = setup_project(tmp_path)
     raw = get_data_view(project).datasets[0]

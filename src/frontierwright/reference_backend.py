@@ -2,9 +2,9 @@
 
 This backend intentionally stays narrow: real causal language-model training for
 Frontierwright reference-model lineages, including initial/continued pretraining,
-full-parameter causal SFT, merged-output LoRA SFT, merged-output NF4 QLoRA SFT,
-and full-parameter Direct Preference Optimization over structured preference pairs.
-It is not a compatibility layer for arbitrary Hugging Face architectures.
+full-parameter causal SFT, merged-output LoRA/QLoRA SFT, Direct Preference
+Optimization, and teacher-to-smaller-student knowledge distillation. It is not a
+compatibility layer for arbitrary Hugging Face architectures.
 
 The module is executed by a dedicated training Python environment:
     python -m frontierwright.reference_backend REQUEST_JSON
@@ -31,6 +31,7 @@ SUPPORTED_PATHS = (
     "LORA_SFT",
     "QLORA_SFT",
     "DPO",
+    "DISTILL",
 )
 VOCAB_SIZE = 256
 QLORA_BLOCK_SIZE = 64
@@ -116,6 +117,9 @@ class ReferenceConfig:
     lora_rank: int
     lora_alpha: float
     dpo_beta: float = 0.1
+    student_preset: ModelPreset | None = None
+    distill_temperature: float = 2.0
+    distill_alpha: float = 0.5
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -131,6 +135,13 @@ class ReferenceConfig:
             "lora_rank": self.lora_rank,
             "lora_alpha": self.lora_alpha,
             "dpo_beta": self.dpo_beta,
+            "student_preset": (
+                asdict(self.student_preset)
+                if self.student_preset is not None
+                else None
+            ),
+            "distill_temperature": self.distill_temperature,
+            "distill_alpha": self.distill_alpha,
         }
 
 
@@ -202,6 +213,16 @@ def _nonnegative_float(raw: object, default: float, label: str) -> float:
     return result
 
 
+def _unit_interval_float(raw: object, default: float, label: str) -> float:
+    value = default if raw is None else raw
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be a finite number between 0 and 1")
+    result = float(value)
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise ValueError(f"{label} must be a finite number between 0 and 1")
+    return result
+
+
 def _preset_name_for_request(
     request: dict[str, Any],
     raw_config: dict[str, Any],
@@ -261,6 +282,21 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
     if path_id != "DPO" and "dpo_beta" in raw:
         raise ValueError("dpo_beta is only valid for DPO")
 
+    distill_keys = {"student_preset", "distill_temperature", "distill_alpha"}
+    if path_id != "DISTILL" and any(key in raw for key in distill_keys):
+        raise ValueError(
+            "student_preset/distill_temperature/distill_alpha are only valid for DISTILL"
+        )
+    student_preset: ModelPreset | None = None
+    if path_id == "DISTILL":
+        student_raw = raw.get("student_preset")
+        if not isinstance(student_raw, str) or student_raw not in PRESETS:
+            raise ValueError(
+                "DISTILL requires student_preset to be one of: "
+                + ", ".join(sorted(PRESETS))
+            )
+        student_preset = PRESETS[student_raw]
+
     return ReferenceConfig(
         preset=preset,
         steps=_positive_int(raw.get("steps"), 20, "steps"),
@@ -290,6 +326,13 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
         lora_rank=_positive_int(raw.get("lora_rank"), 8, "lora_rank"),
         lora_alpha=_positive_float(raw.get("lora_alpha"), 16.0, "lora_alpha"),
         dpo_beta=_positive_float(raw.get("dpo_beta"), 0.1, "dpo_beta"),
+        student_preset=student_preset,
+        distill_temperature=_positive_float(
+            raw.get("distill_temperature"), 2.0, "distill_temperature"
+        ),
+        distill_alpha=_unit_interval_float(
+            raw.get("distill_alpha"), 0.5, "distill_alpha"
+        ),
     )
 
 
@@ -660,6 +703,132 @@ def _dpo_train_step(
     return float(loss.detach().cpu().item()), processed_tokens
 
 
+def _distillation_training_objects(
+    torch: Any,
+    config: ReferenceConfig,
+    corpus_bytes: bytes,
+    *,
+    model_source_path: str,
+) -> tuple[Any, Any, Any, Any, Any, str, dict[str, object]]:
+    student_preset = config.student_preset
+    if student_preset is None:
+        raise ValueError("DISTILL requires student_preset")
+
+    torch.manual_seed(config.seed)
+    device = _select_device(torch, config.device)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(config.seed)
+
+    teacher = _load_reference_model(
+        torch,
+        config.preset,
+        model_source_path=model_source_path,
+        device=device,
+    )
+    for parameter in teacher.parameters():
+        parameter.requires_grad = False
+    teacher.eval()
+
+    student = _build_model(torch, student_preset).to(device)
+    teacher_parameter_count = _parameter_count(teacher)
+    student_parameter_count = _parameter_count(student)
+    if student_parameter_count >= teacher_parameter_count:
+        raise ValueError(
+            "DISTILL student must have fewer parameters than the teacher model"
+        )
+
+    optimizer = torch.optim.AdamW(
+        [parameter for parameter in student.parameters() if parameter.requires_grad],
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    corpus = torch.tensor(list(corpus_bytes), dtype=torch.long)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(config.seed)
+    details: dict[str, object] = {
+        "method": "knowledge_distillation",
+        "teacher_preset": config.preset.name,
+        "student_preset": student_preset.name,
+        "teacher_frozen": True,
+        "temperature": config.distill_temperature,
+        "soft_loss_weight": config.distill_alpha,
+        "hard_loss_weight": 1.0 - config.distill_alpha,
+        "teacher_parameter_count": teacher_parameter_count,
+        "base_parameter_count": student_parameter_count,
+        "trainable_parameter_count": _trainable_parameter_count(student),
+    }
+    return (
+        student,
+        teacher,
+        optimizer,
+        corpus,
+        generator,
+        device,
+        details,
+    )
+
+
+def _kd_step(
+    torch: Any,
+    student: Any,
+    teacher: Any,
+    optimizer: Any,
+    corpus: Any,
+    generator: Any,
+    *,
+    config: ReferenceConfig,
+    device: str,
+) -> tuple[float, int]:
+    student_preset = config.student_preset
+    if student_preset is None:
+        raise ValueError("DISTILL requires student_preset")
+
+    student.train()
+    teacher.eval()
+    context_length = min(
+        config.preset.context_length,
+        student_preset.context_length,
+    )
+    x, y = _sample_batch(
+        torch,
+        corpus,
+        batch_size=config.batch_size,
+        context_length=context_length,
+        generator=generator,
+        device=device,
+    )
+    optimizer.zero_grad(set_to_none=True)
+    student_logits = student(x)
+    with torch.no_grad():
+        teacher_logits = teacher(x)
+
+    temperature = config.distill_temperature
+    student_log_probs = torch.nn.functional.log_softmax(
+        student_logits.reshape(-1, VOCAB_SIZE) / temperature,
+        dim=-1,
+    )
+    teacher_probs = torch.nn.functional.softmax(
+        teacher_logits.reshape(-1, VOCAB_SIZE) / temperature,
+        dim=-1,
+    )
+    soft_loss = torch.nn.functional.kl_div(
+        student_log_probs,
+        teacher_probs,
+        reduction="batchmean",
+    ) * (temperature * temperature)
+    hard_loss = torch.nn.functional.cross_entropy(
+        student_logits.reshape(-1, VOCAB_SIZE),
+        y.reshape(-1),
+    )
+    loss = (
+        config.distill_alpha * soft_loss
+        + (1.0 - config.distill_alpha) * hard_loss
+    )
+    loss.backward()
+    optimizer.step()
+    return float(loss.detach().cpu().item()), int(y.numel())
+
+
 def _objective_for_path(path_id: object) -> str:
     if path_id == "FROM_SCRATCH_PRETRAINING":
         return "causal_lm_pretraining"
@@ -673,6 +842,8 @@ def _objective_for_path(path_id: object) -> str:
         return "qlora_nf4_causal_sft"
     if path_id == "DPO":
         return "direct_preference_optimization"
+    if path_id == "DISTILL":
+        return "knowledge_distillation"
     raise ValueError(f"unsupported reference training path: {path_id!r}")
 
 
@@ -1545,6 +1716,37 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
             config=config,
             device=device,
         )
+    elif path_id == "DISTILL":
+        if not isinstance(model_source_path, str) or not model_source_path:
+            raise ValueError("DISTILL requires a materialized teacher model")
+        corpus_bytes = _read_corpus(
+            _native_path(dataset_source),
+            max_bytes=config.max_dataset_bytes,
+        )
+        (
+            model,
+            teacher_model,
+            optimizer,
+            corpus,
+            generator,
+            device,
+            training_details,
+        ) = _distillation_training_objects(
+            torch,
+            config,
+            corpus_bytes,
+            model_source_path=model_source_path,
+        )
+        _kd_step(
+            torch,
+            model,
+            teacher_model,
+            optimizer,
+            corpus,
+            generator,
+            config=config,
+            device=device,
+        )
     else:
         corpus_bytes = _read_corpus(
             _native_path(dataset_source),
@@ -1585,6 +1787,17 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
                 config=config,
                 device=device,
             )
+        elif path_id == "DISTILL":
+            _, tokens = _kd_step(
+                torch,
+                model,
+                teacher_model,
+                optimizer,
+                corpus,
+                generator,
+                config=config,
+                device=device,
+            )
         else:
             _, tokens = _train_step(
                 torch,
@@ -1609,6 +1822,11 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
     )
     parameter_count = _training_detail_int(training_details, "base_parameter_count")
     projected_storage = int(parameter_count * 4 * 1.05) + 16 * 1024
+    calibration_preset = (
+        config.student_preset
+        if path_id == "DISTILL" and config.student_preset is not None
+        else config.preset
+    )
 
     return {
         "schema_version": 1,
@@ -1624,7 +1842,7 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
         "gpu_count": int(torch.cuda.device_count()) if device == "cuda" else 0,
         "device": device,
         "parameter_count": parameter_count,
-        "preset": config.preset.name,
+        "preset": calibration_preset.name,
         "objective": objective,
         "training": training_details,
     }
@@ -1670,6 +1888,27 @@ def _train(
             preference_pairs,
             model_source_path=model_source_path,
         )
+    elif path_id == "DISTILL":
+        if not isinstance(model_source_path, str) or not model_source_path:
+            raise ValueError("DISTILL requires a materialized teacher model")
+        corpus_bytes = _read_corpus(
+            _native_path(dataset_source),
+            max_bytes=config.max_dataset_bytes,
+        )
+        (
+            model,
+            teacher_model,
+            optimizer,
+            corpus,
+            generator,
+            device,
+            training_details,
+        ) = _distillation_training_objects(
+            torch,
+            config,
+            corpus_bytes,
+            model_source_path=model_source_path,
+        )
     else:
         corpus_bytes = _read_corpus(
             _native_path(dataset_source),
@@ -1696,6 +1935,17 @@ def _train(
                 reference_model,
                 optimizer,
                 preference_pairs,
+                generator,
+                config=config,
+                device=device,
+            )
+        elif path_id == "DISTILL":
+            loss, tokens = _kd_step(
+                torch,
+                model,
+                teacher_model,
+                optimizer,
+                corpus,
                 generator,
                 config=config,
                 device=device,
@@ -1728,17 +1978,22 @@ def _train(
     output = (_native_path(output_root).expanduser().resolve() / "model")
     output.mkdir(parents=True, exist_ok=True)
 
+    output_preset = (
+        config.student_preset
+        if path_id == "DISTILL" and config.student_preset is not None
+        else config.preset
+    )
     config_payload = {
         "architectures": ["FrontierwrightByteCausalLM"],
         "model_type": "frontierwright_byte_causal_lm",
         "frontierwright_reference_backend": REFERENCE_BACKEND_ID,
-        "preset": config.preset.name,
+        "preset": output_preset.name,
         "vocab_size": VOCAB_SIZE,
-        "d_model": config.preset.d_model,
-        "n_layers": config.preset.n_layers,
-        "n_heads": config.preset.n_heads,
-        "d_ff": config.preset.d_ff,
-        "context_length": config.preset.context_length,
+        "d_model": output_preset.d_model,
+        "n_layers": output_preset.n_layers,
+        "n_heads": output_preset.n_heads,
+        "d_ff": output_preset.d_ff,
+        "context_length": output_preset.context_length,
         "parameter_count": parameter_count,
     }
     (output / "config.json").write_text(
@@ -1790,7 +2045,7 @@ def _train(
         "output_model_path": _reported_child_path(output_root, "model"),
         "metrics": {
             "backend_id": REFERENCE_BACKEND_ID,
-            "preset": config.preset.name,
+            "preset": output_preset.name,
             "device": device,
             "objective": objective,
             "training": training_details,

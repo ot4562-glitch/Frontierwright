@@ -191,6 +191,12 @@ BUILTIN_INTERVENTION_PLUGINS: tuple[InterventionPlugin, ...] = (
         title="Direct Preference Optimization (DPO)",
         path_id=TrainingPathId.DPO,
     ),
+    _training_plugin(
+        intervention_id="frontierwright.evolve.distill",
+        family=InterventionFamily.EVOLVE,
+        title="Knowledge distillation",
+        path_id=TrainingPathId.DISTILL,
+    ),
     ArtifactTransformInterventionPlugin(
         descriptor=InterventionDescriptor(
             intervention_id="frontierwright.evolve.linear-merge",

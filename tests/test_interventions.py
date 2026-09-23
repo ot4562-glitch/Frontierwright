@@ -93,6 +93,25 @@ def test_training_assessment_executes_through_intervention_plugins() -> None:
     assert lora.recommendation_eligible is True
 
 
+def test_distillation_is_builtin_evolve_training_intervention() -> None:
+    item = intervention_for_training_path(TrainingPathId.DISTILL)
+    assert item.intervention_id == "frontierwright.evolve.distill"
+    assert item.family is InterventionFamily.EVOLVE
+    assert item.surface is InterventionSurface.TRAINING_PATH
+
+    context = PathContext(
+        origin=ModelOrigin.IMPORTED_LOCAL,
+        champion_present=True,
+        champion_trainable=True,
+        history_confidence=HistoryConfidence.VERIFIED,
+        resource_profile_available=True,
+        dataset_roles=frozenset({DatasetRole.PRETRAIN}),
+    )
+    assessment = training_intervention_for_path(TrainingPathId.DISTILL).assess(context)
+    assert assessment.availability.value == "PLANNABLE"
+    assert assessment.blockers == ()
+
+
 def test_linear_merge_is_builtin_evolve_artifact_transform() -> None:
     item = intervention_by_id("frontierwright.evolve.linear-merge")
     assert item is not None

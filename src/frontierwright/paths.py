@@ -23,6 +23,7 @@ class TrainingPathId(StrEnum):
     LORA_SFT = "LORA_SFT"
     QLORA_SFT = "QLORA_SFT"
     DPO = "DPO"
+    DISTILL = "DISTILL"
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,38 @@ class _SFTPath:
 
 
 
+
+
+@dataclass(frozen=True)
+class KnowledgeDistillationPath:
+    path_id: TrainingPathId = TrainingPathId.DISTILL
+    title: str = "Knowledge distillation"
+
+    def assess(self, context: PathContext) -> PathAssessment:
+        blockers: list[str] = []
+        next_checks: list[str] = []
+        if not context.champion_present:
+            blockers.append("teacher champion required")
+        elif context.champion_is_birth_root:
+            blockers.append(
+                "born root has not completed initial pretraining; "
+                "distillation requires a trained teacher"
+            )
+        elif context.champion_trainable is not True:
+            blockers.append("trainable teacher representation required")
+        if DatasetRole.PRETRAIN not in context.dataset_roles:
+            blockers.append("pretraining corpus required for distillation")
+        if not context.resource_profile_available:
+            next_checks.append("run frontierwright resources detect")
+        return _finish(
+            path_id=self.path_id,
+            title=self.title,
+            context=context,
+            blockers=blockers,
+            next_checks=next_checks,
+        )
+
+
 @dataclass(frozen=True)
 class DirectPreferenceOptimizationPath:
     path_id: TrainingPathId = TrainingPathId.DPO
@@ -215,6 +248,7 @@ DEFAULT_PATHS: tuple[TrainingPathPlugin, ...] = (
     _SFTPath(TrainingPathId.LORA_SFT, "LoRA SFT"),
     _SFTPath(TrainingPathId.QLORA_SFT, "QLoRA SFT"),
     DirectPreferenceOptimizationPath(),
+    KnowledgeDistillationPath(),
 )
 
 

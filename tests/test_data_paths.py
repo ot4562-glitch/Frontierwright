@@ -235,6 +235,31 @@ def test_verified_history_enables_recommendation_eligibility_but_no_fake_winner(
     assert "No effect/recommendation model" in (view.recommendation_reason or "")
 
 
+def test_pretrain_data_unlocks_distillation_for_trained_imported_model(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    import_local_model(
+        project,
+        fake_hf_model(tmp_path / "teacher"),
+        origin=ModelOrigin.IMPORTED_LOCAL,
+        project_name="Teacher",
+    )
+    add_local_dataset(
+        project,
+        make_dataset(tmp_path / "distill-corpus"),
+        name="Distillation corpus",
+        role=DatasetRole.PRETRAIN,
+    )
+
+    view = get_paths_view(project)
+    distill = by_id(view, "DISTILL")
+    assert distill["availability"] == "PLANNABLE"
+    assert distill["blockers"] == []
+    assert distill["intervention_family"] == "EVOLVE"
+    assert distill["intervention_id"] == "frontierwright.evolve.distill"
+
+
 def test_preference_data_unlocks_dpo_without_unlocking_sft_paths(
     tmp_path: Path,
 ) -> None:

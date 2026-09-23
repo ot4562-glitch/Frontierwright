@@ -27,6 +27,7 @@ def test_reference_backend_declares_pretraining_full_sft_and_lora() -> None:
         "LORA_SFT",
         "QLORA_SFT",
         "DPO",
+        "DISTILL",
     ]
 
 
@@ -39,6 +40,7 @@ def test_reference_backend_objective_labels_are_path_specific() -> None:
     assert _objective_for_path("LORA_SFT") == "lora_causal_sft"
     assert _objective_for_path("QLORA_SFT") == "qlora_nf4_causal_sft"
     assert _objective_for_path("DPO") == "direct_preference_optimization"
+    assert _objective_for_path("DISTILL") == "knowledge_distillation"
 
 
 def test_reference_config_infers_preset_from_materialized_model(
@@ -227,6 +229,61 @@ def test_reference_dpo_config_is_path_scoped(tmp_path: Path) -> None:
                 "path_id": "FULL_SFT",
                 "model_source_path": str(model),
                 "config": {"dpo_beta": 0.2},
+            }
+        )
+
+
+
+
+def test_reference_distill_config_pins_smaller_student_preset(tmp_path: Path) -> None:
+    model = tmp_path / "teacher"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "frontierwright_reference_backend": (
+                    "frontierwright-reference-pytorch-v1"
+                ),
+                "preset": "zero-25m",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = _load_config(
+        {
+            "path_id": "DISTILL",
+            "model_source_path": str(model),
+            "config": {
+                "student_preset": "zero-8m",
+                "distill_temperature": 3.0,
+                "distill_alpha": 0.7,
+            },
+        }
+    )
+    assert config.preset.name == "zero-25m"
+    assert config.student_preset is not None
+    assert config.student_preset.name == "zero-8m"
+    assert config.distill_temperature == 3.0
+    assert config.distill_alpha == 0.7
+
+    import pytest
+
+    with pytest.raises(ValueError, match="DISTILL requires student_preset"):
+        _load_config(
+            {
+                "path_id": "DISTILL",
+                "model_source_path": str(model),
+                "config": {},
+            }
+        )
+
+    with pytest.raises(ValueError, match="only valid for DISTILL"):
+        _load_config(
+            {
+                "path_id": "FULL_SFT",
+                "model_source_path": str(model),
+                "config": {"student_preset": "zero-8m"},
             }
         )
 

@@ -1651,7 +1651,7 @@ WHERE parent_model_id IS NOT NULL;
     ) -> None:
         with self.connect(write=True) as connection:
             run = connection.execute(
-                "SELECT status, candidate_model_id FROM runs WHERE run_id = ?",
+                "SELECT status, candidate_model_id, plan_id FROM runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
             if run is None:
@@ -1723,6 +1723,27 @@ WHERE parent_model_id IS NOT NULL;
                 ),
             )
             self.insert_model(connection, model)
+            plan_row = connection.execute(
+                "SELECT intervention_id, intervention_version FROM plans WHERE plan_id = ?",
+                (run["plan_id"],),
+            ).fetchone()
+            if (
+                plan_row is not None
+                and plan_row["intervention_id"] == "frontierwright.evolve.distill"
+                and model.parent_model_id is not None
+            ):
+                Registry.insert_lineage_edge(
+                    connection,
+                    child_model_id=model.model_id,
+                    parent_model_id=model.parent_model_id,
+                    relation=LineageRelation.DISTILLED_FROM,
+                    ordinal=0,
+                    details={
+                        "intervention_id": str(plan_row["intervention_id"]),
+                        "intervention_version": str(plan_row["intervention_version"]),
+                        "run_id": run_id,
+                    },
+                )
             self.insert_model_artifact(
                 connection,
                 model.model_id,
