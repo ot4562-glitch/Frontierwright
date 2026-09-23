@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from frontierwright.artifact_store import SealedArtifact
 from frontierwright.data import DatasetDescriptor, DatasetProvenance, DatasetRole
 from frontierwright.domain import (
     Axis,
@@ -42,7 +43,7 @@ from frontierwright.models import HistoryEvidenceResult, ImportedModelDescriptor
 from frontierwright.paths import TrainingPathId
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -209,6 +210,17 @@ CREATE TABLE IF NOT EXISTS run_attempts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_running_run_per_plan
 ON runs(plan_id) WHERE status = 'RUNNING';
+
+CREATE TABLE sealed_artifacts (
+    model_id TEXT PRIMARY KEY REFERENCES models(model_id),
+    run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+    artifact_root TEXT NOT NULL,
+    model_path TEXT NOT NULL,
+    manifest_path TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    model_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 MIGRATION_1_TO_2 = """
@@ -391,6 +403,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_running_run_per_plan
 ON runs(plan_id) WHERE status = 'RUNNING';
 """
 
+MIGRATION_8_TO_9 = """
+CREATE TABLE sealed_artifacts (
+    model_id TEXT PRIMARY KEY REFERENCES models(model_id),
+    run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+    artifact_root TEXT NOT NULL,
+    model_path TEXT NOT NULL,
+    manifest_path TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    model_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
 
 def timestamp() -> str:
     return datetime.now(UTC).isoformat()
@@ -545,6 +570,17 @@ class Registry:
                 )
                 connection.commit()
                 version = 8
+
+            if version == 8:
+                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATION_8_TO_9)
+                connection.execute("PRAGMA user_version = 9")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 8, "to_version": 9},
+                )
+                connection.commit()
+                version = 9
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -807,7 +843,7 @@ class Registry:
     def register_training_candidate(
         self,
         model: ModelState,
-        descriptor: ImportedModelDescriptor,
+        sealed: SealedArtifact,
         *,
         run_id: str,
         metrics: dict[str, object],
@@ -860,16 +896,54 @@ class Registry:
                     "Candidate does not belong to this Frontierwright identity.",
                     13,
                 )
+            if sealed.model_id != model.model_id or sealed.run_id != run_id:
+                raise FrontierwrightError(
+                    "ARTIFACT_ID_CONFLICT",
+                    "Sealed artifact identity does not match candidate/run.",
+                    13,
+                )
+            if sealed.descriptor.fingerprint != model.fingerprint:
+                raise FrontierwrightError(
+                    "ARTIFACT_FINGERPRINT_MISMATCH",
+                    "Sealed artifact fingerprint does not match candidate model.",
+                    13,
+                )
+
             evidence = HistoryEvidenceResult(
                 confidence=HistoryConfidence(project["history_confidence"]),
-                evidence_files=(f"run:{run_id}", f"result:{attempt['result_sha256']}"),
+                evidence_files=(
+                    f"run:{run_id}",
+                    f"result:{attempt['result_sha256']}",
+                    f"artifact-manifest:{sealed.manifest_sha256}",
+                ),
                 reason=(
                     f"Candidate produced by Frontierwright run {run_id}; "
-                    "durable executor evidence recorded before registration."
+                    "durable executor evidence and sealed artifact recorded before registration."
                 ),
             )
             self.insert_model(connection, model)
-            self.insert_model_artifact(connection, model.model_id, descriptor, evidence)
+            self.insert_model_artifact(
+                connection,
+                model.model_id,
+                sealed.descriptor,
+                evidence,
+            )
+            connection.execute(
+                "INSERT INTO sealed_artifacts "
+                "(model_id, run_id, artifact_root, model_path, manifest_path, "
+                "manifest_sha256, model_fingerprint, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    model.model_id,
+                    run_id,
+                    str(sealed.artifact_root),
+                    str(sealed.model_path),
+                    str(sealed.manifest_path),
+                    sealed.manifest_sha256,
+                    model.fingerprint,
+                    timestamp(),
+                ),
+            )
             connection.execute(
                 "INSERT INTO candidates(model_id, status) VALUES (?, ?)",
                 (model.model_id, CandidateStatus.PENDING.value),
@@ -918,6 +992,14 @@ class Registry:
             if row is None:
                 raise FrontierwrightError("MODEL_NOT_FOUND", "Model does not exist.", 3)
             return decode_model(row["snapshot"])
+
+    def get_sealed_artifact(self, model_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM sealed_artifacts WHERE model_id = ?",
+                (model_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     def get_active_capability_profile(self, model_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:

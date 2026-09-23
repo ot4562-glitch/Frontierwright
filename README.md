@@ -71,7 +71,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration from the earlier v1-v4 schemas to schema v5;
+- automatic registry migration through schema v9;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
@@ -94,20 +94,30 @@ Implemented now:
 - user/lab-first local dataset inventory with content fingerprints, role, license/domain/language metadata, and optional token count;
 - v1 training-path plugin protocol for From-scratch pretraining, Continued pretraining, Full SFT, LoRA SFT, and QLoRA SFT;
 - factual path prerequisite evaluation using current model trainability, local data inventory, resources, and history confidence;
-- hard-missing prerequisites show `LOCKED`; satisfied prerequisites currently show `PLANNABLE` until a real backend/calibration proves execution readiness;
-- stable `project init`, `import`, `status`, `resources`, `build`, `stats`, `data`, and `paths` JSON/non-interactive machine surfaces;
+- hard-missing prerequisites show `LOCKED`; calibrated accepted plans can project `READY` only after pinned model/data/backend/resource checks;
+- immutable `TrainingPlan` identity with pinned model fingerprint, dataset fingerprint, backend spec hash, resource profile, config, permission, and hard budgets;
+- representative calibration receipts with step time, throughput, peak memory, projected storage, and projected wall time;
+- idempotent durable local run attempts with worker/process identity, liveness reconciliation, durable executor results, explicit rerun semantics, and repairable run-receipt export;
+- built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` from-scratch pretraining/calibration;
+- successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
+- sealed artifact manifests bind the run, plan, dataset, backend, effective config, model fingerprint, and exact file hashes;
+- evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
+- training creates a `PENDING` candidate and never silently changes the champion;
+- candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
+- stable JSON/non-interactive machine surfaces for project/model/resource/build/stats/data/path/plan/run/candidate operations;
 - mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;
 - English/Korean human-string structure;
-- automated domain, migration, evaluation, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.
+- automated domain, migration, evaluation, execution recovery/idempotency, artifact integrity, candidate, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.
 
 Not implemented yet:
 
-- an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle;
-- benchmark execution runner (the engine currently ingests verifiable raw receipts);
-- training backend execution for the five v1 paths;
-- calibration/peak-memory/throughput/cost engine that can promote `PLANNABLE` to real `READY`;
-- public dataset discovery/download/preparation adapters;
-- real candidate training execution and run receipts.
+- an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and benchmark runner;
+- production built-in training backends for all five paths beyond the narrow from-scratch reference backend and structured external command adapter;
+- full execution-time enforcement/accounting for every hard-budget dimension across calibration and repeated attempts;
+- explicit zero-model birth/materialization as a root checkpoint before first training;
+- prepared-dataset recipe artifacts and public dataset discovery/download adapters;
+- remote/server/Slurm executor implementations;
+- full candidate evaluation-eligibility policy and build-floor enforcement transaction.
 
 Those surfaces remain explicitly `NOT_READY` / `UNKNOWN` rather than using fake data.
 

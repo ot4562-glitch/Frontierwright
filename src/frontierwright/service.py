@@ -10,6 +10,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
+from frontierwright.artifact_store import (
+    seal_training_artifact,
+    verify_manifest_digest,
+    verify_sealed_artifact,
+)
 from frontierwright.data import DatasetProvenance, DatasetRole, inspect_local_dataset
 from frontierwright.domain import (
     Axis,
@@ -357,6 +362,45 @@ def get_stats_view(root: Path, model_id: str | None = None) -> StatsView:
     )
 
 
+def _verify_model_artifact_integrity(registry: Registry, model_id: str) -> None:
+    record = registry.get_sealed_artifact(model_id)
+    if record is None:
+        # Imported/current models may legitimately live outside the managed
+        # candidate store. Training-produced candidates must have a record.
+        return
+
+    manifest_path = Path(str(record["manifest_path"]))
+    artifact_root = Path(str(record["artifact_root"]))
+    verify_manifest_digest(manifest_path, str(record["manifest_sha256"]))
+    sealed = verify_sealed_artifact(artifact_root)
+
+    model = registry.get_model(model_id)
+    if sealed.model_id != model_id:
+        raise FrontierwrightError(
+            "ARTIFACT_ID_CONFLICT",
+            "Managed artifact model identity does not match registry model.",
+            13,
+        )
+    if sealed.descriptor.fingerprint != model.fingerprint:
+        raise FrontierwrightError(
+            "ARTIFACT_TAMPERED",
+            "Managed artifact bytes no longer match the registered model fingerprint.",
+            13,
+        )
+    if str(record["model_fingerprint"]) != model.fingerprint:
+        raise FrontierwrightError(
+            "ARTIFACT_REGISTRY_MISMATCH",
+            "Managed artifact registry fingerprint does not match the model.",
+            13,
+        )
+    if Path(model.checkpoint).resolve() != sealed.model_path.resolve():
+        raise FrontierwrightError(
+            "ARTIFACT_REGISTRY_MISMATCH",
+            "Registered model checkpoint does not point to its sealed artifact.",
+            13,
+        )
+
+
 def ingest_stats(
     root: Path,
     *,
@@ -374,6 +418,7 @@ def ingest_stats(
     receipt = load_evaluation_receipt(receipt_path)
     scale = load_capability_scale(scale_path)
     model = registry.get_model(receipt.model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
 
     if receipt.model_fingerprint != model.fingerprint:
         raise FrontierwrightError(
@@ -1231,10 +1276,10 @@ def reconcile_training_run(root: Path, run_id: str) -> RunView:
             )
 
         plan = registry.get_plan(str(run["plan_id"]))
-        descriptor = inspect_local_model(Path(output))
+        backend_descriptor = inspect_local_model(Path(output))
         if (
             plan.budgets.max_storage_bytes is not None
-            and descriptor.total_bytes > plan.budgets.max_storage_bytes
+            and backend_descriptor.total_bytes > plan.budgets.max_storage_bytes
         ):
             registry.finish_run_failure(
                 run_id,
@@ -1244,21 +1289,33 @@ def reconcile_training_run(root: Path, run_id: str) -> RunView:
             )
             return get_run_view(root, run_id)
 
+        candidate_model_id = _deterministic_candidate_id(
+            run_id,
+            backend_descriptor.fingerprint,
+        )
+        sealed = seal_training_artifact(
+            registry.state_dir,
+            source_path=Path(output),
+            model_id=candidate_model_id,
+            run_id=run_id,
+            plan=plan,
+        )
+
         state = registry.read()
         candidate = ModelState(
-            model_id=_deterministic_candidate_id(run_id, descriptor.fingerprint),
+            model_id=candidate_model_id,
             identity_id=state.project["identity_id"],
             origin=ModelOrigin(state.project["origin"]),
-            checkpoint=str(descriptor.source_path),
-            fingerprint=descriptor.fingerprint,
+            checkpoint=str(sealed.model_path),
+            fingerprint=sealed.descriptor.fingerprint,
             parent_model_id=plan.model_id,
             stats=(),
-            model_format=descriptor.model_format,
-            trainable=descriptor.trainable,
+            model_format=sealed.descriptor.model_format,
+            trainable=sealed.descriptor.trainable,
         )
         registry.register_training_candidate(
             candidate,
-            descriptor,
+            sealed,
             run_id=run_id,
             metrics=dict(metrics),
         )
@@ -1541,6 +1598,8 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
             12,
         )
     candidate = registry.get_candidate(candidate_model_id)
+    _verify_model_artifact_integrity(registry, state.champion.model.model_id)
+    _verify_model_artifact_integrity(registry, candidate.model.model_id)
     champion_stats = get_stats_view(root, state.champion.model.model_id)
     candidate_stats = get_stats_view(root, candidate.model.model_id)
 
@@ -1646,6 +1705,8 @@ def promote_candidate(
             12,
         )
     candidate = registry.get_candidate(candidate_model_id)
+    _verify_model_artifact_integrity(registry, state.champion.model.model_id)
+    _verify_model_artifact_integrity(registry, candidate.model.model_id)
     if candidate.status is not CandidateStatus.PENDING:
         raise FrontierwrightError(
             "CANDIDATE_STATE_CONFLICT",

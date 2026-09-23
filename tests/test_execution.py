@@ -26,6 +26,7 @@ from frontierwright.service import (
     get_paths_view,
     get_run_view,
     import_local_model,
+    promote_candidate,
     reconcile_training_run,
     repair_run_receipt,
 )
@@ -536,3 +537,62 @@ def test_concurrent_identical_admission_creates_one_active_run(tmp_path: Path) -
     state = Registry(project).read()
     assert len(state.runs) == 1
     assert state.runs[0]["status"] == "RUNNING"
+
+
+def test_completed_run_registers_sealed_managed_artifact(tmp_path: Path) -> None:
+    project, backend_spec = setup_project(tmp_path)
+    plan_id = make_ready_plan(project, backend_spec)
+
+    completed = execute_training_plan(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+        dry_run=False,
+        rerun=False,
+    )
+
+    assert completed.candidate_model_id is not None
+    registry = Registry(project)
+    record = registry.get_sealed_artifact(completed.candidate_model_id)
+    assert record is not None
+
+    model = registry.get_model(completed.candidate_model_id)
+    managed_root = (registry.state_dir / "artifacts").resolve()
+    checkpoint = Path(model.checkpoint).resolve()
+    assert checkpoint.is_relative_to(managed_root)
+    assert checkpoint.exists()
+    assert Path(str(record["manifest_path"])).is_file()
+    assert str(record["model_fingerprint"]) == model.fingerprint
+    assert str(record["run_id"]) == completed.run_id
+
+
+def test_tampered_sealed_candidate_cannot_be_promoted_with_override(
+    tmp_path: Path,
+) -> None:
+    project, backend_spec = setup_project(tmp_path)
+    plan_id = make_ready_plan(project, backend_spec)
+
+    completed = execute_training_plan(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+        dry_run=False,
+        rerun=False,
+    )
+
+    assert completed.candidate_model_id is not None
+    registry = Registry(project)
+    record = registry.get_sealed_artifact(completed.candidate_model_id)
+    assert record is not None
+
+    model_path = Path(str(record["model_path"]))
+    weights = model_path / "model.safetensors"
+    assert weights.is_file()
+    weights.write_bytes(b"tampered-candidate-weights")
+
+    with pytest.raises(FrontierwrightError, match="artifact"):
+        promote_candidate(
+            project,
+            completed.candidate_model_id,
+            allow_unmeasured=True,
+        )

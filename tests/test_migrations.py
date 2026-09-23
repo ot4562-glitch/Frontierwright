@@ -18,6 +18,7 @@ def test_previous_registry_versions_migrate_to_current(
     registry.initialize("NOVA", ModelOrigin.ZERO)
 
     with sqlite3.connect(registry.path) as connection:
+        connection.execute("DROP TABLE sealed_artifacts")
         connection.execute("DROP TABLE runs")
         connection.execute("DROP TABLE calibrations")
         connection.execute("DROP TABLE plans")
@@ -55,7 +56,7 @@ def test_previous_registry_versions_migrate_to_current(
             )
         }
 
-    assert version == SCHEMA_VERSION == 8
+    assert version == SCHEMA_VERSION == 9
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -67,6 +68,7 @@ def test_previous_registry_versions_migrate_to_current(
     assert "calibrations" in tables
     assert "runs" in tables
     assert "run_attempts" in tables
+    assert "sealed_artifacts" in tables
 
 
 def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
@@ -74,6 +76,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
     registry.initialize("NOVA", ModelOrigin.ZERO)
 
     with sqlite3.connect(registry.path) as connection:
+        connection.execute("DROP TABLE sealed_artifacts")
         connection.execute("DROP INDEX IF EXISTS one_running_run_per_plan")
         connection.execute("DROP TABLE run_attempts")
         connection.execute(
@@ -115,7 +118,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 8
+    assert version == SCHEMA_VERSION == 9
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -123,6 +126,7 @@ def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
     registry.initialize("NOVA", ModelOrigin.ZERO)
 
     with sqlite3.connect(registry.path) as connection:
+        connection.execute("DROP TABLE sealed_artifacts")
         connection.execute("DROP INDEX IF EXISTS one_running_run_per_plan")
         connection.execute("DROP TABLE run_attempts")
         connection.execute("DROP TABLE runs")
