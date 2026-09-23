@@ -9,7 +9,11 @@ from frontierwright.domain import ModelOrigin
 from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
-from frontierwright.recipes import BYTE_SHARDS_PLUGIN_ID, TEXT_LINES_PLUGIN_ID
+from frontierwright.recipes import (
+    BYTE_SHARDS_PLUGIN_ID,
+    PREFERENCE_JSONL_PLUGIN_ID,
+    TEXT_LINES_PLUGIN_ID,
+)
 from frontierwright.registry import Registry
 from frontierwright.service import (
     add_local_dataset,
@@ -536,4 +540,180 @@ def test_byte_shards_detects_published_artifact_tampering(tmp_path: Path) -> Non
             dataset_id=str(text["dataset_id"]),
             plugin_id=BYTE_SHARDS_PLUGIN_ID,
             config={"bytes_per_shard": 5},
+        )
+
+
+def test_preference_jsonl_recipe_canonicalizes_dedupes_and_preserves_whitespace(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    Registry(project).initialize("NOVA", ModelOrigin.ZERO)
+
+    source = tmp_path / "preference"
+    source.mkdir()
+    first = {
+        "prompt": " cafe\u0301?",
+        "chosen": " yes",
+        "rejected": " no",
+        "meta": {"source": 1},
+    }
+    duplicate = {
+        "prompt": " café?",
+        "chosen": " yes",
+        "rejected": " no",
+        "meta": {"source": 2},
+    }
+    second = {
+        "prompt": "2+2?",
+        "chosen": " 4",
+        "rejected": " 5",
+    }
+    (source / "a.jsonl").write_text(
+        json.dumps(first, ensure_ascii=False) + "\n\n",
+        encoding="utf-8",
+    )
+    (source / "b.jsonl").write_text(
+        json.dumps(duplicate, ensure_ascii=False)
+        + "\n"
+        + json.dumps(second, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    add_local_dataset(
+        project,
+        source,
+        name="Raw preferences",
+        role=DatasetRole.PREFERENCE,
+    )
+    raw = get_data_view(project).datasets[0]
+
+    first_view = prepare_dataset(
+        project,
+        dataset_id=str(raw["dataset_id"]),
+        plugin_id=PREFERENCE_JSONL_PLUGIN_ID,
+        name="Canonical preferences",
+    )
+    second_view = prepare_dataset(
+        project,
+        dataset_id=str(raw["dataset_id"]),
+        plugin_id=PREFERENCE_JSONL_PLUGIN_ID,
+        name="Ignored duplicate name",
+    )
+
+    assert len(first_view.datasets) == 2
+    assert len(second_view.datasets) == 2
+    prepared = next(item for item in second_view.datasets if item["managed"] is True)
+    assert prepared["role"] == "PREFERENCE"
+    assert prepared["source_dataset_id"] == raw["dataset_id"]
+    assert isinstance(prepared["preparation_recipe_hash"], str)
+
+    data_root = Path(str(prepared["source_path"]))
+    lines = (data_root / "pairs.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    records = [json.loads(line) for line in lines]
+    assert records[0]["prompt"] == " café?"
+    assert records[0]["chosen"] == " yes"
+    assert records[0]["rejected"] == " no"
+    assert records[0]["meta"] == {"source": 1}
+    assert records[1]["chosen"] == " 4"
+
+    recipe_id = str(prepared["preparation_recipe_id"])
+    recipe = Registry(project).get_data_recipe(recipe_id)
+    assert recipe is not None
+    assert recipe["plugin_id"] == PREFERENCE_JSONL_PLUGIN_ID
+    assert recipe["config"] == {
+        "encoding": "utf-8",
+        "unicode_normalization": "NFC",
+        "dedupe": "stable_exact",
+        "output": "pairs.jsonl",
+    }
+
+    manifest = json.loads((data_root.parent / "recipe.json").read_text(encoding="utf-8"))
+    transformation = manifest["transformation"]
+    assert transformation["input_records"] == 3
+    assert transformation["output_records"] == 2
+    assert transformation["blank_lines_removed"] == 1
+    assert transformation["duplicate_pairs_removed"] == 1
+    assert transformation["semantic_whitespace_preserved"] is True
+
+
+def test_preference_jsonl_recipe_rejects_invalid_semantics(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    Registry(project).initialize("NOVA", ModelOrigin.ZERO)
+    source = tmp_path / "preference"
+    source.mkdir()
+    (source / "pairs.jsonl").write_text(
+        json.dumps(
+            {
+                "prompt": "Question:",
+                "chosen": " same",
+                "rejected": " same",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    add_local_dataset(
+        project,
+        source,
+        name="Invalid preference",
+        role=DatasetRole.PREFERENCE,
+    )
+    raw = get_data_view(project).datasets[0]
+
+    with pytest.raises(FrontierwrightError, match="chosen and rejected"):
+        prepare_dataset(
+            project,
+            dataset_id=str(raw["dataset_id"]),
+            plugin_id=PREFERENCE_JSONL_PLUGIN_ID,
+        )
+
+
+def test_preference_recipe_role_compatibility_is_enforced(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    Registry(project).initialize("NOVA", ModelOrigin.ZERO)
+
+    pretrain = make_dataset(tmp_path / "pretrain")
+    add_local_dataset(
+        project,
+        pretrain,
+        name="Pretrain",
+        role=DatasetRole.PRETRAIN,
+    )
+    pretrain_row = get_data_view(project).datasets[0]
+    with pytest.raises(FrontierwrightError, match="requires a PREFERENCE dataset"):
+        prepare_dataset(
+            project,
+            dataset_id=str(pretrain_row["dataset_id"]),
+            plugin_id=PREFERENCE_JSONL_PLUGIN_ID,
+        )
+
+    preference = tmp_path / "preference-ok"
+    preference.mkdir()
+    (preference / "pairs.jsonl").write_text(
+        json.dumps(
+            {
+                "prompt": "Q:",
+                "chosen": " good",
+                "rejected": " bad",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    add_local_dataset(
+        project,
+        preference,
+        name="Preference",
+        role=DatasetRole.PREFERENCE,
+    )
+    preference_row = next(
+        item for item in get_data_view(project).datasets if item["role"] == "PREFERENCE"
+    )
+    with pytest.raises(FrontierwrightError, match="may only use"):
+        prepare_dataset(
+            project,
+            dataset_id=str(preference_row["dataset_id"]),
+            plugin_id=TEXT_LINES_PLUGIN_ID,
         )

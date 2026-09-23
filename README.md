@@ -114,6 +114,7 @@ Implemented now:
 - reproducible DataPreparationPlugin contract with discoverable recipe registry;
 - built-in byte-preserving managed snapshot recipe via `frontierwright data prepare`, preserving source provenance while freezing exact training-input bytes under Frontierwright state;
 - built-in `text-lines-v1` preparation normalizes UTF-8 text, canonicalizes line endings/Unicode, removes empty lines, and performs deterministic stable exact dedupe while recording transformation counts;
+- built-in `preference-jsonl-v1` preparation validates PREFERENCE JSONL records, canonicalizes JSON/Unicode, preserves semantically meaningful field whitespace, stable-dedupes exact prompt/chosen/rejected triples, and emits managed `pairs.jsonl` with transformation evidence;
 - built-in weighted text-mixture preparation composes multiple managed text corpora with exact source fingerprints/parts, conservative metadata/classification propagation, deterministic output, and a hard materialization-size limit;
 - built-in `byte-shards-v1` chained preparation converts managed `corpus.txt` into deterministic uint8 byte-ID shards, records the exact training-unit count, and lets the reference backend reconstruct shard streams without inserting synthetic separators;
 - prepared-source chaining is explicit per plugin: immutable prepared data is never silently reprocessed by a recipe that did not declare support;

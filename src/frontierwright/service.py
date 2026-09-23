@@ -80,6 +80,7 @@ from frontierwright.models import discover_history_evidence, inspect_local_model
 from frontierwright.paths import PathAvailability, PathContext, TrainingPathId
 from frontierwright.recipes import (
     BUILTIN_DATA_PREPARATION_PLUGINS,
+    PREFERENCE_JSONL_PLUGIN_ID,
     SNAPSHOT_COPY_PLUGIN_ID,
     TEXT_LINES_PLUGIN_ID,
     WEIGHTED_TEXT_MIXTURE_PLUGIN_ID,
@@ -2007,6 +2008,26 @@ def prepare_dataset(
             3,
         )
     plugin = data_preparation_plugin(plugin_id)
+    source_role = source.get("role")
+    if plugin_id == PREFERENCE_JSONL_PLUGIN_ID and source_role != DatasetRole.PREFERENCE.value:
+        raise FrontierwrightError(
+            "DATA_RECIPE_ROLE_INCOMPATIBLE",
+            "preference-jsonl requires a PREFERENCE dataset.",
+            12,
+        )
+    if (
+        source_role == DatasetRole.PREFERENCE.value
+        and plugin_id not in {SNAPSHOT_COPY_PLUGIN_ID, PREFERENCE_JSONL_PLUGIN_ID}
+    ):
+        raise FrontierwrightError(
+            "DATA_RECIPE_ROLE_INCOMPATIBLE",
+            (
+                "PREFERENCE datasets may only use snapshot-copy or "
+                "preference-jsonl preparation."
+            ),
+            12,
+        )
+
     source_is_prepared = isinstance(source.get("preparation_recipe_hash"), str)
     if source_is_prepared and not plugin.accepts_prepared_source:
         raise FrontierwrightError(

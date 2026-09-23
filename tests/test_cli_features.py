@@ -86,6 +86,11 @@ def test_data_and_paths_machine_surface(tmp_path: Path) -> None:
             "title": "Normalize and stable-dedupe UTF-8 text lines",
         },
         {
+            "plugin_id": "frontierwright.data.preference-jsonl",
+            "plugin_version": "1",
+            "title": "Validate and canonicalize preference JSONL pairs",
+        },
+        {
             "plugin_id": "frontierwright.data.weighted-text-mixture",
             "plugin_version": "1",
             "title": "Deterministic weighted mixture of managed UTF-8 corpora",

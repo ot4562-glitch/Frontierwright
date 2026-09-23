@@ -19,6 +19,8 @@ SNAPSHOT_COPY_PLUGIN_ID = "frontierwright.data.snapshot-copy"
 SNAPSHOT_COPY_PLUGIN_VERSION = "1"
 TEXT_LINES_PLUGIN_ID = "frontierwright.data.text-lines-normalize-dedupe"
 TEXT_LINES_PLUGIN_VERSION = "1"
+PREFERENCE_JSONL_PLUGIN_ID = "frontierwright.data.preference-jsonl"
+PREFERENCE_JSONL_PLUGIN_VERSION = "1"
 WEIGHTED_TEXT_MIXTURE_PLUGIN_ID = "frontierwright.data.weighted-text-mixture"
 WEIGHTED_TEXT_MIXTURE_PLUGIN_VERSION = "1"
 BYTE_SHARDS_PLUGIN_ID = "frontierwright.data.byte-shards"
@@ -175,6 +177,81 @@ def _text_lines_config(config: dict[str, object] | None) -> dict[str, object]:
         )
     return merged
 
+
+
+
+def _preference_jsonl_config(
+    config: dict[str, object] | None,
+) -> dict[str, object]:
+    defaults: dict[str, object] = {
+        "encoding": "utf-8",
+        "unicode_normalization": "NFC",
+        "dedupe": "stable_exact",
+        "output": "pairs.jsonl",
+    }
+    supplied = dict(config or {})
+    unknown = sorted(set(supplied) - set(defaults))
+    if unknown:
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "preference-jsonl recipe does not support config keys: "
+            + ", ".join(unknown),
+            2,
+        )
+    merged = {**defaults, **supplied}
+    if merged["encoding"] != "utf-8":
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "preference-jsonl v1 supports UTF-8 input only.",
+            2,
+        )
+    normalization = merged["unicode_normalization"]
+    if normalization not in ("NFC", "NFKC", "NFD", "NFKD", "NONE"):
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "unicode_normalization must be NFC, NFKC, NFD, NFKD, or NONE.",
+            2,
+        )
+    if merged["dedupe"] not in ("stable_exact", "none"):
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "dedupe must be stable_exact or none.",
+            2,
+        )
+    if merged["output"] != "pairs.jsonl":
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "preference-jsonl v1 writes the fixed managed output pairs.jsonl.",
+            2,
+        )
+    return merged
+
+
+def make_preference_jsonl_recipe(
+    *,
+    source_dataset_id: str,
+    source_fingerprint: str,
+    config: dict[str, object] | None = None,
+) -> DataPreparationRecipe:
+    canonical_config = _preference_jsonl_config(config)
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "plugin_id": PREFERENCE_JSONL_PLUGIN_ID,
+        "plugin_version": PREFERENCE_JSONL_PLUGIN_VERSION,
+        "source_dataset_id": source_dataset_id,
+        "source_fingerprint": source_fingerprint,
+        "config": canonical_config,
+    }
+    digest = hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+    return DataPreparationRecipe(
+        recipe_id=f"data-recipe-{digest[:32]}",
+        recipe_hash=f"sha256:{digest}",
+        plugin_id=PREFERENCE_JSONL_PLUGIN_ID,
+        plugin_version=PREFERENCE_JSONL_PLUGIN_VERSION,
+        source_dataset_id=source_dataset_id,
+        source_fingerprint=source_fingerprint,
+        config=canonical_config,
+    )
 
 
 def _weighted_text_mixture_config(
@@ -701,6 +778,234 @@ def materialize_text_lines_recipe(
             shutil.rmtree(staging_root, ignore_errors=True)
         raise
 
+
+
+
+def _preference_source_files(source: DatasetDescriptor) -> tuple[Path, ...]:
+    paths = tuple(
+        path
+        for path in _text_source_files(source)
+        if path.suffix.lower() == ".jsonl"
+    )
+    if not paths:
+        raise FrontierwrightError(
+            "DATA_PREP_PREFERENCE_FORMAT",
+            "preference-jsonl requires at least one .jsonl source file.",
+            13,
+        )
+    return paths
+
+
+def _transform_preference_jsonl(
+    source: DatasetDescriptor,
+    config: dict[str, object],
+) -> tuple[bytes, dict[str, object]]:
+    normalization = str(config["unicode_normalization"])
+    dedupe = str(config["dedupe"])
+    source_files = _preference_source_files(source)
+
+    output_lines: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    input_records = 0
+    blank_lines_removed = 0
+    duplicates_removed = 0
+
+    for path in source_files:
+        for line_number, raw_line in enumerate(_read_text_lines(path), start=1):
+            if not raw_line.strip():
+                blank_lines_removed += 1
+                continue
+            input_records += 1
+            try:
+                raw = json.loads(raw_line)
+            except json.JSONDecodeError as exc:
+                raise FrontierwrightError(
+                    "DATA_PREP_PREFERENCE_JSON",
+                    f"Invalid preference JSON: {path.name}:{line_number}",
+                    13,
+                ) from exc
+            if not isinstance(raw, dict):
+                raise FrontierwrightError(
+                    "DATA_PREP_PREFERENCE_JSON",
+                    f"Preference record must be an object: {path.name}:{line_number}",
+                    13,
+                )
+
+            normalized = dict(raw)
+            semantic: list[str] = []
+            for key in ("prompt", "chosen", "rejected"):
+                value = raw.get(key)
+                if not isinstance(value, str) or value == "":
+                    raise FrontierwrightError(
+                        "DATA_PREP_PREFERENCE_SCHEMA",
+                        (
+                            f"Preference field {key} must be a nonempty string: "
+                            f"{path.name}:{line_number}"
+                        ),
+                        13,
+                    )
+                if normalization == "NFC":
+                    value = unicodedata.normalize("NFC", value)
+                elif normalization == "NFKC":
+                    value = unicodedata.normalize("NFKC", value)
+                elif normalization == "NFD":
+                    value = unicodedata.normalize("NFD", value)
+                elif normalization == "NFKD":
+                    value = unicodedata.normalize("NFKD", value)
+                normalized[key] = value
+                semantic.append(value)
+
+            if semantic[1] == semantic[2]:
+                raise FrontierwrightError(
+                    "DATA_PREP_PREFERENCE_SCHEMA",
+                    (
+                        "Preference chosen and rejected responses must differ: "
+                        f"{path.name}:{line_number}"
+                    ),
+                    13,
+                )
+
+            semantic_key = (semantic[0], semantic[1], semantic[2])
+            if dedupe == "stable_exact":
+                if semantic_key in seen:
+                    duplicates_removed += 1
+                    continue
+                seen.add(semantic_key)
+
+            try:
+                canonical = json.dumps(
+                    normalized,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise FrontierwrightError(
+                    "DATA_PREP_PREFERENCE_JSON",
+                    (
+                        "Preference record contains unsupported JSON values: "
+                        f"{path.name}:{line_number}"
+                    ),
+                    13,
+                ) from exc
+            output_lines.append(canonical)
+
+    if not output_lines:
+        raise FrontierwrightError(
+            "DATA_PREP_PREFERENCE_EMPTY",
+            "Preference preparation produced no usable records.",
+            13,
+        )
+
+    payload = "\n".join(output_lines) + "\n"
+    encoded = payload.encode("utf-8")
+    transformation: dict[str, object] = {
+        "input_files": len(source_files),
+        "input_records": input_records,
+        "output_records": len(output_lines),
+        "blank_lines_removed": blank_lines_removed,
+        "duplicate_pairs_removed": duplicates_removed,
+        "output_bytes": len(encoded),
+        "semantic_whitespace_preserved": True,
+    }
+    return encoded, transformation
+
+
+def materialize_preference_jsonl_recipe(
+    state_dir: Path,
+    *,
+    source: DatasetDescriptor,
+    recipe: DataPreparationRecipe,
+) -> DatasetDescriptor:
+    """Validate and canonicalize preference pairs without stripping field whitespace."""
+
+    if source.fingerprint != recipe.source_fingerprint:
+        raise FrontierwrightError(
+            "DATA_RECIPE_SOURCE_DRIFT",
+            "Dataset content no longer matches the fingerprint pinned by the recipe.",
+            13,
+        )
+    if recipe.plugin_id != PREFERENCE_JSONL_PLUGIN_ID:
+        raise FrontierwrightError(
+            "DATA_RECIPE_PLUGIN_MISMATCH",
+            "Preference materializer received a recipe for a different plugin.",
+            13,
+        )
+
+    config = _preference_jsonl_config(recipe.config)
+    prepared_root = state_dir.resolve() / "data" / "prepared" / recipe.recipe_id
+    data_root = prepared_root / "data"
+    manifest_path = prepared_root / "recipe.json"
+
+    if prepared_root.exists():
+        if not manifest_path.is_file() or not data_root.is_dir():
+            raise FrontierwrightError(
+                "DATA_PREP_ARTIFACT_INVALID",
+                "Existing prepared preference artifact is incomplete.",
+                13,
+            )
+        prepared = inspect_local_dataset(data_root)
+        manifest = _load_prepared_manifest(manifest_path)
+        if manifest.get("recipe_hash") != recipe.recipe_hash:
+            raise FrontierwrightError(
+                "DATA_PREP_MANIFEST_INVALID",
+                "Prepared preference artifact has the wrong recipe hash.",
+                13,
+            )
+        if manifest.get("prepared_fingerprint") != prepared.fingerprint:
+            raise FrontierwrightError(
+                "DATA_PREP_ARTIFACT_TAMPERED",
+                "Prepared preference dataset no longer matches its recorded fingerprint.",
+                13,
+            )
+        return prepared
+
+    staging_parent = state_dir.resolve() / "data" / ".staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f"{recipe.recipe_id}-", dir=staging_parent)
+    ).resolve()
+
+    try:
+        staging_data = staging_root / "data"
+        staging_data.mkdir(parents=True, exist_ok=False)
+        output_bytes, transformation = _transform_preference_jsonl(source, config)
+        output_path = staging_data / str(config["output"])
+        output_path.write_bytes(output_bytes)
+        prepared = inspect_local_dataset(staging_data)
+        _write_recipe_manifest(
+            staging_root / "recipe.json",
+            recipe,
+            prepared,
+            transformation=transformation,
+        )
+
+        prepared_root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(staging_root, prepared_root)
+        except FileExistsError:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+        final = inspect_local_dataset(data_root)
+        manifest = _load_prepared_manifest(manifest_path)
+        if manifest.get("recipe_hash") != recipe.recipe_hash:
+            raise FrontierwrightError(
+                "DATA_PREP_MANIFEST_INVALID",
+                "Published preference preparation has the wrong recipe hash.",
+                13,
+            )
+        if manifest.get("prepared_fingerprint") != final.fingerprint:
+            raise FrontierwrightError(
+                "DATA_PREP_COPY_MISMATCH",
+                "Published preference preparation differs from its recorded fingerprint.",
+                13,
+            )
+        return final
+    except Exception:
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+        raise
 
 
 def _mixture_source_bindings(
@@ -1297,6 +1602,52 @@ class TextLinesPreparationPlugin:
 
 
 @dataclass(frozen=True)
+class PreferenceJsonlPreparationPlugin:
+    plugin_id: str = PREFERENCE_JSONL_PLUGIN_ID
+    plugin_version: str = PREFERENCE_JSONL_PLUGIN_VERSION
+    title: str = "Validate and canonicalize preference JSONL pairs"
+    accepts_prepared_source: bool = True
+    requires_prepared_source: bool = False
+
+    def build_recipe(
+        self,
+        *,
+        source_dataset_id: str,
+        source_fingerprint: str,
+        config: dict[str, object] | None = None,
+    ) -> DataPreparationRecipe:
+        return make_preference_jsonl_recipe(
+            source_dataset_id=source_dataset_id,
+            source_fingerprint=source_fingerprint,
+            config=config,
+        )
+
+    def source_bindings(
+        self,
+        recipe: DataPreparationRecipe,
+    ) -> tuple[DataSourceBinding, ...]:
+        return (
+            DataSourceBinding(
+                dataset_id=recipe.source_dataset_id,
+                fingerprint=recipe.source_fingerprint,
+            ),
+        )
+
+    def materialize(
+        self,
+        state_dir: Path,
+        *,
+        sources: dict[str, DatasetDescriptor],
+        recipe: DataPreparationRecipe,
+    ) -> DatasetDescriptor:
+        return materialize_preference_jsonl_recipe(
+            state_dir,
+            source=sources[recipe.source_dataset_id],
+            recipe=recipe,
+        )
+
+
+@dataclass(frozen=True)
 class WeightedTextMixturePreparationPlugin:
     plugin_id: str = WEIGHTED_TEXT_MIXTURE_PLUGIN_ID
     plugin_version: str = WEIGHTED_TEXT_MIXTURE_PLUGIN_VERSION
@@ -1393,6 +1744,7 @@ class ByteShardsPreparationPlugin:
 BUILTIN_DATA_PREPARATION_PLUGINS: tuple[DataPreparationPlugin, ...] = (
     SnapshotCopyPreparationPlugin(),
     TextLinesPreparationPlugin(),
+    PreferenceJsonlPreparationPlugin(),
     WeightedTextMixturePreparationPlugin(),
     ByteShardsPreparationPlugin(),
 )

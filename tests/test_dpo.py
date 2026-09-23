@@ -5,10 +5,12 @@ from frontierwright.data import DatasetRole
 from frontierwright.domain import ModelOrigin
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
+from frontierwright.recipes import PREFERENCE_JSONL_PLUGIN_ID
 from frontierwright.service import (
     add_local_dataset,
     create_training_plan,
     import_local_model,
+    prepare_dataset,
 )
 
 
@@ -60,13 +62,22 @@ def test_dpo_plan_pins_preference_dataset_and_align_intervention(
         name="Preference pairs",
         role=DatasetRole.PREFERENCE,
     )
-    dataset_id = str(data_view.datasets[0]["dataset_id"])
+    raw_dataset_id = str(data_view.datasets[0]["dataset_id"])
+    prepared_view = prepare_dataset(
+        project,
+        dataset_id=raw_dataset_id,
+        plugin_id=PREFERENCE_JSONL_PLUGIN_ID,
+        name="Canonical preference pairs",
+    )
+    prepared = next(
+        item for item in prepared_view.datasets if item["managed"] is True
+    )
 
     view = create_training_plan(
         project,
         path_id=TrainingPathId.DPO,
         backend_spec_path=backend_spec(tmp_path / "backend.json"),
-        dataset_id=dataset_id,
+        dataset_id=None,
         permission=PermissionLevel.EXECUTE_SINGLE,
         budgets=HardBudgets(max_runs=1),
         config={"dpo_beta": 0.1},
@@ -75,7 +86,9 @@ def test_dpo_plan_pins_preference_dataset_and_align_intervention(
     assert view.path_id == "DPO"
     assert view.intervention_id == "frontierwright.align.dpo"
     assert view.intervention_family == "ALIGN"
-    assert view.dataset_id == dataset_id
+    assert view.dataset_id == prepared["dataset_id"]
+    assert view.dataset_recipe_id == prepared["preparation_recipe_id"]
+    assert view.dataset_recipe_hash == prepared["preparation_recipe_hash"]
     assert view.config == {"dpo_beta": 0.1}
     assert view.ready is False
     assert "representative calibration required" in view.blockers

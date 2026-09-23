@@ -20,6 +20,7 @@ from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import (
     BYTE_SHARDS_PLUGIN_ID,
+    PREFERENCE_JSONL_PLUGIN_ID,
     SNAPSHOT_COPY_PLUGIN_ID,
     TEXT_LINES_PLUGIN_ID,
 )
@@ -1440,6 +1441,7 @@ def data_prepare(
             help=(
                 "Preparation plugin ID. Aliases: snapshot-copy-v1 for a byte-preserving "
                 "snapshot; text-lines-v1 for UTF-8 normalization and stable exact dedupe; "
+                "preference-jsonl-v1 for canonical preference pairs; "
                 "byte-shards-v1 for deterministic uint8 byte-ID shards."
             ),
         ),
@@ -1459,6 +1461,7 @@ def data_prepare(
     aliases = {
         "snapshot-copy-v1": SNAPSHOT_COPY_PLUGIN_ID,
         "text-lines-v1": TEXT_LINES_PLUGIN_ID,
+        "preference-jsonl-v1": PREFERENCE_JSONL_PLUGIN_ID,
         "byte-shards-v1": BYTE_SHARDS_PLUGIN_ID,
     }
     plugin_id = aliases.get(recipe, recipe)
