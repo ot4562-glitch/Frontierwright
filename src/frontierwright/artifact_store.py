@@ -126,6 +126,8 @@ def _manifest_payload(
         "dataset_recipe_hash": plan.dataset_recipe_hash,
         "backend_id": plan.backend_id,
         "backend_spec_hash": plan.backend_spec_hash,
+        "backend_adapter_ref": plan.backend_adapter_ref,
+        "backend_adapter_hash": plan.backend_adapter_hash,
         "effective_config": plan.config,
         "model_relpath": model_relpath,
         "model_format": descriptor.model_format.value,

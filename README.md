@@ -82,7 +82,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v15, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, and dataset/backend data-boundary policy;
+- automatic registry migration through schema v16, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, and Lab adapter manifests;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
@@ -107,6 +107,10 @@ Implemented now:
 - backend specs declare a pinned data boundary: `LOCAL_MACHINE / CONTROLLED_PRIVATE / EXTERNAL / UNKNOWN`; non-public data is hard-blocked from `EXTERNAL` and `UNKNOWN` boundaries;
 - plan identity pins both dataset classification and backend boundary, and re-checks classification drift before calibration/execution;
 - legacy backend specs without a boundary remain hash-compatible and are interpreted as `LOCAL_MACHINE`; new explicit boundary declarations participate in the backend-spec hash;
+- Lab adapter manifests declare adapter ID/version, trainer/executor/data/evaluator/artifact-store kinds, network scope, capabilities, and data boundary without storing credentials;
+- `frontierwright lab adapters connect/list/disconnect` provides a stable machine/human surface for private adapter registration;
+- `CONTROLLED_PRIVATE` backends must bind a connected Lab adapter; plans pin both adapter ref and immutable manifest hash, and disconnect/drift makes an existing plan stale before calibration or execution;
+- adapter ref/hash evidence is propagated into plan identity, durable execution requests, and sealed candidate manifests;
 - reproducible DataPreparationPlugin contract with discoverable recipe registry;
 - built-in byte-preserving managed snapshot recipe via `frontierwright data prepare`, preserving source provenance while freezing exact training-input bytes under Frontierwright state;
 - prepared datasets retain source-dataset ID plus recipe ID/hash, and training plans pin the recipe hash in addition to dataset bytes;
@@ -128,7 +132,7 @@ Implemented now:
 - training creates a `PENDING` candidate and never silently changes the champion;
 - candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
 - promotion re-checks current champion/build/evaluation state transactionally, enforces frozen-scale build floors by default, and records explicit override evidence when a user intentionally accepts an unmeasured or build-violating candidate;
-- stable JSON/non-interactive machine surfaces for project/model/birth/resource/build/stats/data/path/plan/run/candidate operations;
+- stable JSON/non-interactive machine surfaces for project/model/birth/resource/build/stats/data/path/plan/run/candidate/Lab-adapter operations;
 - mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;
 - English/Korean human-string structure;
 - automated domain, migration, evaluation, execution recovery/idempotency, artifact integrity, candidate, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.

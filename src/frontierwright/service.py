@@ -55,6 +55,7 @@ from frontierwright.interventions import (
     intervention_for_training_path,
     intervention_plugins,
 )
+from frontierwright.lab_adapters import LabAdapterKind, load_lab_adapter_manifest
 from frontierwright.local_executor import (
     LocalAttemptSpec,
     atomic_write_json,
@@ -211,6 +212,15 @@ class InterventionsView:
 
 
 @dataclass(frozen=True)
+class LabAdaptersView:
+    schema_version: int = 1
+    adapters: list[dict[str, object]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class PlanView:
     schema_version: int = 1
     plan_id: str | None = None
@@ -226,6 +236,8 @@ class PlanView:
     dataset_recipe_hash: str | None = None
     dataset_classification: str | None = None
     backend_data_boundary: str | None = None
+    backend_adapter_ref: str | None = None
+    backend_adapter_hash: str | None = None
     resource_profile_id: str | None = None
     permission: str | None = None
     budgets: dict[str, object] = field(default_factory=dict)
@@ -380,6 +392,68 @@ def set_project_edition(root: Path, edition: EditionProfile) -> StatusView:
     registry.set_edition_profile(edition)
     return get_status(root)
 
+
+
+def get_lab_adapters(root: Path) -> LabAdaptersView:
+    registry = Registry(root)
+    if not registry.exists:
+        return LabAdaptersView()
+
+    adapters = []
+    for item in registry.list_lab_adapters():
+        adapters.append(
+            {
+                "adapter_ref": item["adapter_ref"],
+                "adapter_id": item["adapter_id"],
+                "adapter_version": item["adapter_version"],
+                "display_name": item["display_name"],
+                "manifest_hash": item["manifest_hash"],
+                "source_path": item["source_path"],
+                "data_boundary": item["data_boundary"],
+                "network_scope": item["network_scope"],
+                "kinds": item["kinds"],
+                "capabilities": item["capabilities"],
+                "connected_at": item["connected_at"],
+            }
+        )
+    return LabAdaptersView(adapters=adapters)
+
+
+def connect_lab_adapter(root: Path, manifest_path: Path) -> LabAdaptersView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before connecting a Lab adapter.",
+            10,
+        )
+
+    state = registry.read()
+    if EditionProfile(state.project["edition_profile"]) is not EditionProfile.LAB:
+        raise FrontierwrightError(
+            "LAB_EDITION_REQUIRED",
+            "Private infrastructure adapters can only be connected in Frontierwright Lab.",
+            12,
+        )
+
+    manifest = load_lab_adapter_manifest(manifest_path.expanduser().resolve())
+    registry.register_lab_adapter(
+        manifest,
+        source_path=manifest_path.expanduser().resolve(),
+    )
+    return get_lab_adapters(root)
+
+
+def disconnect_lab_adapter(root: Path, adapter_ref: str) -> LabAdaptersView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before disconnecting a Lab adapter.",
+            10,
+        )
+    registry.disconnect_lab_adapter(adapter_ref)
+    return get_lab_adapters(root)
 
 
 def get_birth_view(root: Path) -> BirthView:
@@ -1227,6 +1301,7 @@ def _find_dataset(
 
 
 def _plan_input_blockers(
+    registry: Registry,
     state: ProjectState,
     plan: TrainingPlan,
 ) -> list[str]:
@@ -1297,6 +1372,8 @@ def _plan_input_blockers(
             blockers.append(
                 "data policy blocks this dataset classification from the pinned backend"
             )
+
+    blockers.extend(_lab_adapter_blockers(registry, plan))
 
     if plan.resource_profile_id is not None:
         profile = project_state.resource_profile
@@ -1387,12 +1464,91 @@ def _calibration_budget_blockers(
     return blockers
 
 
+def _resolve_backend_adapter(
+    registry: Registry,
+    state: ProjectState,
+    backend: CommandBackendSpec,
+) -> tuple[str | None, str | None]:
+    adapter_ref = backend.provider_adapter_ref
+    if adapter_ref is None:
+        if backend.data_boundary is BackendDataBoundary.CONTROLLED_PRIVATE:
+            raise FrontierwrightError(
+                "LAB_ADAPTER_REQUIRED",
+                "CONTROLLED_PRIVATE backends must be bound to a connected Lab adapter.",
+                12,
+            )
+        return None, None
+
+    if EditionProfile(state.project["edition_profile"]) is not EditionProfile.LAB:
+        raise FrontierwrightError(
+            "LAB_EDITION_REQUIRED",
+            "Backends bound to Lab adapters require the Frontierwright Lab profile.",
+            12,
+        )
+
+    adapter = registry.get_lab_adapter(adapter_ref)
+    if adapter is None:
+        raise FrontierwrightError(
+            "LAB_ADAPTER_NOT_CONNECTED",
+            f"Backend references an unconnected Lab adapter: {adapter_ref}",
+            12,
+        )
+    kinds = set(adapter.get("kinds", []))
+    if not {
+        LabAdapterKind.TRAINER.value,
+        LabAdapterKind.EXECUTOR.value,
+    }.intersection(kinds):
+        raise FrontierwrightError(
+            "LAB_ADAPTER_KIND_UNSUPPORTED",
+            "Backend provider adapter must declare TRAINER or EXECUTOR capability.",
+            12,
+        )
+    if adapter.get("data_boundary") != backend.data_boundary.value:
+        raise FrontierwrightError(
+            "LAB_ADAPTER_BOUNDARY_MISMATCH",
+            "Backend data boundary differs from its connected Lab adapter manifest.",
+            12,
+        )
+    manifest_hash = adapter.get("manifest_hash")
+    if not isinstance(manifest_hash, str):
+        raise FrontierwrightError(
+            "LAB_ADAPTER_INVALID",
+            "Connected Lab adapter lacks a manifest hash.",
+            4,
+        )
+    return adapter_ref, manifest_hash
+
+
+def _lab_adapter_blockers(registry: Registry, plan: TrainingPlan) -> list[str]:
+    if plan.backend_adapter_ref is None:
+        if plan.backend_data_boundary == BackendDataBoundary.CONTROLLED_PRIVATE.value:
+            return ["controlled-private backend has no pinned Lab adapter"]
+        return []
+    if plan.backend_adapter_hash is None:
+        return ["plan lacks pinned Lab adapter manifest hash"]
+
+    adapter = registry.get_lab_adapter(plan.backend_adapter_ref)
+    if adapter is None:
+        return ["pinned Lab adapter is not connected"]
+    if adapter.get("manifest_hash") != plan.backend_adapter_hash:
+        return ["pinned Lab adapter manifest hash changed"]
+    if adapter.get("data_boundary") != plan.backend_data_boundary:
+        return ["pinned Lab adapter data boundary changed"]
+    kinds = set(adapter.get("kinds", []))
+    if not {
+        LabAdapterKind.TRAINER.value,
+        LabAdapterKind.EXECUTOR.value,
+    }.intersection(kinds):
+        return ["pinned Lab adapter no longer provides trainer/executor capability"]
+    return []
+
+
 def get_plan_view(root: Path, plan_id: str) -> PlanView:
     registry = Registry(root)
     plan = registry.get_plan(plan_id)
     state = registry.read()
     calibration = registry.latest_calibration_for_plan(plan.plan_id)
-    blockers = _plan_input_blockers(state, plan)
+    blockers = _plan_input_blockers(registry, state, plan)
     blockers.extend(
         _calibration_budget_blockers(plan, calibration, state.resource_profile)
     )
@@ -1410,6 +1566,8 @@ def get_plan_view(root: Path, plan_id: str) -> PlanView:
         dataset_recipe_hash=plan.dataset_recipe_hash,
         dataset_classification=plan.dataset_classification,
         backend_data_boundary=plan.backend_data_boundary,
+        backend_adapter_ref=plan.backend_adapter_ref,
+        backend_adapter_hash=plan.backend_adapter_hash,
         resource_profile_id=plan.resource_profile_id,
         permission=plan.permission.name,
         budgets=plan.budgets.to_dict(),
@@ -1486,6 +1644,12 @@ def create_training_plan(
             12,
         )
 
+    backend_adapter_ref, backend_adapter_hash = _resolve_backend_adapter(
+        registry,
+        state,
+        backend,
+    )
+
     try:
         key = compute_plan_idempotency_key(
             path_id=path_id,
@@ -1512,6 +1676,8 @@ def create_training_plan(
             config=config,
             dataset_classification=dataset_classification.value,
             backend_data_boundary=backend.data_boundary.value,
+            backend_adapter_ref=backend_adapter_ref,
+            backend_adapter_hash=backend_adapter_hash,
         )
     except (TypeError, ValueError) as exc:
         raise FrontierwrightError(
@@ -1558,6 +1724,8 @@ def create_training_plan(
         ),
         dataset_classification=dataset_classification.value,
         backend_data_boundary=backend.data_boundary.value,
+        backend_adapter_ref=backend_adapter_ref,
+        backend_adapter_hash=backend_adapter_hash,
         resource_profile_id=(
             str(state.resource_profile["profile_id"])
             if state.resource_profile is not None
@@ -1593,6 +1761,12 @@ def _validate_backend_for_plan(
             "Backend spec content changed after plan creation.",
             13,
         )
+    if backend.provider_adapter_ref != plan.backend_adapter_ref:
+        raise FrontierwrightError(
+            "BACKEND_ADAPTER_DRIFT",
+            "Backend provider adapter differs from the adapter pinned by the plan.",
+            13,
+        )
     if plan.path_id not in backend.supported_paths:
         raise FrontierwrightError(
             "BACKEND_PATH_UNSUPPORTED",
@@ -1618,7 +1792,7 @@ def calibrate_training_plan(
             13,
         )
     state = registry.read()
-    blockers = _plan_input_blockers(state, plan)
+    blockers = _plan_input_blockers(registry, state, plan)
     if blockers:
         raise FrontierwrightError(
             "PLAN_INPUT_STALE",
@@ -1982,7 +2156,7 @@ def execute_training_plan(
         )
 
     state = registry.read()
-    input_blockers = _plan_input_blockers(state, plan)
+    input_blockers = _plan_input_blockers(registry, state, plan)
     if input_blockers:
         raise FrontierwrightError(
             "PLAN_INPUT_STALE",

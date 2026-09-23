@@ -92,6 +92,7 @@ class CommandBackendSpec:
     environment: dict[str, str]
     data_boundary: BackendDataBoundary = BackendDataBoundary.LOCAL_MACHINE
     data_boundary_explicit: bool = True
+    provider_adapter_ref: str | None = None
 
     def __post_init__(self) -> None:
         if not self.backend_id.strip():
@@ -108,6 +109,11 @@ class CommandBackendSpec:
         for key, value in self.environment.items():
             if not key or "\x00" in key or "\x00" in value:
                 raise ValueError("backend environment entries must be NUL-free")
+        if self.provider_adapter_ref is not None and (
+            not self.provider_adapter_ref.strip()
+            or "\x00" in self.provider_adapter_ref
+        ):
+            raise ValueError("provider_adapter_ref must be nonempty and NUL-free")
 
     def canonical_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -119,6 +125,8 @@ class CommandBackendSpec:
         }
         if self.data_boundary_explicit:
             payload["data_boundary"] = self.data_boundary.value
+        if self.provider_adapter_ref is not None:
+            payload["provider_adapter_ref"] = self.provider_adapter_ref
         return payload
 
     @property
@@ -156,6 +164,8 @@ class TrainingPlan:
     idempotency_key: str
     dataset_classification: str = DatasetClassification.PRIVATE.value
     backend_data_boundary: str = BackendDataBoundary.LOCAL_MACHINE.value
+    backend_adapter_ref: str | None = None
+    backend_adapter_hash: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -168,6 +178,19 @@ class TrainingPlan:
                 raise ValueError(f"{name} must be nonempty")
         DatasetClassification(self.dataset_classification)
         BackendDataBoundary(self.backend_data_boundary)
+        if self.backend_adapter_ref is not None and (
+            not self.backend_adapter_ref.strip() or "\x00" in self.backend_adapter_ref
+        ):
+            raise ValueError("backend_adapter_ref must be nonempty and NUL-free")
+        if self.backend_adapter_hash is not None and (
+            not self.backend_adapter_hash.startswith("sha256:")
+            or len(self.backend_adapter_hash) != 71
+        ):
+            raise ValueError("backend_adapter_hash must be a sha256: digest")
+        if (self.backend_adapter_ref is None) != (self.backend_adapter_hash is None):
+            raise ValueError(
+                "backend_adapter_ref and backend_adapter_hash must be supplied together"
+            )
 
     def request_payload(self) -> dict[str, object]:
         return {
@@ -189,6 +212,8 @@ class TrainingPlan:
             "dataset_recipe_hash": self.dataset_recipe_hash,
             "dataset_classification": self.dataset_classification,
             "backend_data_boundary": self.backend_data_boundary,
+            "backend_adapter_ref": self.backend_adapter_ref,
+            "backend_adapter_hash": self.backend_adapter_hash,
             "resource_profile_id": self.resource_profile_id,
             "permission": self.permission.name,
             "budgets": self.budgets.to_dict(),
@@ -278,6 +303,12 @@ def load_command_backend_spec(path: Path) -> CommandBackendSpec:
             "data_boundary",
             BackendDataBoundary.LOCAL_MACHINE.value,
         )
+        provider_adapter_ref_raw = raw.get("provider_adapter_ref")
+        if provider_adapter_ref_raw is not None and not isinstance(
+            provider_adapter_ref_raw,
+            str,
+        ):
+            raise ValueError("provider_adapter_ref must be a string when supplied")
         if not isinstance(supported_raw, list):
             raise ValueError("supported_paths must be a list")
         if not isinstance(calibrate_raw, list) or not all(
@@ -301,6 +332,7 @@ def load_command_backend_spec(path: Path) -> CommandBackendSpec:
             environment=dict(environment_raw),
             data_boundary=BackendDataBoundary(str(data_boundary_raw)),
             data_boundary_explicit="data_boundary" in raw,
+            provider_adapter_ref=provider_adapter_ref_raw,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise FrontierwrightError(
@@ -347,9 +379,20 @@ def compute_plan_idempotency_key(
     config: dict[str, object],
     dataset_classification: str = DatasetClassification.PRIVATE.value,
     backend_data_boundary: str = BackendDataBoundary.LOCAL_MACHINE.value,
+    backend_adapter_ref: str | None = None,
+    backend_adapter_hash: str | None = None,
 ) -> str:
     DatasetClassification(dataset_classification)
     BackendDataBoundary(backend_data_boundary)
+    if (backend_adapter_ref is None) != (backend_adapter_hash is None):
+        raise ValueError(
+            "backend_adapter_ref and backend_adapter_hash must be supplied together"
+        )
+    if backend_adapter_hash is not None and (
+        not backend_adapter_hash.startswith("sha256:")
+        or len(backend_adapter_hash) != 71
+    ):
+        raise ValueError("backend_adapter_hash must be a sha256: digest")
     payload = {
         "path_id": path_id.value,
         "intervention_id": intervention_id,
@@ -361,6 +404,8 @@ def compute_plan_idempotency_key(
         "dataset_recipe_hash": dataset_recipe_hash,
         "dataset_classification": dataset_classification,
         "backend_data_boundary": backend_data_boundary,
+        "backend_adapter_ref": backend_adapter_ref,
+        "backend_adapter_hash": backend_adapter_hash,
         "resource_profile_id": resource_profile_id,
         "permission": permission.name,
         "budgets": budgets.to_dict(),

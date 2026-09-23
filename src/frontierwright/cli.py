@@ -28,6 +28,7 @@ from frontierwright.service import (
     DataView,
     HistoryView,
     InterventionsView,
+    LabAdaptersView,
     PathsView,
     PlanView,
     ResourceView,
@@ -38,8 +39,10 @@ from frontierwright.service import (
     birth_zero_model,
     calibrate_training_plan,
     compare_candidate,
+    connect_lab_adapter,
     create_training_plan,
     detect_resources,
+    disconnect_lab_adapter,
     execute_training_plan,
     get_birth_view,
     get_build_view,
@@ -48,6 +51,7 @@ from frontierwright.service import (
     get_data_view,
     get_history_view,
     get_interventions_view,
+    get_lab_adapters,
     get_paths_view,
     get_plan_view,
     get_resource_view,
@@ -79,6 +83,9 @@ data_app = typer.Typer(help="Register and inspect user/lab datasets.")
 plan_app = typer.Typer(help="Create and inspect pinned training plans.")
 backend_app = typer.Typer(help="Inspect and configure training backends.")
 birth_app = typer.Typer(help="Materialize and inspect zero-model birth state.")
+lab_app = typer.Typer(help="Connect and inspect controlled private Lab infrastructure.")
+lab_adapters_app = typer.Typer(help="Manage Lab adapter manifests.")
+lab_app.add_typer(lab_adapters_app, name="adapters")
 app.add_typer(project_app, name="project")
 app.add_typer(resources_app, name="resources")
 app.add_typer(build_app, name="build")
@@ -87,6 +94,7 @@ app.add_typer(data_app, name="data")
 app.add_typer(plan_app, name="plan")
 app.add_typer(backend_app, name="backend")
 app.add_typer(birth_app, name="birth")
+app.add_typer(lab_app, name="lab")
 
 console = Console()
 
@@ -146,6 +154,10 @@ def _paths_payload(view: PathsView) -> dict[str, object]:
 
 
 def _interventions_payload(view: InterventionsView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _lab_adapters_payload(view: LabAdaptersView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -341,6 +353,22 @@ def _print_paths(view: PathsView) -> None:
         console.print(view.recommendation_reason)
 
 
+def _print_lab_adapters(view: LabAdaptersView) -> None:
+    if not view.adapters:
+        console.print("No connected Lab adapters.")
+        return
+    console.print("[bold]LAB ADAPTERS[/bold]")
+    for item in view.adapters:
+        console.print(
+            f"{item.get('adapter_ref')} · {item.get('display_name')} · "
+            f"{item.get('data_boundary')} · {item.get('network_scope')}"
+        )
+        kinds = item.get("kinds")
+        kind_values = kinds if isinstance(kinds, list) else []
+        console.print(f"  Kinds: {', '.join(str(value) for value in kind_values)}")
+        console.print(f"  Manifest: {item.get('manifest_hash')}")
+
+
 def _print_plan(view: PlanView) -> None:
     console.print(f"[bold]PLAN[/bold] · {view.plan_id}")
     console.print(f"Path: {view.path_id}")
@@ -355,6 +383,11 @@ def _print_plan(view: PlanView) -> None:
         f"Data policy: {view.dataset_classification or 'UNKNOWN'} -> "
         f"{view.backend_data_boundary or 'UNKNOWN'}"
     )
+    if view.backend_adapter_ref:
+        console.print(
+            f"Lab adapter: {view.backend_adapter_ref} · "
+            f"{view.backend_adapter_hash or 'UNPINNED'}"
+        )
     console.print(f"Resource profile: {view.resource_profile_id or 'UNPINNED'}")
     console.print(f"Ready: {'YES' if view.ready else 'NO'}")
     if view.calibration:
@@ -650,6 +683,73 @@ def project_edition(
         console.print(view.edition_tagline)
     if view.edition_starting_point:
         console.print(f"Starting point: {view.edition_starting_point}")
+
+
+@lab_adapters_app.command("list")
+def lab_adapters_list(
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = get_lab_adapters(path)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_lab_adapters_payload(view))
+        return
+    _print_lab_adapters(view)
+
+
+@lab_adapters_app.command("connect")
+def lab_adapters_connect(
+    manifest: Annotated[Path, typer.Argument(help="Lab adapter manifest JSON.")],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = connect_lab_adapter(path, manifest)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_lab_adapters_payload(view))
+        return
+    _print_lab_adapters(view)
+
+
+@lab_adapters_app.command("disconnect")
+def lab_adapters_disconnect(
+    adapter_ref: Annotated[str, typer.Argument(help="Adapter ref, e.g. id@version.")],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = disconnect_lab_adapter(path, adapter_ref)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_lab_adapters_payload(view))
+        return
+    _print_lab_adapters(view)
 
 
 @birth_app.command("show")

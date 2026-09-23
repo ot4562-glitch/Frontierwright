@@ -46,12 +46,13 @@ from frontierwright.execution import (
     RunStatus,
     TrainingPlan,
 )
+from frontierwright.lab_adapters import LabAdapterManifest
 from frontierwright.models import HistoryEvidenceResult, ImportedModelDescriptor
 from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import DataPreparationRecipe
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -195,6 +196,8 @@ CREATE TABLE plans (
     dataset_recipe_hash TEXT,
     dataset_classification TEXT NOT NULL DEFAULT 'PRIVATE',
     backend_data_boundary TEXT NOT NULL DEFAULT 'LOCAL_MACHINE',
+    backend_adapter_ref TEXT,
+    backend_adapter_hash TEXT,
     resource_profile_id TEXT,
     permission TEXT NOT NULL,
     budgets_json TEXT NOT NULL,
@@ -263,6 +266,21 @@ CREATE TABLE model_births (
     backend_id TEXT NOT NULL,
     runtime_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+CREATE TABLE lab_adapters (
+    adapter_ref TEXT PRIMARY KEY,
+    adapter_id TEXT NOT NULL,
+    adapter_version TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    data_boundary TEXT NOT NULL,
+    network_scope TEXT NOT NULL,
+    kinds_json TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL,
+    connected_at TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0,1))
 );
 """
 
@@ -517,6 +535,8 @@ def decode_plan(row: sqlite3.Row) -> TrainingPlan:
         dataset_recipe_hash=row["dataset_recipe_hash"],
         dataset_classification=row["dataset_classification"],
         backend_data_boundary=row["backend_data_boundary"],
+        backend_adapter_ref=row["backend_adapter_ref"],
+        backend_adapter_hash=row["backend_adapter_hash"],
         resource_profile_id=row["resource_profile_id"],
         permission=PermissionLevel[row["permission"]],
         budgets=HardBudgets(**budgets_raw),
@@ -851,6 +871,45 @@ class Registry:
                 )
                 connection.commit()
                 version = 15
+
+            if version == 15:
+                plan_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(plans)")
+                }
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS lab_adapters ("
+                    "adapter_ref TEXT PRIMARY KEY, "
+                    "adapter_id TEXT NOT NULL, "
+                    "adapter_version TEXT NOT NULL, "
+                    "display_name TEXT NOT NULL, "
+                    "manifest_hash TEXT NOT NULL, "
+                    "manifest_json TEXT NOT NULL, "
+                    "source_path TEXT NOT NULL, "
+                    "data_boundary TEXT NOT NULL, "
+                    "network_scope TEXT NOT NULL, "
+                    "kinds_json TEXT NOT NULL, "
+                    "capabilities_json TEXT NOT NULL, "
+                    "connected_at TEXT NOT NULL, "
+                    "active INTEGER NOT NULL CHECK (active IN (0,1))"
+                    ")"
+                )
+                if "backend_adapter_ref" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN backend_adapter_ref TEXT"
+                    )
+                if "backend_adapter_hash" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN backend_adapter_hash TEXT"
+                    )
+                connection.execute("PRAGMA user_version = 16")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 15, "to_version": 16},
+                )
+                connection.commit()
+                version = 16
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -1614,6 +1673,148 @@ class Registry:
             )
             self.event(connection, "CANDIDATE_REJECTED", {"model_id": model_id})
 
+    def register_lab_adapter(
+        self,
+        manifest: LabAdapterManifest,
+        *,
+        source_path: Path,
+    ) -> str:
+        with self.connect(write=True) as connection:
+            existing = connection.execute(
+                "SELECT manifest_hash, active FROM lab_adapters WHERE adapter_ref = ?",
+                (manifest.adapter_ref,),
+            ).fetchone()
+            if existing is not None:
+                if existing["manifest_hash"] == manifest.manifest_hash:
+                    if not bool(existing["active"]):
+                        connection.execute(
+                            "UPDATE lab_adapters SET active = 1, source_path = ?, "
+                            "connected_at = ? WHERE adapter_ref = ?",
+                            (
+                                str(source_path.resolve()),
+                                timestamp(),
+                                manifest.adapter_ref,
+                            ),
+                        )
+                        self.event(
+                            connection,
+                            "LAB_ADAPTER_RECONNECTED",
+                            {
+                                "adapter_ref": manifest.adapter_ref,
+                                "manifest_hash": manifest.manifest_hash,
+                            },
+                        )
+                    return manifest.adapter_ref
+                raise FrontierwrightError(
+                    "LAB_ADAPTER_REF_CONFLICT",
+                    (
+                        "A different Lab adapter manifest is already registered for "
+                        f"{manifest.adapter_ref}."
+                    ),
+                    13,
+                )
+
+            payload = manifest.canonical_payload()
+            connection.execute(
+                "INSERT INTO lab_adapters ("
+                "adapter_ref, adapter_id, adapter_version, display_name, manifest_hash, "
+                "manifest_json, source_path, data_boundary, network_scope, kinds_json, "
+                "capabilities_json, connected_at, active"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                (
+                    manifest.adapter_ref,
+                    manifest.adapter_id,
+                    manifest.adapter_version,
+                    manifest.display_name,
+                    manifest.manifest_hash,
+                    json.dumps(payload, sort_keys=True, allow_nan=False),
+                    str(source_path.resolve()),
+                    manifest.data_boundary.value,
+                    manifest.network_scope.value,
+                    json.dumps(
+                        [item.value for item in manifest.kinds],
+                        sort_keys=True,
+                        allow_nan=False,
+                    ),
+                    json.dumps(
+                        list(manifest.capabilities),
+                        sort_keys=True,
+                        allow_nan=False,
+                    ),
+                    timestamp(),
+                ),
+            )
+            self.event(
+                connection,
+                "LAB_ADAPTER_CONNECTED",
+                {
+                    "adapter_ref": manifest.adapter_ref,
+                    "manifest_hash": manifest.manifest_hash,
+                    "data_boundary": manifest.data_boundary.value,
+                    "network_scope": manifest.network_scope.value,
+                    "kinds": [item.value for item in manifest.kinds],
+                },
+            )
+            return manifest.adapter_ref
+
+    def get_lab_adapter(self, adapter_ref: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM lab_adapters WHERE adapter_ref = ? AND active = 1",
+                (adapter_ref,),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["manifest"] = json.loads(result.pop("manifest_json"))
+            result["kinds"] = json.loads(result.pop("kinds_json"))
+            result["capabilities"] = json.loads(result.pop("capabilities_json"))
+            result["active"] = bool(result["active"])
+            return result
+
+    def list_lab_adapters(self) -> tuple[dict[str, Any], ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM lab_adapters WHERE active = 1 "
+                "ORDER BY adapter_id, adapter_version"
+            ).fetchall()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                item["manifest"] = json.loads(item.pop("manifest_json"))
+                item["kinds"] = json.loads(item.pop("kinds_json"))
+                item["capabilities"] = json.loads(item.pop("capabilities_json"))
+                item["active"] = bool(item["active"])
+                items.append(item)
+            return tuple(items)
+
+    def disconnect_lab_adapter(self, adapter_ref: str) -> None:
+        with self.connect(write=True) as connection:
+            row = connection.execute(
+                "SELECT active, manifest_hash FROM lab_adapters WHERE adapter_ref = ?",
+                (adapter_ref,),
+            ).fetchone()
+            if row is None:
+                raise FrontierwrightError(
+                    "LAB_ADAPTER_NOT_FOUND",
+                    f"Lab adapter is not registered: {adapter_ref}",
+                    3,
+                )
+            if not bool(row["active"]):
+                return
+            connection.execute(
+                "UPDATE lab_adapters SET active = 0 WHERE adapter_ref = ?",
+                (adapter_ref,),
+            )
+            self.event(
+                connection,
+                "LAB_ADAPTER_DISCONNECTED",
+                {
+                    "adapter_ref": adapter_ref,
+                    "manifest_hash": row["manifest_hash"],
+                },
+            )
+
     def store_plan(self, plan: TrainingPlan) -> TrainingPlan:
         with self.connect(write=True) as connection:
             existing = connection.execute(
@@ -1630,9 +1831,10 @@ class Registry:
                 "backend_spec_hash, model_id, model_fingerprint, model_source_path, "
                 "dataset_id, dataset_fingerprint, dataset_source_path, "
                 "dataset_recipe_id, dataset_recipe_hash, dataset_classification, "
-                "backend_data_boundary, resource_profile_id, permission, budgets_json, "
-                "config_json, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "backend_data_boundary, backend_adapter_ref, backend_adapter_hash, "
+                "resource_profile_id, permission, budgets_json, config_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?)",
                 (
                     plan.plan_id,
                     plan.idempotency_key,
@@ -1652,6 +1854,8 @@ class Registry:
                     plan.dataset_recipe_hash,
                     plan.dataset_classification,
                     plan.backend_data_boundary,
+                    plan.backend_adapter_ref,
+                    plan.backend_adapter_hash,
                     plan.resource_profile_id,
                     plan.permission.name,
                     json.dumps(plan.budgets.to_dict(), sort_keys=True, allow_nan=False),
@@ -1669,6 +1873,8 @@ class Registry:
                     "intervention_version": plan.intervention_version,
                     "intervention_family": plan.intervention_family,
                     "backend_id": plan.backend_id,
+                    "backend_adapter_ref": plan.backend_adapter_ref,
+                    "backend_adapter_hash": plan.backend_adapter_hash,
                     "idempotency_key": plan.idempotency_key,
                 },
             )
