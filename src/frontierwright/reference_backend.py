@@ -20,7 +20,10 @@ from pathlib import Path
 from typing import Any
 
 REFERENCE_BACKEND_ID = "frontierwright-reference-pytorch-v1"
-SUPPORTED_PATH = "FROM_SCRATCH_PRETRAINING"
+SUPPORTED_PATHS = (
+    "FROM_SCRATCH_PRETRAINING",
+    "CONTINUED_PRETRAINING",
+)
 VOCAB_SIZE = 256
 
 
@@ -148,16 +151,45 @@ def _nonnegative_float(raw: object, default: float, label: str) -> float:
     return result
 
 
+def _preset_name_for_request(
+    request: dict[str, Any],
+    raw_config: dict[str, Any],
+) -> str:
+    explicit = raw_config.get("preset")
+    if explicit is not None:
+        if not isinstance(explicit, str) or explicit not in PRESETS:
+            raise ValueError(
+                "preset must be one of: " + ", ".join(sorted(PRESETS))
+            )
+        return explicit
+
+    model_source = request.get("model_source_path")
+    if model_source is None:
+        return "zero-8m"
+    if not isinstance(model_source, str) or not model_source:
+        raise ValueError("model_source_path must be a nonempty string")
+
+    config_path = _native_path(model_source).expanduser().resolve() / "config.json"
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "model_source_path does not contain a readable reference config.json"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("model source config.json must contain an object")
+    inferred = payload.get("preset")
+    if not isinstance(inferred, str) or inferred not in PRESETS:
+        raise ValueError("model source config.json has an unsupported preset")
+    return inferred
+
+
 def _load_config(request: dict[str, Any]) -> ReferenceConfig:
     raw = request.get("config", {})
     if not isinstance(raw, dict):
         raise ValueError("config must be an object")
 
-    preset_name = raw.get("preset", "zero-8m")
-    if not isinstance(preset_name, str) or preset_name not in PRESETS:
-        raise ValueError(
-            "preset must be one of: " + ", ".join(sorted(PRESETS))
-        )
+    preset_name = _preset_name_for_request(request, raw)
     preset = PRESETS[preset_name]
 
     device = raw.get("device", "auto")
@@ -763,7 +795,7 @@ def backend_spec_payload(python_executable: str) -> dict[str, object]:
         "schema_version": 1,
         "backend_id": REFERENCE_BACKEND_ID,
         "data_boundary": "LOCAL_MACHINE",
-        "supported_paths": [SUPPORTED_PATH],
+        "supported_paths": list(SUPPORTED_PATHS),
         "calibrate_argv": [
             python_executable,
             "-m",
@@ -800,10 +832,15 @@ def main(argv: list[str] | None = None) -> int:
         if operation == "birth":
             _emit(_birth(request))
             return 0
-        if request.get("path_id") != SUPPORTED_PATH:
+        path_id = request.get("path_id")
+        if path_id not in SUPPORTED_PATHS:
             raise ValueError(
-                "reference backend currently supports only "
-                "FROM_SCRATCH_PRETRAINING"
+                "reference backend supports only: " + ", ".join(SUPPORTED_PATHS)
+            )
+        model_source_path = request.get("model_source_path")
+        if not isinstance(model_source_path, str) or not model_source_path:
+            raise ValueError(
+                "reference backend training requires a materialized model_source_path"
             )
         config = _load_config(request)
         if operation == "calibrate":

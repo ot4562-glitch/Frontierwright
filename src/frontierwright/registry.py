@@ -50,7 +50,7 @@ from frontierwright.execution import (
 from frontierwright.lab_adapters import LabAdapterManifest
 from frontierwright.models import HistoryEvidenceResult, ImportedModelDescriptor
 from frontierwright.paths import TrainingPathId
-from frontierwright.recipes import DataPreparationRecipe
+from frontierwright.recipes import SNAPSHOT_COPY_PLUGIN_ID, DataPreparationRecipe
 from frontierwright.resources import ResourceSnapshot
 
 SCHEMA_VERSION = 17
@@ -2410,6 +2410,7 @@ class Registry:
         descriptor: DatasetDescriptor,
         *,
         name: str | None = None,
+        metadata_overrides: dict[str, object] | None = None,
     ) -> str:
         with self.connect(write=True) as connection:
             source = connection.execute(
@@ -2428,12 +2429,59 @@ class Registry:
                     "Preparation recipe source fingerprint does not match the registry.",
                     13,
                 )
-            if descriptor.fingerprint != recipe.source_fingerprint:
+            if (
+                recipe.plugin_id == SNAPSHOT_COPY_PLUGIN_ID
+                and descriptor.fingerprint != recipe.source_fingerprint
+            ):
                 raise FrontierwrightError(
                     "DATA_PREP_COPY_MISMATCH",
                     "Prepared dataset fingerprint differs from the byte-preserving recipe source.",
                     13,
                 )
+
+            overrides = dict(metadata_overrides or {})
+            unknown_overrides = sorted(
+                set(overrides) - {"classification", "license", "domain", "language"}
+            )
+            if unknown_overrides:
+                raise FrontierwrightError(
+                    "DATASET_METADATA_INVALID",
+                    "Unsupported prepared-dataset metadata overrides: "
+                    + ", ".join(unknown_overrides),
+                    2,
+                )
+
+            raw_classification = overrides.get(
+                "classification",
+                source["classification"],
+            )
+            try:
+                effective_classification = DatasetClassification(
+                    str(
+                        raw_classification.value
+                        if isinstance(raw_classification, DatasetClassification)
+                        else raw_classification
+                    )
+                ).value
+            except ValueError as exc:
+                raise FrontierwrightError(
+                    "DATASET_METADATA_INVALID",
+                    "Prepared dataset classification is invalid.",
+                    2,
+                ) from exc
+
+            effective_text: dict[str, str | None] = {}
+            for key in ("license", "domain", "language"):
+                value = overrides.get(key, source[key])
+                if value is not None and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    raise FrontierwrightError(
+                        "DATASET_METADATA_INVALID",
+                        f"Prepared dataset {key} must be nonempty text or null.",
+                        2,
+                    )
+                effective_text[key] = value
 
             existing_recipe = connection.execute(
                 "SELECT * FROM data_recipes WHERE recipe_hash = ?",
@@ -2492,16 +2540,20 @@ class Registry:
                     prepared_name,
                     source["role"],
                     source["provenance"],
-                    source["classification"],
+                    effective_classification,
                     str(descriptor.source_path),
                     descriptor.fingerprint,
                     descriptor.total_bytes,
                     descriptor.file_count,
                     json.dumps(descriptor.manifest(), sort_keys=True, allow_nan=False),
-                    source["license"],
-                    source["domain"],
-                    source["language"],
-                    source["token_count"],
+                    effective_text["license"],
+                    effective_text["domain"],
+                    effective_text["language"],
+                    (
+                        source["token_count"]
+                        if recipe.plugin_id == SNAPSHOT_COPY_PLUGIN_ID
+                        else None
+                    ),
                     timestamp(),
                     recipe.source_dataset_id,
                     recipe.recipe_id,
@@ -2518,7 +2570,7 @@ class Registry:
                     "recipe_hash": recipe.recipe_hash,
                     "plugin_id": recipe.plugin_id,
                     "plugin_version": recipe.plugin_version,
-                    "classification": source["classification"],
+                    "classification": effective_classification,
                     "fingerprint": descriptor.fingerprint,
                 },
             )

@@ -18,6 +18,7 @@ from frontierwright.artifact_store import (
 )
 from frontierwright.data import (
     DatasetClassification,
+    DatasetDescriptor,
     DatasetProvenance,
     DatasetRole,
     inspect_local_dataset,
@@ -71,6 +72,10 @@ from frontierwright.paths import PathAvailability, PathContext, TrainingPathId
 from frontierwright.recipes import (
     BUILTIN_DATA_PREPARATION_PLUGINS,
     SNAPSHOT_COPY_PLUGIN_ID,
+    TEXT_LINES_PLUGIN_ID,
+    WEIGHTED_TEXT_MIXTURE_PLUGIN_ID,
+    DataPreparationPlugin,
+    DataPreparationRecipe,
     data_preparation_plugin,
 )
 from frontierwright.reference_backend import PRESETS, REFERENCE_BACKEND_ID
@@ -1158,6 +1163,54 @@ def get_data_preparation_plugins() -> list[dict[str, object]]:
     ]
 
 
+
+def _resolve_preparation_sources(
+    state: ProjectState,
+    plugin: DataPreparationPlugin,
+    recipe: DataPreparationRecipe,
+) -> dict[str, DatasetDescriptor]:
+    rows = {
+        str(item["dataset_id"]): item
+        for item in state.datasets
+        if isinstance(item.get("dataset_id"), str)
+    }
+    resolved: dict[str, DatasetDescriptor] = {}
+    for binding in plugin.source_bindings(recipe):
+        row = rows.get(binding.dataset_id)
+        if row is None:
+            raise FrontierwrightError(
+                "DATASET_NOT_FOUND",
+                f"Preparation source dataset is not active: {binding.dataset_id}",
+                3,
+            )
+        source_path = row.get("source_path")
+        fingerprint = row.get("fingerprint")
+        if not isinstance(source_path, str) or not isinstance(fingerprint, str):
+            raise FrontierwrightError(
+                "DATASET_INVALID",
+                f"Preparation source metadata is incomplete: {binding.dataset_id}",
+                4,
+            )
+        if fingerprint != binding.fingerprint:
+            raise FrontierwrightError(
+                "DATA_RECIPE_SOURCE_DRIFT",
+                f"Preparation source registry fingerprint changed: {binding.dataset_id}",
+                13,
+            )
+        descriptor = inspect_local_dataset(Path(source_path))
+        if descriptor.fingerprint != binding.fingerprint:
+            raise FrontierwrightError(
+                "DATASET_CONTENT_DRIFT",
+                (
+                    "Preparation source content changed after registration: "
+                    f"{binding.dataset_id}"
+                ),
+                13,
+            )
+        resolved[binding.dataset_id] = descriptor
+    return resolved
+
+
 def prepare_dataset(
     root: Path,
     *,
@@ -1221,9 +1274,10 @@ def prepare_dataset(
         source_fingerprint=source_fingerprint,
         config=config,
     )
+    sources = _resolve_preparation_sources(state, plugin, recipe)
     prepared = plugin.materialize(
         registry.state_dir,
-        source=descriptor,
+        sources=sources,
         recipe=recipe,
     )
     registry.register_prepared_dataset(recipe, prepared, name=name)
@@ -1243,6 +1297,164 @@ def prepare_dataset_snapshot(
         config=None,
         name=name,
     )
+
+
+
+def prepare_dataset_mixture(
+    root: Path,
+    *,
+    inputs: list[tuple[str, int]],
+    name: str | None = None,
+    max_output_bytes: int = 4 * 1024**3,
+) -> DataView:
+    """Create a deterministic weighted mixture from managed text datasets."""
+
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before mixing data.",
+            10,
+        )
+    if len(inputs) < 2:
+        raise FrontierwrightError(
+            "DATA_MIXTURE_INPUTS_INVALID",
+            "A weighted mixture requires at least two prepared datasets.",
+            2,
+        )
+
+    seen_ids: set[str] = set()
+    state = registry.read()
+    rows = {
+        str(item["dataset_id"]): item
+        for item in state.datasets
+        if isinstance(item.get("dataset_id"), str)
+    }
+    selected: list[dict[str, object]] = []
+    source_specs: list[dict[str, object]] = []
+
+    for dataset_id, parts in inputs:
+        if dataset_id in seen_ids:
+            raise FrontierwrightError(
+                "DATA_MIXTURE_INPUTS_INVALID",
+                f"Mixture dataset is duplicated: {dataset_id}",
+                2,
+            )
+        seen_ids.add(dataset_id)
+        if isinstance(parts, bool) or not isinstance(parts, int) or parts <= 0:
+            raise FrontierwrightError(
+                "DATA_MIXTURE_INPUTS_INVALID",
+                f"Mixture parts must be a positive integer: {dataset_id}",
+                2,
+            )
+        row = rows.get(dataset_id)
+        if row is None:
+            raise FrontierwrightError(
+                "DATASET_NOT_FOUND",
+                f"Mixture source dataset is not active: {dataset_id}",
+                3,
+            )
+
+        recipe_id = row.get("preparation_recipe_id")
+        fingerprint = row.get("fingerprint")
+        if not isinstance(recipe_id, str) or not isinstance(fingerprint, str):
+            raise FrontierwrightError(
+                "DATA_MIXTURE_SOURCE_INVALID",
+                (
+                    "Weighted mixture inputs must be managed prepared text datasets; "
+                    f"{dataset_id} is not."
+                ),
+                13,
+            )
+        source_recipe = registry.get_data_recipe(recipe_id)
+        if source_recipe is None or source_recipe.get("plugin_id") not in {
+            TEXT_LINES_PLUGIN_ID,
+            WEIGHTED_TEXT_MIXTURE_PLUGIN_ID,
+        }:
+            raise FrontierwrightError(
+                "DATA_MIXTURE_SOURCE_INVALID",
+                (
+                    "Weighted mixture inputs must come from text-lines or prior "
+                    f"weighted-text-mixture recipes: {dataset_id}"
+                ),
+                13,
+            )
+
+        selected.append(row)
+        source_specs.append(
+            {
+                "dataset_id": dataset_id,
+                "fingerprint": fingerprint,
+                "parts": parts,
+            }
+        )
+
+    roles = {str(item["role"]) for item in selected}
+    provenances = {str(item["provenance"]) for item in selected}
+    if len(roles) != 1:
+        raise FrontierwrightError(
+            "DATA_MIXTURE_METADATA_CONFLICT",
+            "Mixture sources must have the same dataset role.",
+            13,
+        )
+    if len(provenances) != 1:
+        raise FrontierwrightError(
+            "DATA_MIXTURE_METADATA_CONFLICT",
+            "Mixture sources must have the same provenance.",
+            13,
+        )
+
+    classification_rank = {
+        DatasetClassification.PUBLIC: 0,
+        DatasetClassification.INTERNAL: 1,
+        DatasetClassification.CONFIDENTIAL: 2,
+        DatasetClassification.PRIVATE: 3,
+    }
+    classifications = [
+        DatasetClassification(str(item["classification"])) for item in selected
+    ]
+    effective_classification = max(
+        classifications,
+        key=lambda item: classification_rank[item],
+    )
+
+    def common_optional_text(key: str) -> str | None:
+        values = {item.get(key) for item in selected}
+        if len(values) != 1:
+            return None
+        value = next(iter(values))
+        return str(value) if isinstance(value, str) else None
+
+    primary = selected[0]
+    primary_id = str(primary["dataset_id"])
+    primary_fingerprint = str(primary["fingerprint"])
+    plugin = data_preparation_plugin(WEIGHTED_TEXT_MIXTURE_PLUGIN_ID)
+    recipe = plugin.build_recipe(
+        source_dataset_id=primary_id,
+        source_fingerprint=primary_fingerprint,
+        config={
+            "sources": source_specs,
+            "max_output_bytes": max_output_bytes,
+        },
+    )
+    sources = _resolve_preparation_sources(state, plugin, recipe)
+    prepared = plugin.materialize(
+        registry.state_dir,
+        sources=sources,
+        recipe=recipe,
+    )
+    registry.register_prepared_dataset(
+        recipe,
+        prepared,
+        name=name,
+        metadata_overrides={
+            "classification": effective_classification,
+            "license": common_optional_text("license"),
+            "domain": common_optional_text("domain"),
+            "language": common_optional_text("language"),
+        },
+    )
+    return get_data_view(root)
 
 
 def _required_dataset_role(path_id: TrainingPathId) -> DatasetRole:

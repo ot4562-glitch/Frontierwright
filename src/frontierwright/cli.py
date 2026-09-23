@@ -17,7 +17,7 @@ from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
-from frontierwright.recipes import SNAPSHOT_COPY_PLUGIN_ID
+from frontierwright.recipes import SNAPSHOT_COPY_PLUGIN_ID, TEXT_LINES_PLUGIN_ID
 from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.registry import Registry
 from frontierwright.service import (
@@ -61,6 +61,7 @@ from frontierwright.service import (
     import_local_model,
     ingest_stats,
     prepare_dataset,
+    prepare_dataset_mixture,
     promote_candidate,
     reconcile_training_run,
     reject_candidate,
@@ -1193,8 +1194,8 @@ def data_prepare(
         typer.Option(
             "--recipe",
             help=(
-                "Preparation plugin ID. Alias snapshot-copy-v1 selects the built-in "
-                "byte-preserving managed snapshot."
+                "Preparation plugin ID. Aliases: snapshot-copy-v1 for a byte-preserving "
+                "snapshot; text-lines-v1 for UTF-8 normalization and stable exact dedupe."
             ),
         ),
     ] = "snapshot-copy-v1",
@@ -1203,7 +1204,11 @@ def data_prepare(
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
-    plugin_id = SNAPSHOT_COPY_PLUGIN_ID if recipe == "snapshot-copy-v1" else recipe
+    aliases = {
+        "snapshot-copy-v1": SNAPSHOT_COPY_PLUGIN_ID,
+        "text-lines-v1": TEXT_LINES_PLUGIN_ID,
+    }
+    plugin_id = aliases.get(recipe, recipe)
     try:
         view = prepare_dataset(
             path,
@@ -1211,6 +1216,75 @@ def data_prepare(
             plugin_id=plugin_id,
             config=None,
             name=name,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_data_payload(view))
+        return
+    _print_data(view)
+
+
+
+@data_app.command("mix")
+def data_mix(
+    inputs: Annotated[
+        list[str],
+        typer.Option(
+            "--input",
+            help=(
+                "Prepared text dataset in DATASET_ID:PARTS form. Repeat --input "
+                "for every mixture source."
+            ),
+        ),
+    ],
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    name: Annotated[str | None, typer.Option("--name")] = None,
+    max_output_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-output-bytes",
+            help="Hard preparation limit for the materialized mixed corpus.",
+        ),
+    ] = 4 * 1024**3,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+
+    parsed: list[tuple[str, int]] = []
+    for raw in inputs:
+        dataset_id, separator, parts_raw = raw.rpartition(":")
+        if not separator or not dataset_id:
+            _fail(
+                FrontierwrightError(
+                    "DATA_MIXTURE_INPUTS_INVALID",
+                    f"Invalid --input {raw!r}; expected DATASET_ID:PARTS.",
+                    2,
+                ),
+                json_output=json_output,
+            )
+        try:
+            parts = int(parts_raw)
+        except ValueError:
+            _fail(
+                FrontierwrightError(
+                    "DATA_MIXTURE_INPUTS_INVALID",
+                    f"Invalid mixture parts in --input {raw!r}.",
+                    2,
+                ),
+                json_output=json_output,
+            )
+        parsed.append((dataset_id, parts))
+
+    try:
+        view = prepare_dataset_mixture(
+            path,
+            inputs=parsed,
+            name=name,
+            max_output_bytes=max_output_bytes,
         )
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)

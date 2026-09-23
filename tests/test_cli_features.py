@@ -60,7 +60,17 @@ def test_data_and_paths_machine_surface(tmp_path: Path) -> None:
             "plugin_id": "frontierwright.data.snapshot-copy",
             "plugin_version": "1",
             "title": "Byte-preserving managed snapshot",
-        }
+        },
+        {
+            "plugin_id": "frontierwright.data.text-lines-normalize-dedupe",
+            "plugin_version": "1",
+            "title": "Normalize and stable-dedupe UTF-8 text lines",
+        },
+        {
+            "plugin_id": "frontierwright.data.weighted-text-mixture",
+            "plugin_version": "1",
+            "title": "Deterministic weighted mixture of managed UTF-8 corpora",
+        },
     ]
 
     added = runner.invoke(
@@ -228,3 +238,185 @@ def test_stats_machine_surface_ingests_frozen_evidence(tmp_path: Path) -> None:
     )
     assert show.exit_code == 0, show.output
     assert json.loads(show.stdout) == payload
+
+
+def test_text_lines_recipe_cli_alias_prepares_managed_dataset(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    source = tmp_path / "text"
+    source.mkdir()
+    (source / "train.txt").write_text("alpha\nalpha\n beta \n", encoding="utf-8")
+
+    init = runner.invoke(
+        app,
+        [
+            "project",
+            "init",
+            str(project),
+            "--name",
+            "NOVA",
+            "--origin",
+            "ZERO",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert init.exit_code == 0, init.output
+
+    added = runner.invoke(
+        app,
+        [
+            "data",
+            "add",
+            str(source),
+            "--role",
+            "PRETRAIN",
+            "--path",
+            str(project),
+            "--name",
+            "Raw text",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert added.exit_code == 0, added.output
+    raw = json.loads(added.stdout)["datasets"][0]
+
+    prepared = runner.invoke(
+        app,
+        [
+            "data",
+            "prepare",
+            "--dataset",
+            str(raw["dataset_id"]),
+            "--recipe",
+            "text-lines-v1",
+            "--path",
+            str(project),
+            "--name",
+            "Prepared text",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert prepared.exit_code == 0, prepared.output
+    payload = json.loads(prepared.stdout)
+    managed = next(item for item in payload["datasets"] if item["managed"] is True)
+    assert managed["fingerprint"] != raw["fingerprint"]
+
+    output = Path(str(managed["source_path"])) / "corpus.txt"
+    assert output.read_text(encoding="utf-8") == "alpha\nbeta\n"
+
+    recipes = runner.invoke(
+        app,
+        ["data", "recipes", "--json", "--non-interactive"],
+    )
+    assert recipes.exit_code == 0, recipes.output
+    plugin_ids = {item["plugin_id"] for item in json.loads(recipes.stdout)["plugins"]}
+    assert "frontierwright.data.text-lines-normalize-dedupe" in plugin_ids
+
+
+def test_data_mix_cli_materializes_weighted_managed_corpus(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    init = runner.invoke(
+        app,
+        [
+            "project",
+            "init",
+            str(project),
+            "--name",
+            "NOVA",
+            "--origin",
+            "ZERO",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert init.exit_code == 0, init.output
+
+    prepared_ids: list[str] = []
+    for index, text in enumerate(("alpha\n", "beta\n"), start=1):
+        source = tmp_path / f"text-{index}"
+        source.mkdir()
+        (source / "train.txt").write_text(text, encoding="utf-8")
+
+        added = runner.invoke(
+            app,
+            [
+                "data",
+                "add",
+                str(source),
+                "--role",
+                "PRETRAIN",
+                "--path",
+                str(project),
+                "--name",
+                f"Raw {index}",
+                "--json",
+                "--non-interactive",
+                "--yes",
+            ],
+        )
+        assert added.exit_code == 0, added.output
+        added_payload = json.loads(added.stdout)
+        raw = next(
+            item
+            for item in added_payload["datasets"]
+            if item["name"] == f"Raw {index}"
+        )
+
+        prepared = runner.invoke(
+            app,
+            [
+                "data",
+                "prepare",
+                "--dataset",
+                str(raw["dataset_id"]),
+                "--recipe",
+                "text-lines-v1",
+                "--path",
+                str(project),
+                "--name",
+                f"Prepared {index}",
+                "--json",
+                "--non-interactive",
+                "--yes",
+            ],
+        )
+        assert prepared.exit_code == 0, prepared.output
+        prepared_payload = json.loads(prepared.stdout)
+        managed = next(
+            item
+            for item in prepared_payload["datasets"]
+            if item["name"] == f"Prepared {index}"
+        )
+        prepared_ids.append(str(managed["dataset_id"]))
+
+    mixed = runner.invoke(
+        app,
+        [
+            "data",
+            "mix",
+            "--input",
+            f"{prepared_ids[0]}:2",
+            "--input",
+            f"{prepared_ids[1]}:1",
+            "--path",
+            str(project),
+            "--name",
+            "CLI mixture",
+            "--max-output-bytes",
+            "1024",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert mixed.exit_code == 0, mixed.output
+    payload = json.loads(mixed.stdout)
+    mixture = next(item for item in payload["datasets"] if item["name"] == "CLI mixture")
+    output = Path(str(mixture["source_path"])) / "corpus.txt"
+    assert output.read_text(encoding="utf-8") == "alpha\nalpha\nbeta\n"

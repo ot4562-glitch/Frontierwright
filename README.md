@@ -113,6 +113,8 @@ Implemented now:
 - adapter ref/hash evidence is propagated into plan identity, durable execution requests, and sealed candidate manifests;
 - reproducible DataPreparationPlugin contract with discoverable recipe registry;
 - built-in byte-preserving managed snapshot recipe via `frontierwright data prepare`, preserving source provenance while freezing exact training-input bytes under Frontierwright state;
+- built-in `text-lines-v1` preparation normalizes UTF-8 text, canonicalizes line endings/Unicode, removes empty lines, and performs deterministic stable exact dedupe while recording transformation counts;
+- built-in weighted text-mixture preparation composes multiple managed text corpora with exact source fingerprints/parts, conservative metadata/classification propagation, deterministic output, and a hard materialization-size limit;
 - prepared datasets retain source-dataset ID plus recipe ID/hash, and training plans pin the recipe hash in addition to dataset bytes;
 - extensible intervention taxonomy spanning `BIRTH / LEARN / SPECIALIZE / ALIGN / EVOLVE / OPTIMIZE / EVALUATE / OPERATE`;
 - discoverable InterventionPlugin registry with explicit execution surfaces; built-in training interventions wrap their real path-assessment plugins rather than acting as display-only labels;
@@ -129,7 +131,7 @@ Implemented now:
 - budget enforcement modes are explicit in plan views: run-count registry admission, wall-time timeout, accounted GPU-hour timeout, storage admission/finalization gate, and currently unavailable runtime money enforcement;
 - measured output-size budget violations block candidate finalization even when the training backend itself reports success;
 - `max_money` keeps a plan non-ready until an executor with real runtime cost enforcement exists; a projected price alone is not treated as a hard budget;
-- built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` from-scratch pretraining/calibration;
+- built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` birth, from-scratch pretraining, continued pretraining, and calibration; prepared managed corpora can be consumed directly;
 - successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
 - sealed artifact manifests bind the run, plan, intervention ID/version/family, dataset, dataset-preparation recipe, backend, effective config, model fingerprint, and exact file hashes;
 - evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
@@ -146,7 +148,7 @@ Not implemented yet:
 - an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and benchmark runner;
 - production built-in training backends for all five paths beyond the narrow from-scratch reference backend and structured external command adapter;
 - live output-storage quota enforcement during backend execution, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
-- public dataset discovery/download adapters and transformative recipes such as normalize/dedupe/tokenize/mixture;
+- public dataset discovery/download adapters, tokenizer-training artifacts, and explicit tokenization/sharding recipes beyond the implemented normalize/dedupe/weighted-mixture transforms;
 - remote/server/Slurm executor implementations and concrete private Lab adapters;
 - stronger executor-boundary attestation beyond the current adapter-declared trust contract.
 
