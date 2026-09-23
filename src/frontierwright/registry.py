@@ -30,6 +30,7 @@ from frontierwright.domain import (
     CapabilityStat,
     Champion,
     HistoryConfidence,
+    LineageRelation,
     ModelFormat,
     ModelOrigin,
     ModelState,
@@ -57,7 +58,7 @@ from frontierwright.recipes import (
 )
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -66,6 +67,18 @@ CREATE TABLE models (
     model_id TEXT PRIMARY KEY,
     parent_model_id TEXT REFERENCES models(model_id),
     snapshot TEXT NOT NULL
+);
+CREATE TABLE model_lineage_edges (
+    child_model_id TEXT NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+    parent_model_id TEXT NOT NULL REFERENCES models(model_id),
+    relation TEXT NOT NULL CHECK (
+        relation IN ('DERIVED_FROM','MERGED_FROM','DISTILLED_FROM','TRANSFORMED_FROM')),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(child_model_id, parent_model_id, relation),
+    UNIQUE(child_model_id, relation, ordinal),
+    CHECK(child_model_id != parent_model_id)
 );
 CREATE TABLE project (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -994,6 +1007,45 @@ ALTER TABLE datasets_v18 RENAME TO datasets;
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 18
 
+            if version == 18:
+                connection.executescript(
+                    """
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS model_lineage_edges (
+    child_model_id TEXT NOT NULL REFERENCES models(model_id) ON DELETE CASCADE,
+    parent_model_id TEXT NOT NULL REFERENCES models(model_id),
+    relation TEXT NOT NULL CHECK (
+        relation IN ('DERIVED_FROM','MERGED_FROM','DISTILLED_FROM','TRANSFORMED_FROM')),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(child_model_id, parent_model_id, relation),
+    UNIQUE(child_model_id, relation, ordinal),
+    CHECK(child_model_id != parent_model_id)
+);
+INSERT OR IGNORE INTO model_lineage_edges (
+    child_model_id, parent_model_id, relation, ordinal, details_json, created_at
+)
+SELECT
+    model_id,
+    parent_model_id,
+    'DERIVED_FROM',
+    0,
+    '{"source":"legacy_parent_model_id"}',
+    CURRENT_TIMESTAMP
+FROM models
+WHERE parent_model_id IS NOT NULL;
+"""
+                )
+                connection.execute("PRAGMA user_version = 19")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 18, "to_version": 19},
+                )
+                connection.commit()
+                version = 19
+
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
                     "UNSUPPORTED_SCHEMA",
@@ -1191,6 +1243,59 @@ ALTER TABLE datasets_v18 RENAME TO datasets;
                 model.model_id,
                 model.parent_model_id,
                 json.dumps(asdict(model), sort_keys=True, allow_nan=False),
+            ),
+        )
+        if model.parent_model_id is not None:
+            Registry.insert_lineage_edge(
+                connection,
+                child_model_id=model.model_id,
+                parent_model_id=model.parent_model_id,
+                relation=LineageRelation.DERIVED_FROM,
+                ordinal=0,
+                details={"source": "model.parent_model_id"},
+            )
+
+    @staticmethod
+    def insert_lineage_edge(
+        connection: sqlite3.Connection,
+        *,
+        child_model_id: str,
+        parent_model_id: str,
+        relation: LineageRelation,
+        ordinal: int,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        require_text(child_model_id, "child_model_id")
+        require_text(parent_model_id, "parent_model_id")
+        if child_model_id == parent_model_id:
+            raise FrontierwrightError(
+                "LINEAGE_SELF_REFERENCE",
+                "A model cannot be its own lineage parent.",
+                13,
+            )
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+            raise FrontierwrightError(
+                "LINEAGE_ORDINAL_INVALID",
+                "Lineage ordinal must be a nonnegative integer.",
+                2,
+            )
+        payload = json.dumps(
+            details or {},
+            sort_keys=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        connection.execute(
+            "INSERT INTO model_lineage_edges ("
+            "child_model_id, parent_model_id, relation, ordinal, details_json, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                child_model_id,
+                parent_model_id,
+                relation.value,
+                ordinal,
+                payload,
+                timestamp(),
             ),
         )
 
@@ -1561,6 +1666,108 @@ ALTER TABLE datasets_v18 RENAME TO datasets;
             if row is None:
                 raise FrontierwrightError("MODEL_NOT_FOUND", "Model does not exist.", 3)
             return decode_model(row["snapshot"])
+
+    def get_model_lineage(self, model_id: str) -> tuple[dict[str, Any], ...]:
+        with self.connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM models WHERE model_id = ?",
+                (model_id,),
+            ).fetchone()
+            if exists is None:
+                raise FrontierwrightError("MODEL_NOT_FOUND", "Model does not exist.", 3)
+            rows = connection.execute(
+                "SELECT child_model_id, parent_model_id, relation, ordinal, "
+                "details_json, created_at FROM model_lineage_edges "
+                "WHERE child_model_id = ? "
+                "ORDER BY relation, ordinal, parent_model_id",
+                (model_id,),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                payload = dict(row)
+                payload["details"] = json.loads(payload.pop("details_json"))
+                result.append(payload)
+            return tuple(result)
+
+    def record_model_lineage_edge(
+        self,
+        *,
+        child_model_id: str,
+        parent_model_id: str,
+        relation: LineageRelation,
+        ordinal: int,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        with self.connect(write=True) as connection:
+            child = connection.execute(
+                "SELECT identity_id FROM project WHERE singleton = 1"
+            ).fetchone()
+            if child is None:
+                raise FrontierwrightError(
+                    "REGISTRY_ERROR",
+                    "Missing project metadata.",
+                    4,
+                )
+            for model_id in (child_model_id, parent_model_id):
+                row = connection.execute(
+                    "SELECT snapshot FROM models WHERE model_id = ?",
+                    (model_id,),
+                ).fetchone()
+                if row is None:
+                    raise FrontierwrightError(
+                        "MODEL_NOT_FOUND",
+                        f"Lineage model does not exist: {model_id}",
+                        3,
+                    )
+                model = decode_model(row["snapshot"])
+                if model.identity_id != child["identity_id"]:
+                    raise FrontierwrightError(
+                        "IDENTITY_MISMATCH",
+                        "Lineage edges must stay inside one Frontierwright identity.",
+                        13,
+                    )
+
+            existing = connection.execute(
+                "SELECT ordinal, details_json FROM model_lineage_edges "
+                "WHERE child_model_id = ? AND parent_model_id = ? AND relation = ?",
+                (child_model_id, parent_model_id, relation.value),
+            ).fetchone()
+            canonical_details = json.dumps(
+                details or {},
+                sort_keys=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            if existing is not None:
+                if (
+                    int(existing["ordinal"]) == ordinal
+                    and str(existing["details_json"]) == canonical_details
+                ):
+                    return
+                raise FrontierwrightError(
+                    "LINEAGE_EDGE_CONFLICT",
+                    "An incompatible lineage edge already exists.",
+                    13,
+                )
+
+            Registry.insert_lineage_edge(
+                connection,
+                child_model_id=child_model_id,
+                parent_model_id=parent_model_id,
+                relation=relation,
+                ordinal=ordinal,
+                details=details,
+            )
+            self.event(
+                connection,
+                "MODEL_LINEAGE_EDGE_RECORDED",
+                {
+                    "child_model_id": child_model_id,
+                    "parent_model_id": parent_model_id,
+                    "relation": relation.value,
+                    "ordinal": ordinal,
+                },
+            )
 
     def get_model_artifact(self, model_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:

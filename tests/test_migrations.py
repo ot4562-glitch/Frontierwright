@@ -1,4 +1,6 @@
+import json
 import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -56,7 +58,7 @@ def test_previous_registry_versions_migrate_to_current(
             )
         }
 
-    assert version == SCHEMA_VERSION == 18
+    assert version == SCHEMA_VERSION == 19
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -122,7 +124,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 18
+    assert version == SCHEMA_VERSION == 19
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -287,7 +289,7 @@ def test_v9_project_migrates_to_origin_appropriate_edition_profile(
     assert state.project["edition_profile"] == "ACADEMY"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 18
+    assert version == SCHEMA_VERSION == 19
 
 
 def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
@@ -316,7 +318,7 @@ def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(plans)")
         }
 
-    assert version == SCHEMA_VERSION == 18
+    assert version == SCHEMA_VERSION == 19
     assert "data_recipes" in tables
     assert {
         "source_dataset_id",
@@ -378,7 +380,7 @@ def test_v12_backfills_intervention_identity_for_existing_plan(tmp_path: Path) -
     assert plan.intervention_family == "SPECIALIZE"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 18
+    assert version == SCHEMA_VERSION == 19
 
 
 def test_v13_binds_numeric_build_schema_without_inventing_scale(
@@ -429,7 +431,7 @@ def test_v13_binds_numeric_build_schema_without_inventing_scale(
             row[1] for row in connection.execute("PRAGMA table_info(build_state)")
         }
 
-    assert version == SCHEMA_VERSION == 18
+    assert version == SCHEMA_VERSION == 19
     assert {"scale_hash", "scale_id", "scale_version"}.issubset(columns)
 
 
@@ -500,7 +502,7 @@ def test_v14_backfills_dataset_classification_and_plan_boundary(tmp_path: Path) 
         }
         version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-    assert version == SCHEMA_VERSION == 18
+    assert version == SCHEMA_VERSION == 19
     assert rows == {
         "dataset-public": "PUBLIC",
         "dataset-internal": "INTERNAL",
@@ -526,7 +528,7 @@ def test_v16_adds_durable_run_usage_ledger(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(runs)")
         }
 
-    assert version == SCHEMA_VERSION == 18
+    assert version == SCHEMA_VERSION == 19
     assert "usage_json" in columns
 
 
@@ -591,6 +593,64 @@ def test_v17_migration_preserves_datasets_and_allows_preference_role(
         )
         connection.commit()
 
-    assert version == SCHEMA_VERSION == 18
+    assert version == SCHEMA_VERSION == 19
     assert "PREFERENCE" in schema
     assert any(row[2] == "datasets" for row in self_fk)
+
+
+def test_v18_migration_backfills_model_lineage_edges(tmp_path: Path) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("NOVA", ModelOrigin.ZERO)
+    state = registry.read()
+
+    from frontierwright.domain import ModelState
+
+    parent = ModelState(
+        model_id="lineage-parent",
+        identity_id=state.project["identity_id"],
+        origin=ModelOrigin.ZERO,
+        checkpoint="parent",
+        fingerprint="sha256:parent",
+    )
+    child = ModelState(
+        model_id="lineage-child",
+        identity_id=state.project["identity_id"],
+        origin=ModelOrigin.ZERO,
+        checkpoint="child",
+        fingerprint="sha256:child",
+        parent_model_id=parent.model_id,
+    )
+
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "INSERT INTO models(model_id,parent_model_id,snapshot) VALUES (?,?,?)",
+            (parent.model_id, None, json.dumps(asdict(parent), sort_keys=True)),
+        )
+        connection.execute(
+            "INSERT INTO models(model_id,parent_model_id,snapshot) VALUES (?,?,?)",
+            (
+                child.model_id,
+                parent.model_id,
+                json.dumps(asdict(child), sort_keys=True),
+            ),
+        )
+        connection.execute("DROP TABLE model_lineage_edges")
+        connection.execute("PRAGMA user_version = 18")
+        connection.commit()
+
+    lineage = registry.get_model_lineage(child.model_id)
+    assert lineage == (
+        {
+            "child_model_id": child.model_id,
+            "parent_model_id": parent.model_id,
+            "relation": "DERIVED_FROM",
+            "ordinal": 0,
+            "created_at": lineage[0]["created_at"],
+            "details": {"source": "legacy_parent_model_id"},
+        },
+    )
+
+    with sqlite3.connect(registry.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    assert version == SCHEMA_VERSION == 19

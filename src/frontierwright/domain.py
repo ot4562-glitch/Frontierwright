@@ -44,6 +44,13 @@ class CandidateStatus(StrEnum):
     INCOMPLETE = "INCOMPLETE"
 
 
+class LineageRelation(StrEnum):
+    DERIVED_FROM = "DERIVED_FROM"
+    MERGED_FROM = "MERGED_FROM"
+    DISTILLED_FROM = "DISTILLED_FROM"
+    TRANSFORMED_FROM = "TRANSFORMED_FROM"
+
+
 class ModelFormat(StrEnum):
     HUGGINGFACE = "HUGGINGFACE"
     GGUF = "GGUF"
