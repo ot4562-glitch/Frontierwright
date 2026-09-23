@@ -9,7 +9,7 @@ from frontierwright.domain import ModelOrigin
 from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
-from frontierwright.recipes import TEXT_LINES_PLUGIN_ID
+from frontierwright.recipes import BYTE_SHARDS_PLUGIN_ID, TEXT_LINES_PLUGIN_ID
 from frontierwright.registry import Registry
 from frontierwright.service import (
     add_local_dataset,
@@ -436,4 +436,104 @@ def test_weighted_text_mixture_enforces_materialization_size_limit(
             project,
             inputs=[(prepared_ids[0], 1), (prepared_ids[1], 1)],
             max_output_bytes=3,
+        )
+
+
+def test_byte_shards_requires_prepared_text_and_records_exact_count(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    Registry(project).initialize("NOVA", ModelOrigin.ZERO)
+    add_local_dataset(
+        project,
+        make_dataset(tmp_path / "raw", "café\nbeta\n"),
+        name="Raw",
+        role=DatasetRole.PRETRAIN,
+    )
+    raw = next(item for item in get_data_view(project).datasets if item["name"] == "Raw")
+
+    with pytest.raises(FrontierwrightError, match="requires a managed prepared dataset"):
+        prepare_dataset(
+            project,
+            dataset_id=str(raw["dataset_id"]),
+            plugin_id=BYTE_SHARDS_PLUGIN_ID,
+        )
+
+    text_view = prepare_dataset(
+        project,
+        dataset_id=str(raw["dataset_id"]),
+        plugin_id=TEXT_LINES_PLUGIN_ID,
+        name="Text",
+    )
+    text = next(item for item in text_view.datasets if item["name"] == "Text")
+
+    sharded_view = prepare_dataset(
+        project,
+        dataset_id=str(text["dataset_id"]),
+        plugin_id=BYTE_SHARDS_PLUGIN_ID,
+        config={"bytes_per_shard": 4},
+        name="Byte shards",
+    )
+    sharded = next(item for item in sharded_view.datasets if item["name"] == "Byte shards")
+
+    expected = "café\nbeta\n".encode()
+    shard_root = Path(str(sharded["source_path"]))
+    shard_paths = sorted(shard_root.glob("shard-*.bin"))
+    assert [path.stat().st_size for path in shard_paths] == [4, 4, 3]
+    assert b"".join(path.read_bytes() for path in shard_paths) == expected
+    assert sharded["token_count"] == len(expected)
+
+    recipe = Registry(project).get_data_recipe(str(sharded["preparation_recipe_id"]))
+    assert recipe is not None
+    manifest_path = shard_root.parent / "recipe.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["recipe_hash"] == recipe["recipe_hash"]
+    assert manifest["transformation"]["representation"] == "uint8_byte_ids"
+    assert manifest["transformation"]["byte_id_count"] == len(expected)
+    assert manifest["transformation"]["shard_count"] == 3
+
+    replay = prepare_dataset(
+        project,
+        dataset_id=str(text["dataset_id"]),
+        plugin_id=BYTE_SHARDS_PLUGIN_ID,
+        config={"bytes_per_shard": 4},
+        name="Ignored replay name",
+    )
+    assert len(replay.datasets) == 3
+
+
+def test_byte_shards_detects_published_artifact_tampering(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    Registry(project).initialize("NOVA", ModelOrigin.ZERO)
+    add_local_dataset(
+        project,
+        make_dataset(tmp_path / "raw", "alpha\nbeta\n"),
+        name="Raw",
+        role=DatasetRole.PRETRAIN,
+    )
+    raw = next(item for item in get_data_view(project).datasets if item["name"] == "Raw")
+    text_view = prepare_dataset(
+        project,
+        dataset_id=str(raw["dataset_id"]),
+        plugin_id=TEXT_LINES_PLUGIN_ID,
+        name="Text",
+    )
+    text = next(item for item in text_view.datasets if item["name"] == "Text")
+    sharded_view = prepare_dataset(
+        project,
+        dataset_id=str(text["dataset_id"]),
+        plugin_id=BYTE_SHARDS_PLUGIN_ID,
+        config={"bytes_per_shard": 5},
+        name="Byte shards",
+    )
+    sharded = next(item for item in sharded_view.datasets if item["name"] == "Byte shards")
+    first_shard = sorted(Path(str(sharded["source_path"])).glob("shard-*.bin"))[0]
+    first_shard.write_bytes(b"tampered")
+
+    with pytest.raises(FrontierwrightError, match="recorded fingerprint"):
+        prepare_dataset(
+            project,
+            dataset_id=str(text["dataset_id"]),
+            plugin_id=BYTE_SHARDS_PLUGIN_ID,
+            config={"bytes_per_shard": 5},
         )

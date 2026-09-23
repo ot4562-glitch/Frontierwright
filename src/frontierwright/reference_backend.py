@@ -263,20 +263,34 @@ def _dataset_files(source: Path) -> list[Path]:
 
 
 def _read_corpus(source: Path, *, max_bytes: int) -> bytes:
+    files = _dataset_files(source)
+    shard_mode = all(
+        path.suffix == ".bin" and path.name.startswith("shard-")
+        for path in files
+    )
+    separator = b"" if shard_mode else b"\n"
+
     chunks: list[bytes] = []
     total = 0
-    for path in _dataset_files(source):
-        size = path.stat().st_size
-        if total + size > max_bytes:
-            remaining = max_bytes - total
-            if remaining <= 0:
+    for index, path in enumerate(files):
+        if index > 0 and separator:
+            if total + len(separator) > max_bytes:
                 break
-            chunks.append(path.read_bytes()[:remaining])
+            chunks.append(separator)
+            total += len(separator)
+
+        remaining = max_bytes - total
+        if remaining <= 0:
+            break
+        payload = path.read_bytes()
+        if len(payload) > remaining:
+            chunks.append(payload[:remaining])
             total += remaining
             break
-        chunks.append(path.read_bytes())
-        total += size
-    corpus = b"\n".join(chunks)
+        chunks.append(payload)
+        total += len(payload)
+
+    corpus = b"".join(chunks)
     if not corpus:
         raise ValueError("dataset corpus is empty")
     return corpus

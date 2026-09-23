@@ -115,6 +115,8 @@ Implemented now:
 - built-in byte-preserving managed snapshot recipe via `frontierwright data prepare`, preserving source provenance while freezing exact training-input bytes under Frontierwright state;
 - built-in `text-lines-v1` preparation normalizes UTF-8 text, canonicalizes line endings/Unicode, removes empty lines, and performs deterministic stable exact dedupe while recording transformation counts;
 - built-in weighted text-mixture preparation composes multiple managed text corpora with exact source fingerprints/parts, conservative metadata/classification propagation, deterministic output, and a hard materialization-size limit;
+- built-in `byte-shards-v1` chained preparation converts managed `corpus.txt` into deterministic uint8 byte-ID shards, records the exact training-unit count, and lets the reference backend reconstruct shard streams without inserting synthetic separators;
+- prepared-source chaining is explicit per plugin: immutable prepared data is never silently reprocessed by a recipe that did not declare support;
 - prepared datasets retain source-dataset ID plus recipe ID/hash, and training plans pin the recipe hash in addition to dataset bytes;
 - extensible intervention taxonomy spanning `BIRTH / LEARN / SPECIALIZE / ALIGN / EVOLVE / OPTIMIZE / EVALUATE / OPERATE`;
 - discoverable InterventionPlugin registry with explicit execution surfaces; built-in training interventions wrap their real path-assessment plugins rather than acting as display-only labels;
@@ -148,7 +150,7 @@ Not implemented yet:
 - an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and benchmark runner;
 - production built-in training backends for all five paths beyond the narrow from-scratch reference backend and structured external command adapter;
 - live output-storage quota enforcement during backend execution, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
-- public dataset discovery/download adapters, tokenizer-training artifacts, and explicit tokenization/sharding recipes beyond the implemented normalize/dedupe/weighted-mixture transforms;
+- public dataset discovery/download adapters, trainable tokenizer artifacts beyond the built-in byte vocabulary, and richer tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
 - remote/server/Slurm executor implementations and concrete private Lab adapters;
 - stronger executor-boundary attestation beyond the current adapter-declared trust contract.
 

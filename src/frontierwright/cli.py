@@ -17,7 +17,11 @@ from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
-from frontierwright.recipes import SNAPSHOT_COPY_PLUGIN_ID, TEXT_LINES_PLUGIN_ID
+from frontierwright.recipes import (
+    BYTE_SHARDS_PLUGIN_ID,
+    SNAPSHOT_COPY_PLUGIN_ID,
+    TEXT_LINES_PLUGIN_ID,
+)
 from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.registry import Registry
 from frontierwright.service import (
@@ -1195,10 +1199,18 @@ def data_prepare(
             "--recipe",
             help=(
                 "Preparation plugin ID. Aliases: snapshot-copy-v1 for a byte-preserving "
-                "snapshot; text-lines-v1 for UTF-8 normalization and stable exact dedupe."
+                "snapshot; text-lines-v1 for UTF-8 normalization and stable exact dedupe; "
+                "byte-shards-v1 for deterministic uint8 byte-ID shards."
             ),
         ),
     ] = "snapshot-copy-v1",
+    bytes_per_shard: Annotated[
+        int | None,
+        typer.Option(
+            "--bytes-per-shard",
+            help="Shard size for byte-shards-v1. Omit to use the recipe default.",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
@@ -1207,14 +1219,29 @@ def data_prepare(
     aliases = {
         "snapshot-copy-v1": SNAPSHOT_COPY_PLUGIN_ID,
         "text-lines-v1": TEXT_LINES_PLUGIN_ID,
+        "byte-shards-v1": BYTE_SHARDS_PLUGIN_ID,
     }
     plugin_id = aliases.get(recipe, recipe)
+    if bytes_per_shard is not None and plugin_id != BYTE_SHARDS_PLUGIN_ID:
+        _fail(
+            FrontierwrightError(
+                "DATA_RECIPE_CONFIG_UNSUPPORTED",
+                "--bytes-per-shard is only valid with byte-shards-v1.",
+                2,
+            ),
+            json_output=json_output,
+        )
+    config: dict[str, object] | None = (
+        {"bytes_per_shard": bytes_per_shard}
+        if bytes_per_shard is not None
+        else None
+    )
     try:
         view = prepare_dataset(
             path,
             dataset_id=dataset,
             plugin_id=plugin_id,
-            config=None,
+            config=config,
             name=name,
         )
     except FrontierwrightError as exc:

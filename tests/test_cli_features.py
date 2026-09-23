@@ -71,6 +71,11 @@ def test_data_and_paths_machine_surface(tmp_path: Path) -> None:
             "plugin_version": "1",
             "title": "Deterministic weighted mixture of managed UTF-8 corpora",
         },
+        {
+            "plugin_id": "frontierwright.data.byte-shards",
+            "plugin_version": "1",
+            "title": "Materialize uint8 byte-ID training shards",
+        },
     ]
 
     added = runner.invoke(
@@ -308,6 +313,39 @@ def test_text_lines_recipe_cli_alias_prepares_managed_dataset(tmp_path: Path) ->
 
     output = Path(str(managed["source_path"])) / "corpus.txt"
     assert output.read_text(encoding="utf-8") == "alpha\nbeta\n"
+
+    sharded = runner.invoke(
+        app,
+        [
+            "data",
+            "prepare",
+            "--dataset",
+            str(managed["dataset_id"]),
+            "--recipe",
+            "byte-shards-v1",
+            "--bytes-per-shard",
+            "4",
+            "--path",
+            str(project),
+            "--name",
+            "Prepared byte shards",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert sharded.exit_code == 0, sharded.output
+    sharded_payload = json.loads(sharded.stdout)
+    byte_data = next(
+        item
+        for item in sharded_payload["datasets"]
+        if item["name"] == "Prepared byte shards"
+    )
+    shard_root = Path(str(byte_data["source_path"]))
+    assert b"".join(
+        path.read_bytes() for path in sorted(shard_root.glob("shard-*.bin"))
+    ) == b"alpha\nbeta\n"
+    assert byte_data["token_count"] == len(b"alpha\nbeta\n")
 
     recipes = runner.invoke(
         app,

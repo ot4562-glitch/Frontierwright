@@ -50,7 +50,11 @@ from frontierwright.execution import (
 from frontierwright.lab_adapters import LabAdapterManifest
 from frontierwright.models import HistoryEvidenceResult, ImportedModelDescriptor
 from frontierwright.paths import TrainingPathId
-from frontierwright.recipes import SNAPSHOT_COPY_PLUGIN_ID, DataPreparationRecipe
+from frontierwright.recipes import (
+    BYTE_SHARDS_PLUGIN_ID,
+    SNAPSHOT_COPY_PLUGIN_ID,
+    DataPreparationRecipe,
+)
 from frontierwright.resources import ResourceSnapshot
 
 SCHEMA_VERSION = 17
@@ -2483,6 +2487,13 @@ class Registry:
                     )
                 effective_text[key] = value
 
+            if recipe.plugin_id == SNAPSHOT_COPY_PLUGIN_ID:
+                effective_units = source["token_count"]
+            elif recipe.plugin_id == BYTE_SHARDS_PLUGIN_ID:
+                effective_units = descriptor.total_bytes
+            else:
+                effective_units = None
+
             existing_recipe = connection.execute(
                 "SELECT * FROM data_recipes WHERE recipe_hash = ?",
                 (recipe.recipe_hash,),
@@ -2549,11 +2560,7 @@ class Registry:
                     effective_text["license"],
                     effective_text["domain"],
                     effective_text["language"],
-                    (
-                        source["token_count"]
-                        if recipe.plugin_id == SNAPSHOT_COPY_PLUGIN_ID
-                        else None
-                    ),
+                    effective_units,
                     timestamp(),
                     recipe.source_dataset_id,
                     recipe.recipe_id,

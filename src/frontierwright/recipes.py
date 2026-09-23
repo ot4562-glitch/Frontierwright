@@ -21,6 +21,9 @@ TEXT_LINES_PLUGIN_ID = "frontierwright.data.text-lines-normalize-dedupe"
 TEXT_LINES_PLUGIN_VERSION = "1"
 WEIGHTED_TEXT_MIXTURE_PLUGIN_ID = "frontierwright.data.weighted-text-mixture"
 WEIGHTED_TEXT_MIXTURE_PLUGIN_VERSION = "1"
+BYTE_SHARDS_PLUGIN_ID = "frontierwright.data.byte-shards"
+BYTE_SHARDS_PLUGIN_VERSION = "1"
+BYTE_VOCAB_ID = "frontierwright-byte-vocab-v1"
 
 
 @dataclass(frozen=True)
@@ -921,6 +924,240 @@ def materialize_weighted_text_mixture_recipe(
         raise
 
 
+def _byte_shards_config(config: dict[str, object] | None) -> dict[str, object]:
+    defaults: dict[str, object] = {
+        "vocab_id": BYTE_VOCAB_ID,
+        "dtype": "uint8",
+        "bytes_per_shard": 1024 * 1024,
+        "source": "corpus.txt",
+    }
+    supplied = dict(config or {})
+    unknown = sorted(set(supplied) - set(defaults))
+    if unknown:
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "byte-shards recipe does not support config keys: " + ", ".join(unknown),
+            2,
+        )
+    merged = {**defaults, **supplied}
+    if merged["vocab_id"] != BYTE_VOCAB_ID:
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            f"byte-shards v1 requires vocab_id={BYTE_VOCAB_ID}.",
+            2,
+        )
+    if merged["dtype"] != "uint8":
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "byte-shards v1 stores byte IDs as uint8 only.",
+            2,
+        )
+    shard_size = merged["bytes_per_shard"]
+    if (
+        isinstance(shard_size, bool)
+        or not isinstance(shard_size, int)
+        or shard_size <= 0
+    ):
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "bytes_per_shard must be a positive integer.",
+            2,
+        )
+    if shard_size > 1024 * 1024 * 1024:
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "bytes_per_shard exceeds the v1 limit of 1 GiB.",
+            2,
+        )
+    if merged["source"] != "corpus.txt":
+        raise FrontierwrightError(
+            "DATA_RECIPE_CONFIG_UNSUPPORTED",
+            "byte-shards v1 consumes managed corpus.txt only.",
+            2,
+        )
+    return merged
+
+
+def make_byte_shards_recipe(
+    *,
+    source_dataset_id: str,
+    source_fingerprint: str,
+    config: dict[str, object] | None = None,
+) -> DataPreparationRecipe:
+    canonical_config = _byte_shards_config(config)
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "plugin_id": BYTE_SHARDS_PLUGIN_ID,
+        "plugin_version": BYTE_SHARDS_PLUGIN_VERSION,
+        "source_dataset_id": source_dataset_id,
+        "source_fingerprint": source_fingerprint,
+        "config": canonical_config,
+    }
+    digest = hashlib.sha256(_canonical_bytes(payload)).hexdigest()
+    return DataPreparationRecipe(
+        recipe_id=f"data-recipe-{digest[:32]}",
+        recipe_hash=f"sha256:{digest}",
+        plugin_id=BYTE_SHARDS_PLUGIN_ID,
+        plugin_version=BYTE_SHARDS_PLUGIN_VERSION,
+        source_dataset_id=source_dataset_id,
+        source_fingerprint=source_fingerprint,
+        config=canonical_config,
+    )
+
+
+def _managed_corpus_path(source: DatasetDescriptor) -> Path:
+    if source.source_path.is_file():
+        raise FrontierwrightError(
+            "DATA_SHARDS_SOURCE_INVALID",
+            "byte-shards requires a managed dataset directory containing corpus.txt.",
+            13,
+        )
+    corpus = source.source_path / "corpus.txt"
+    if corpus.is_symlink() or not corpus.is_file():
+        raise FrontierwrightError(
+            "DATA_SHARDS_SOURCE_INVALID",
+            "byte-shards requires a managed corpus.txt source.",
+            13,
+        )
+    return corpus
+
+
+def materialize_byte_shards_recipe(
+    state_dir: Path,
+    *,
+    source: DatasetDescriptor,
+    recipe: DataPreparationRecipe,
+) -> DatasetDescriptor:
+    """Materialize deterministic uint8 byte-ID shards for the reference vocabulary."""
+
+    if recipe.plugin_id != BYTE_SHARDS_PLUGIN_ID:
+        raise FrontierwrightError(
+            "DATA_RECIPE_PLUGIN_MISMATCH",
+            "Byte-shards materializer received a recipe for a different plugin.",
+            13,
+        )
+    if source.fingerprint != recipe.source_fingerprint:
+        raise FrontierwrightError(
+            "DATA_RECIPE_SOURCE_DRIFT",
+            "Dataset content no longer matches the fingerprint pinned by the recipe.",
+            13,
+        )
+
+    config = _byte_shards_config(recipe.config)
+    prepared_root = state_dir.resolve() / "data" / "prepared" / recipe.recipe_id
+    data_root = prepared_root / "data"
+    manifest_path = prepared_root / "recipe.json"
+
+    if prepared_root.exists():
+        if not manifest_path.is_file() or not data_root.is_dir():
+            raise FrontierwrightError(
+                "DATA_PREP_ARTIFACT_INVALID",
+                "Existing byte-shards artifact is incomplete.",
+                13,
+            )
+        prepared = inspect_local_dataset(data_root)
+        manifest = _load_prepared_manifest(manifest_path)
+        if manifest.get("recipe_hash") != recipe.recipe_hash:
+            raise FrontierwrightError(
+                "DATA_PREP_MANIFEST_INVALID",
+                "Prepared byte-shards manifest does not match the requested recipe.",
+                13,
+            )
+        if manifest.get("prepared_fingerprint") != prepared.fingerprint:
+            raise FrontierwrightError(
+                "DATA_PREP_ARTIFACT_TAMPERED",
+                "Prepared byte-shards no longer match their recorded fingerprint.",
+                13,
+            )
+        return prepared
+
+    corpus_path = _managed_corpus_path(source)
+    try:
+        payload = corpus_path.read_bytes()
+    except OSError as exc:
+        raise FrontierwrightError(
+            "DATA_PREP_SOURCE_UNREADABLE",
+            "Could not read managed corpus.txt for byte-shards preparation.",
+            13,
+        ) from exc
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FrontierwrightError(
+            "DATA_PREP_TEXT_ENCODING",
+            "byte-shards requires corpus.txt to contain valid UTF-8.",
+            13,
+        ) from exc
+    if not payload:
+        raise FrontierwrightError(
+            "DATA_EMPTY",
+            "byte-shards cannot materialize an empty corpus.",
+            12,
+        )
+
+    bytes_per_shard = config["bytes_per_shard"]
+    assert isinstance(bytes_per_shard, int)
+
+    staging_parent = state_dir.resolve() / "data" / ".staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f"{recipe.recipe_id}-", dir=staging_parent)
+    ).resolve()
+
+    try:
+        staging_data = staging_root / "data"
+        staging_data.mkdir(parents=True, exist_ok=False)
+        shard_count = 0
+        for offset in range(0, len(payload), bytes_per_shard):
+            shard = payload[offset : offset + bytes_per_shard]
+            shard_path = staging_data / f"shard-{shard_count:05d}.bin"
+            shard_path.write_bytes(shard)
+            shard_count += 1
+
+        prepared = inspect_local_dataset(staging_data)
+        transformation: dict[str, object] = {
+            "representation": "uint8_byte_ids",
+            "vocab_id": BYTE_VOCAB_ID,
+            "dtype": "uint8",
+            "byte_id_count": len(payload),
+            "shard_count": shard_count,
+            "bytes_per_shard": bytes_per_shard,
+            "source": "corpus.txt",
+        }
+        _write_recipe_manifest(
+            staging_root / "recipe.json",
+            recipe,
+            prepared,
+            transformation=transformation,
+        )
+
+        prepared_root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(staging_root, prepared_root)
+        except FileExistsError:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+        final = inspect_local_dataset(data_root)
+        manifest = _load_prepared_manifest(manifest_path)
+        if manifest.get("recipe_hash") != recipe.recipe_hash:
+            raise FrontierwrightError(
+                "DATA_PREP_MANIFEST_INVALID",
+                "Published byte-shards artifact has the wrong recipe hash.",
+                13,
+            )
+        if manifest.get("prepared_fingerprint") != final.fingerprint:
+            raise FrontierwrightError(
+                "DATA_PREP_COPY_MISMATCH",
+                "Published byte-shards artifact differs from its recorded fingerprint.",
+                13,
+            )
+        return final
+    except Exception:
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+
+
 class DataPreparationPlugin(Protocol):
     """Contract for reproducible dataset preparation implementations."""
 
@@ -932,6 +1169,12 @@ class DataPreparationPlugin(Protocol):
 
     @property
     def title(self) -> str: ...
+
+    @property
+    def accepts_prepared_source(self) -> bool: ...
+
+    @property
+    def requires_prepared_source(self) -> bool: ...
 
     def build_recipe(
         self,
@@ -960,6 +1203,8 @@ class SnapshotCopyPreparationPlugin:
     plugin_id: str = SNAPSHOT_COPY_PLUGIN_ID
     plugin_version: str = SNAPSHOT_COPY_PLUGIN_VERSION
     title: str = "Byte-preserving managed snapshot"
+    accepts_prepared_source: bool = False
+    requires_prepared_source: bool = False
 
     def build_recipe(
         self,
@@ -1010,6 +1255,8 @@ class TextLinesPreparationPlugin:
     plugin_id: str = TEXT_LINES_PLUGIN_ID
     plugin_version: str = TEXT_LINES_PLUGIN_VERSION
     title: str = "Normalize and stable-dedupe UTF-8 text lines"
+    accepts_prepared_source: bool = False
+    requires_prepared_source: bool = False
 
     def build_recipe(
         self,
@@ -1054,6 +1301,8 @@ class WeightedTextMixturePreparationPlugin:
     plugin_id: str = WEIGHTED_TEXT_MIXTURE_PLUGIN_ID
     plugin_version: str = WEIGHTED_TEXT_MIXTURE_PLUGIN_VERSION
     title: str = "Deterministic weighted mixture of managed UTF-8 corpora"
+    accepts_prepared_source: bool = True
+    requires_prepared_source: bool = True
 
     def build_recipe(
         self,
@@ -1094,10 +1343,58 @@ class WeightedTextMixturePreparationPlugin:
         )
 
 
+
+@dataclass(frozen=True)
+class ByteShardsPreparationPlugin:
+    plugin_id: str = BYTE_SHARDS_PLUGIN_ID
+    plugin_version: str = BYTE_SHARDS_PLUGIN_VERSION
+    title: str = "Materialize uint8 byte-ID training shards"
+    accepts_prepared_source: bool = True
+    requires_prepared_source: bool = True
+
+    def build_recipe(
+        self,
+        *,
+        source_dataset_id: str,
+        source_fingerprint: str,
+        config: dict[str, object] | None = None,
+    ) -> DataPreparationRecipe:
+        return make_byte_shards_recipe(
+            source_dataset_id=source_dataset_id,
+            source_fingerprint=source_fingerprint,
+            config=config,
+        )
+
+    def source_bindings(
+        self,
+        recipe: DataPreparationRecipe,
+    ) -> tuple[DataSourceBinding, ...]:
+        return (
+            DataSourceBinding(
+                dataset_id=recipe.source_dataset_id,
+                fingerprint=recipe.source_fingerprint,
+            ),
+        )
+
+    def materialize(
+        self,
+        state_dir: Path,
+        *,
+        sources: dict[str, DatasetDescriptor],
+        recipe: DataPreparationRecipe,
+    ) -> DatasetDescriptor:
+        return materialize_byte_shards_recipe(
+            state_dir,
+            source=sources[recipe.source_dataset_id],
+            recipe=recipe,
+        )
+
+
 BUILTIN_DATA_PREPARATION_PLUGINS: tuple[DataPreparationPlugin, ...] = (
     SnapshotCopyPreparationPlugin(),
     TextLinesPreparationPlugin(),
     WeightedTextMixturePreparationPlugin(),
+    ByteShardsPreparationPlugin(),
 )
 
 _DATA_PREPARATION_PLUGINS = {

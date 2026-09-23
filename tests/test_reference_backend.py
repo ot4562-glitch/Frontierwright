@@ -3,6 +3,7 @@ from pathlib import Path
 
 from frontierwright.reference_backend import (
     _load_config,
+    _read_corpus,
     backend_spec_payload,
 )
 
@@ -47,3 +48,27 @@ def test_reference_config_infers_preset_from_materialized_model(
 
     assert config.preset.name == "zero-25m"
     assert config.steps == 3
+
+
+def test_reference_backend_concatenates_byte_shards_without_separator(
+    tmp_path: Path,
+) -> None:
+    shards = tmp_path / "shards"
+    shards.mkdir()
+    (shards / "shard-00000.bin").write_bytes(b"abcd")
+    (shards / "shard-00001.bin").write_bytes(b"efgh")
+    (shards / "shard-00002.bin").write_bytes(b"ijk")
+
+    assert _read_corpus(shards, max_bytes=100) == b"abcdefghijk"
+    assert _read_corpus(shards, max_bytes=6) == b"abcdef"
+
+
+def test_reference_backend_still_separates_multiple_plain_files(
+    tmp_path: Path,
+) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.txt").write_bytes(b"alpha")
+    (corpus / "b.txt").write_bytes(b"beta")
+
+    assert _read_corpus(corpus, max_bytes=100) == b"alpha\nbeta"

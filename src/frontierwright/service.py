@@ -1244,10 +1244,21 @@ def prepare_dataset(
             "Source dataset is not active in this project.",
             3,
         )
-    if isinstance(source.get("preparation_recipe_hash"), str):
+    plugin = data_preparation_plugin(plugin_id)
+    source_is_prepared = isinstance(source.get("preparation_recipe_hash"), str)
+    if source_is_prepared and not plugin.accepts_prepared_source:
         raise FrontierwrightError(
             "DATASET_ALREADY_PREPARED",
-            "Managed prepared datasets are already immutable training inputs.",
+            (
+                "This preparation recipe does not accept an already prepared source. "
+                "Choose a recipe that explicitly supports chained preparation."
+            ),
+            13,
+        )
+    if plugin.requires_prepared_source and not source_is_prepared:
+        raise FrontierwrightError(
+            "DATA_RECIPE_PREPARED_SOURCE_REQUIRED",
+            "This preparation recipe requires a managed prepared dataset as its source.",
             13,
         )
 
@@ -1268,7 +1279,6 @@ def prepare_dataset(
             13,
         )
 
-    plugin = data_preparation_plugin(plugin_id)
     recipe = plugin.build_recipe(
         source_dataset_id=dataset_id,
         source_fingerprint=source_fingerprint,
