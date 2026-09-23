@@ -111,6 +111,9 @@ class CommandBackendSpec:
 class TrainingPlan:
     plan_id: str
     path_id: TrainingPathId
+    intervention_id: str
+    intervention_version: str
+    intervention_family: str
     backend_id: str
     backend_spec_hash: str
     model_id: str | None
@@ -127,11 +130,24 @@ class TrainingPlan:
     config: dict[str, object]
     idempotency_key: str
 
+    def __post_init__(self) -> None:
+        for name in (
+            "intervention_id",
+            "intervention_version",
+            "intervention_family",
+        ):
+            value = getattr(self, name)
+            if not value.strip():
+                raise ValueError(f"{name} must be nonempty")
+
     def request_payload(self) -> dict[str, object]:
         return {
             "schema_version": 1,
             "plan_id": self.plan_id,
             "path_id": self.path_id.value,
+            "intervention_id": self.intervention_id,
+            "intervention_version": self.intervention_version,
+            "intervention_family": self.intervention_family,
             "backend_id": self.backend_id,
             "backend_spec_hash": self.backend_spec_hash,
             "model_id": self.model_id,
@@ -281,6 +297,8 @@ def compute_execution_request_digest(
 def compute_plan_idempotency_key(
     *,
     path_id: TrainingPathId,
+    intervention_id: str,
+    intervention_version: str,
     backend_id: str,
     backend_spec_hash: str,
     model_fingerprint: str | None,
@@ -293,6 +311,8 @@ def compute_plan_idempotency_key(
 ) -> str:
     payload = {
         "path_id": path_id.value,
+        "intervention_id": intervention_id,
+        "intervention_version": intervention_version,
         "backend_id": backend_id,
         "backend_spec_hash": backend_spec_hash,
         "model_fingerprint": model_fingerprint,

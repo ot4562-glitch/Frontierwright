@@ -638,6 +638,9 @@ def test_sealed_candidate_manifest_binds_preparation_recipe(tmp_path: Path) -> N
     manifest = json.loads(
         Path(str(record["manifest_path"])).read_text(encoding="utf-8")
     )
+    assert manifest["intervention_id"] == "frontierwright.specialize.lora-sft"
+    assert manifest["intervention_version"] == "1"
+    assert manifest["intervention_family"] == "SPECIALIZE"
     assert manifest["dataset_id"] == prepared["dataset_id"]
     assert manifest["dataset_fingerprint"] == prepared["fingerprint"]
     assert manifest["dataset_recipe_id"] == prepared["preparation_recipe_id"]

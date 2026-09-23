@@ -45,7 +45,7 @@ from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import DataPreparationRecipe
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -169,6 +169,9 @@ CREATE TABLE plans (
     plan_id TEXT PRIMARY KEY,
     idempotency_key TEXT NOT NULL UNIQUE,
     path_id TEXT NOT NULL,
+    intervention_id TEXT,
+    intervention_version TEXT,
+    intervention_family TEXT,
     backend_id TEXT NOT NULL,
     backend_spec_hash TEXT NOT NULL,
     model_id TEXT REFERENCES models(model_id),
@@ -486,6 +489,9 @@ def decode_plan(row: sqlite3.Row) -> TrainingPlan:
     return TrainingPlan(
         plan_id=row["plan_id"],
         path_id=TrainingPathId(row["path_id"]),
+        intervention_id=row["intervention_id"],
+        intervention_version=row["intervention_version"],
+        intervention_family=row["intervention_family"],
         backend_id=row["backend_id"],
         backend_spec_hash=row["backend_spec_hash"],
         model_id=row["model_id"],
@@ -708,6 +714,56 @@ class Registry:
                 )
                 connection.commit()
                 version = 12
+
+            if version == 12:
+                plan_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(plans)")
+                }
+                connection.execute("BEGIN IMMEDIATE")
+                if "intervention_id" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN intervention_id TEXT"
+                    )
+                if "intervention_version" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN intervention_version TEXT"
+                    )
+                if "intervention_family" not in plan_columns:
+                    connection.execute(
+                        "ALTER TABLE plans ADD COLUMN intervention_family TEXT"
+                    )
+                connection.execute(
+                    "UPDATE plans SET intervention_id = CASE path_id "
+                    "WHEN 'FROM_SCRATCH_PRETRAINING' THEN 'frontierwright.learn.pretrain' "
+                    "WHEN 'CONTINUED_PRETRAINING' THEN 'frontierwright.learn.continued-pretrain' "
+                    "WHEN 'FULL_SFT' THEN 'frontierwright.specialize.full-sft' "
+                    "WHEN 'LORA_SFT' THEN 'frontierwright.specialize.lora-sft' "
+                    "WHEN 'QLORA_SFT' THEN 'frontierwright.specialize.qlora-sft' "
+                    "ELSE intervention_id END "
+                    "WHERE intervention_id IS NULL"
+                )
+                connection.execute(
+                    "UPDATE plans SET intervention_family = CASE path_id "
+                    "WHEN 'FROM_SCRATCH_PRETRAINING' THEN 'LEARN' "
+                    "WHEN 'CONTINUED_PRETRAINING' THEN 'LEARN' "
+                    "WHEN 'FULL_SFT' THEN 'SPECIALIZE' "
+                    "WHEN 'LORA_SFT' THEN 'SPECIALIZE' "
+                    "WHEN 'QLORA_SFT' THEN 'SPECIALIZE' "
+                    "ELSE intervention_family END "
+                    "WHERE intervention_family IS NULL"
+                )
+                connection.execute(
+                    "UPDATE plans SET intervention_version = '1' "
+                    "WHERE intervention_version IS NULL"
+                )
+                connection.execute("PRAGMA user_version = 13")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 12, "to_version": 13},
+                )
+                connection.commit()
+                version = 13
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -1410,16 +1466,20 @@ class Registry:
 
             connection.execute(
                 "INSERT INTO plans ("
-                "plan_id, idempotency_key, path_id, backend_id, backend_spec_hash, "
-                "model_id, model_fingerprint, model_source_path, dataset_id, "
-                "dataset_fingerprint, dataset_source_path, dataset_recipe_id, "
-                "dataset_recipe_hash, resource_profile_id, permission, budgets_json, "
-                "config_json, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "plan_id, idempotency_key, path_id, intervention_id, "
+                "intervention_version, intervention_family, backend_id, "
+                "backend_spec_hash, model_id, model_fingerprint, model_source_path, "
+                "dataset_id, dataset_fingerprint, dataset_source_path, "
+                "dataset_recipe_id, dataset_recipe_hash, resource_profile_id, "
+                "permission, budgets_json, config_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     plan.plan_id,
                     plan.idempotency_key,
                     plan.path_id.value,
+                    plan.intervention_id,
+                    plan.intervention_version,
+                    plan.intervention_family,
                     plan.backend_id,
                     plan.backend_spec_hash,
                     plan.model_id,
@@ -1443,6 +1503,9 @@ class Registry:
                 {
                     "plan_id": plan.plan_id,
                     "path_id": plan.path_id.value,
+                    "intervention_id": plan.intervention_id,
+                    "intervention_version": plan.intervention_version,
+                    "intervention_family": plan.intervention_family,
                     "backend_id": plan.backend_id,
                     "idempotency_key": plan.idempotency_key,
                 },

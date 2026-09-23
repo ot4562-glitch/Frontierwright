@@ -43,7 +43,11 @@ from frontierwright.execution import (
     run_calibration_backend,
     run_structured_command,
 )
-from frontierwright.interventions import intervention_for_training_path
+from frontierwright.interventions import (
+    assess_training_interventions,
+    intervention_for_training_path,
+    intervention_plugins,
+)
 from frontierwright.local_executor import (
     LocalAttemptSpec,
     atomic_write_json,
@@ -54,7 +58,7 @@ from frontierwright.local_executor import (
     terminate_worker_tree,
 )
 from frontierwright.models import discover_history_evidence, inspect_local_model
-from frontierwright.paths import PathAvailability, PathContext, TrainingPathId, assess_paths
+from frontierwright.paths import PathAvailability, PathContext, TrainingPathId
 from frontierwright.recipes import (
     BUILTIN_DATA_PREPARATION_PLUGINS,
     SNAPSHOT_COPY_PLUGIN_ID,
@@ -187,10 +191,22 @@ class PathsView:
 
 
 @dataclass(frozen=True)
+class InterventionsView:
+    schema_version: int = 1
+    interventions: list[dict[str, object]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class PlanView:
     schema_version: int = 1
     plan_id: str | None = None
     path_id: str | None = None
+    intervention_id: str | None = None
+    intervention_version: str | None = None
+    intervention_family: str | None = None
     backend_id: str | None = None
     backend_spec_hash: str | None = None
     model_id: str | None = None
@@ -1302,6 +1318,9 @@ def get_plan_view(root: Path, plan_id: str) -> PlanView:
     return PlanView(
         plan_id=plan.plan_id,
         path_id=plan.path_id.value,
+        intervention_id=plan.intervention_id,
+        intervention_version=plan.intervention_version,
+        intervention_family=plan.intervention_family,
         backend_id=plan.backend_id,
         backend_spec_hash=plan.backend_spec_hash,
         model_id=plan.model_id,
@@ -1365,10 +1384,13 @@ def create_training_plan(
         dataset_id=dataset_id,
         role=_required_dataset_role(path_id),
     )
+    intervention = intervention_for_training_path(path_id)
 
     try:
         key = compute_plan_idempotency_key(
             path_id=path_id,
+            intervention_id=intervention.intervention_id,
+            intervention_version=intervention.version,
             backend_id=backend.backend_id,
             backend_spec_hash=backend.sha256,
             model_fingerprint=(
@@ -1399,6 +1421,9 @@ def create_training_plan(
     plan = TrainingPlan(
         plan_id=f"plan-{uuid4().hex}",
         path_id=path_id,
+        intervention_id=intervention.intervention_id,
+        intervention_version=intervention.version,
+        intervention_family=intervention.family.value,
         backend_id=backend.backend_id,
         backend_spec_hash=backend.sha256,
         model_id=state.champion.model.model_id if state.champion is not None else None,
@@ -2203,6 +2228,15 @@ def get_history_view(root: Path) -> HistoryView:
     return HistoryView(events=events)
 
 
+def get_interventions_view() -> InterventionsView:
+    return InterventionsView(
+        interventions=[
+            plugin.descriptor.machine_payload()
+            for plugin in intervention_plugins()
+        ]
+    )
+
+
 def get_paths_view(root: Path) -> PathsView:
     registry = Registry(root)
     if not registry.exists:
@@ -2229,11 +2263,10 @@ def get_paths_view(root: Path) -> PathsView:
         dataset_roles=roles,
         champion_is_birth_root=champion_birth is not None,
     )
-    assessments = assess_paths(context)
+    assessments = assess_training_interventions(context)
 
     paths: list[dict[str, object]] = []
-    for item in assessments:
-        intervention = intervention_for_training_path(item.path_id)
+    for intervention, item in assessments:
         payload: dict[str, object] = {
             "path_id": item.path_id.value,
             "intervention_id": intervention.intervention_id,

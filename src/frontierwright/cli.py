@@ -27,6 +27,7 @@ from frontierwright.service import (
     CompareView,
     DataView,
     HistoryView,
+    InterventionsView,
     PathsView,
     PlanView,
     ResourceView,
@@ -46,6 +47,7 @@ from frontierwright.service import (
     get_data_preparation_plugins,
     get_data_view,
     get_history_view,
+    get_interventions_view,
     get_paths_view,
     get_plan_view,
     get_resource_view,
@@ -140,6 +142,10 @@ def _data_payload(view: DataView) -> dict[str, object]:
 
 
 def _paths_payload(view: PathsView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _interventions_payload(view: InterventionsView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -1067,6 +1073,28 @@ def data_prepare(
         _emit_json(_data_payload(view))
         return
     _print_data(view)
+
+
+@app.command("interventions")
+def interventions_command(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    view = get_interventions_view()
+    if json_output:
+        _emit_json(_interventions_payload(view))
+        return
+
+    console.print("[bold]INTERVENTIONS[/bold]")
+    for item in view.interventions:
+        path_id = item.get("training_path_id")
+        suffix = f" · path={path_id}" if path_id else ""
+        console.print(
+            f"{item.get('family')} / {item.get('surface')} · "
+            f"{item.get('intervention_id')}@{item.get('version')}{suffix}"
+        )
+        console.print(f"  {item.get('title')}")
 
 
 @app.command("paths")

@@ -33,6 +33,22 @@ def test_data_and_paths_machine_surface(tmp_path: Path) -> None:
     )
     assert init.exit_code == 0, init.output
 
+    interventions = runner.invoke(
+        app,
+        ["interventions", "--json", "--non-interactive"],
+    )
+    assert interventions.exit_code == 0, interventions.output
+    intervention_payload = json.loads(interventions.stdout)
+    assert intervention_payload["interventions"][0]["intervention_id"] == (
+        "frontierwright.birth.zero"
+    )
+    assert {
+        item["intervention_id"] for item in intervention_payload["interventions"]
+    } >= {
+        "frontierwright.learn.pretrain",
+        "frontierwright.specialize.lora-sft",
+    }
+
     recipes = runner.invoke(
         app,
         ["data", "recipes", "--json", "--non-interactive"],

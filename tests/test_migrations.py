@@ -56,7 +56,7 @@ def test_previous_registry_versions_migrate_to_current(
             )
         }
 
-    assert version == SCHEMA_VERSION == 12
+    assert version == SCHEMA_VERSION == 13
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -121,7 +121,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 12
+    assert version == SCHEMA_VERSION == 13
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -215,6 +215,9 @@ def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
     plan = TrainingPlan(
         plan_id="plan-after-migration",
         path_id=TrainingPathId.LORA_SFT,
+        intervention_id="frontierwright.specialize.lora-sft",
+        intervention_version="1",
+        intervention_family="SPECIALIZE",
         backend_id="backend-v1",
         backend_spec_hash="sha256:backend-v1",
         model_id=None,
@@ -283,7 +286,7 @@ def test_v9_project_migrates_to_origin_appropriate_edition_profile(
     assert state.project["edition_profile"] == "ACADEMY"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 12
+    assert version == SCHEMA_VERSION == 13
 
 
 def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
@@ -312,7 +315,7 @@ def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(plans)")
         }
 
-    assert version == SCHEMA_VERSION == 12
+    assert version == SCHEMA_VERSION == 13
     assert "data_recipes" in tables
     assert {
         "source_dataset_id",
@@ -320,3 +323,58 @@ def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
         "preparation_recipe_hash",
     }.issubset(dataset_columns)
     assert {"dataset_recipe_id", "dataset_recipe_hash"}.issubset(plan_columns)
+
+
+def test_v12_backfills_intervention_identity_for_existing_plan(tmp_path: Path) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("NOVA", ModelOrigin.ZERO)
+
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute(
+            "INSERT INTO datasets ("
+            "dataset_id, name, role, provenance, source_path, fingerprint, "
+            "total_bytes, file_count, manifest_json, license, domain, language, "
+            "token_count, created_at, active, source_dataset_id, "
+            "preparation_recipe_id, preparation_recipe_hash"
+            ") VALUES (?, ?, 'SFT', 'LOCAL_USER', ?, ?, 4, 1, '[]', NULL, NULL, "
+            "NULL, NULL, ?, 1, NULL, NULL, NULL)",
+            (
+                "dataset-v12",
+                "fixture",
+                "/tmp/v12-data",
+                "sha256:v12-data",
+                "2026-09-23T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO plans ("
+            "plan_id, idempotency_key, path_id, intervention_id, "
+            "intervention_version, intervention_family, backend_id, "
+            "backend_spec_hash, model_id, model_fingerprint, model_source_path, "
+            "dataset_id, dataset_fingerprint, dataset_source_path, "
+            "dataset_recipe_id, dataset_recipe_hash, resource_profile_id, "
+            "permission, budgets_json, config_json, created_at"
+            ") VALUES (?, ?, 'LORA_SFT', NULL, NULL, NULL, ?, ?, NULL, NULL, NULL, "
+            "?, ?, ?, NULL, NULL, NULL, 'PLAN', '{}', '{}', ?)",
+            (
+                "plan-v12",
+                "sha256:plan-v12",
+                "backend-v12",
+                "sha256:backend-v12",
+                "dataset-v12",
+                "sha256:v12-data",
+                "/tmp/v12-data",
+                "2026-09-23T00:00:00+00:00",
+            ),
+        )
+        connection.execute("PRAGMA user_version = 12")
+        connection.commit()
+
+    plan = registry.get_plan("plan-v12")
+
+    assert plan.intervention_id == "frontierwright.specialize.lora-sft"
+    assert plan.intervention_version == "1"
+    assert plan.intervention_family == "SPECIALIZE"
+    with sqlite3.connect(registry.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    assert version == SCHEMA_VERSION == 13
