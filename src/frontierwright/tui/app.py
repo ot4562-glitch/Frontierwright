@@ -51,6 +51,7 @@ from frontierwright.service import (
     reject_candidate,
     run_capability_v1,
     set_build_intent,
+    set_build_targets,
     train_project_tokenizer,
 )
 
@@ -843,6 +844,17 @@ class FrontierwrightApp(App[None]):
                     "Choose an archetype and real capability priorities before stats exist.",
                 )
             )
+        elif self.build.mode == "TARGETS_FLOORS":
+            items.append(
+                ActionItem(
+                    "build_targets",
+                    "Set measured build targets",
+                    (
+                        "Set explicit numeric targets and optional floors on the exact "
+                        "frozen capability scale."
+                    ),
+                )
+            )
 
         if self.view.champion_model_id is not None:
             items.append(
@@ -993,6 +1005,40 @@ class FrontierwrightApp(App[None]):
                     ],
                 ),
                 self._submit_build_intent,
+            )
+            return
+
+        if action_id == "build_targets":
+            fields: list[FormField] = []
+            for axis in ("general", "reasoning", "math", "coding"):
+                current = self.view.stats.get(axis)
+                current_text = "?" if current is None else str(current)
+                fields.append(
+                    FormField(
+                        f"target_{axis}",
+                        f"{axis.title()} target (current {current_text})",
+                        str(self.build.targets.get(axis, "")),
+                        "leave blank to omit",
+                    )
+                )
+                fields.append(
+                    FormField(
+                        f"floor_{axis}",
+                        f"{axis.title()} floor (current {current_text})",
+                        str(self.build.floors.get(axis, "")),
+                        "optional",
+                    )
+                )
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="SET MEASURED BUILD TARGETS",
+                    description=(
+                        "Targets/floors bind to the current frozen capability scale. "
+                        "Blank fields are omitted; at least one target is required."
+                    ),
+                    fields=fields,
+                ),
+                self._submit_build_targets,
             )
             return
 
@@ -1218,6 +1264,29 @@ class FrontierwrightApp(App[None]):
             )
             self._refresh_all()
             self.notify("Build intent updated.")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_build_targets(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            targets: dict[str, int] = {}
+            floors: dict[str, int] = {}
+            for axis in ("general", "reasoning", "math", "coding"):
+                target_raw = values.get(f"target_{axis}", "").strip()
+                floor_raw = values.get(f"floor_{axis}", "").strip()
+                if target_raw:
+                    targets[axis] = int(target_raw)
+                if floor_raw:
+                    floors[axis] = int(floor_raw)
+            set_build_targets(
+                self.root,
+                targets=targets,
+                floors=floors,
+            )
+            self._refresh_all()
+            self.notify("Measured build targets updated.")
         except (FrontierwrightError, KeyError, ValueError) as exc:
             self.notify(str(exc), severity="error")
 

@@ -2,7 +2,13 @@ from pathlib import Path
 
 from textual.widgets import TabbedContent
 
-from frontierwright.domain import ModelOrigin, ModelState
+from frontierwright.capability_v1 import (
+    CAPABILITY_V1_BUNDLE_ID,
+    CAPABILITY_V1_BUNDLE_VERSION,
+    CAPABILITY_V1_SCALE,
+)
+from frontierwright.domain import Axis, ModelOrigin, ModelState
+from frontierwright.evaluations import EvaluationReceipt, RawMeasurement, apply_scale
 from frontierwright.registry import Registry
 from frontierwright.service import (
     CompareView,
@@ -159,6 +165,36 @@ def setup_candidate_project(root: Path) -> None:
                 parent_model_id=champion.model_id,
             )
         )
+
+
+def activate_tui_capability_profile(root: Path) -> None:
+    registry = Registry(root)
+    model = registry.get_model("champion")
+    receipt = EvaluationReceipt(
+        receipt_id="receipt-tui-capability",
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        evaluator_id="tui-capability-fixture",
+        evaluator_version="1",
+        conditions={},
+        measurements=tuple(
+            RawMeasurement(
+                task_id=(
+                    f"{CAPABILITY_V1_BUNDLE_ID}.{axis.value.lower()}"
+                ),
+                task_version=CAPABILITY_V1_BUNDLE_VERSION,
+                metric="accuracy",
+                value=0.5,
+                higher_is_better=True,
+            )
+            for axis in Axis
+        ),
+    )
+    registry.activate_capability_profile(
+        receipt,
+        CAPABILITY_V1_SCALE,
+        apply_scale(receipt, CAPABILITY_V1_SCALE),
+    )
 
 
 async def test_tui_candidate_keyboard_selection_and_compare_modal(tmp_path: Path) -> None:
@@ -336,3 +372,50 @@ def test_tui_action_center_exposes_capability_v1_for_current_champion(
     actions = {item.action_id: item for item in app._action_items()}
     assert "capability_v1" in actions
     assert actions["capability_v1"].title == "Measure Capability v1"
+
+
+async def test_tui_keyboard_sets_scale_bound_measured_build_targets(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    setup_candidate_project(project)
+    activate_tui_capability_profile(project)
+
+    app = FrontierwrightApp(
+        view=get_status(project),
+        resources=get_resource_view(project),
+        build=get_build_view(project),
+        data=get_data_view(project),
+        paths=get_paths_view(project),
+        candidates=get_candidates_view(project),
+        history=get_history_view(project),
+        root=project,
+        language="en",
+    )
+    assert app.build.mode == "TARGETS_FLOORS"
+    actions = app._action_items()
+    action_index = [item.action_id for item in actions].index("build_targets")
+
+    async with app.run_test(size=(140, 55)) as pilot:
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, ActionCenterScreen)
+        for _ in range(action_index):
+            await pilot.press("j")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, WorkflowFormScreen)
+
+        # First field is General target. Other target/floor fields stay intentionally blank.
+        await pilot.press("1", "2", "0")
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert not isinstance(app.screen, WorkflowFormScreen)
+
+    build = get_build_view(project)
+    assert build.mode == "TARGETS_FLOORS"
+    assert build.configured is True
+    assert build.targets == {"general": 120}
+    assert build.floors == {}
+    assert build.scale_bound is True
+    assert build.scale_hash == CAPABILITY_V1_SCALE.sha256
