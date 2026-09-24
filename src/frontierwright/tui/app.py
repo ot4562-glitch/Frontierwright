@@ -927,6 +927,16 @@ class FrontierwrightApp(App[None]):
         if self.candidates.candidates and self.view.champion_model_id is not None:
             items.append(
                 ActionItem(
+                    "measure_candidate_capability",
+                    "Measure selected candidate Capability v1",
+                    (
+                        "Give the candidate the same frozen four-axis stats used by "
+                        "Build targets and promotion gates."
+                    ),
+                )
+            )
+            items.append(
+                ActionItem(
                     "evaluate_candidate",
                     "Evaluate selected candidate vs champion",
                     "Run the same raw evaluation pack on both exact model fingerprints.",
@@ -1179,6 +1189,29 @@ class FrontierwrightApp(App[None]):
                     ],
                 ),
                 self._submit_capability_v1,
+            )
+            return
+
+        if action_id == "measure_candidate_capability":
+            model_id = self._selected_candidate_model_id()
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="MEASURE CANDIDATE CAPABILITY v1",
+                    description=(
+                        "Runs the same frozen Capability v1 bundle on the selected candidate. "
+                        "This does not promote the candidate."
+                    ),
+                    fields=[
+                        FormField("candidate_model_id", "Candidate model ID", model_id),
+                        FormField(
+                            "python",
+                            "Evaluation Python executable",
+                            self._reference_python_default(),
+                        ),
+                        FormField("device", "Device (auto/cpu/cuda)", "auto"),
+                    ],
+                ),
+                self._submit_candidate_capability_v1,
             )
             return
 
@@ -1465,6 +1498,26 @@ class FrontierwrightApp(App[None]):
                 for axis in ("general", "reasoning", "math", "coding")
             )
             self.notify("Capability v1 measured: " + rendered)
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_candidate_capability_v1(
+        self,
+        values: dict[str, str] | None,
+    ) -> None:
+        if values is None:
+            return
+        try:
+            model_id = values["candidate_model_id"]
+            result = run_capability_v1(
+                self.root,
+                model_id=model_id,
+                python_executable=values["python"],
+                device=(values.get("device") or "auto").lower(),
+            )
+            self._refresh_all()
+            self.notify(f"Candidate Capability v1 measured: {result.model_id}")
+            self.push_screen(CandidateScreen(compare_candidate(self.root, model_id)))
         except (FrontierwrightError, KeyError, ValueError) as exc:
             self.notify(str(exc), severity="error")
 

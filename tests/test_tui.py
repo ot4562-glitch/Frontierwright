@@ -2,10 +2,14 @@ from pathlib import Path
 
 from textual.widgets import TabbedContent
 
+import frontierwright.service as service_module
 from frontierwright.capability_v1 import (
     CAPABILITY_V1_BUNDLE_ID,
     CAPABILITY_V1_BUNDLE_VERSION,
     CAPABILITY_V1_SCALE,
+    CAPABILITY_V1_SCORING,
+    capability_v1_bundle_hash,
+    capability_v1_task_counts,
 )
 from frontierwright.domain import Axis, ModelOrigin, ModelState
 from frontierwright.evaluations import EvaluationReceipt, RawMeasurement, apply_scale
@@ -19,6 +23,7 @@ from frontierwright.service import (
     get_history_view,
     get_paths_view,
     get_resource_view,
+    get_stats_view,
     get_status,
 )
 from frontierwright.tui import FrontierwrightApp
@@ -419,3 +424,97 @@ async def test_tui_keyboard_sets_scale_bound_measured_build_targets(
     assert build.floors == {}
     assert build.scale_bound is True
     assert build.scale_hash == CAPABILITY_V1_SCALE.sha256
+
+
+async def test_tui_keyboard_measures_selected_candidate_capability(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    setup_candidate_project(project)
+
+    def fake_capability_backend(
+        argv_template,
+        *,
+        environment_overrides,
+        request_path,
+        timeout_seconds,
+    ):
+        del argv_template, environment_overrides, timeout_seconds
+        request = __import__("json").loads(request_path.read_text(encoding="utf-8"))
+        assert request["operation"] == "capability_v1"
+        axes = []
+        for axis in ("general", "reasoning", "math", "coding"):
+            axes.append(
+                {
+                    "axis": axis,
+                    "task_id": f"{CAPABILITY_V1_BUNDLE_ID}.{axis}",
+                    "task_version": CAPABILITY_V1_BUNDLE_VERSION,
+                    "accuracy": 0.5,
+                    "correct": 8,
+                    "total": 16,
+                    "mean_correct_margin_nats": 0.1,
+                }
+            )
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "operation": "capability_v1",
+            "metrics": {
+                "backend_id": "frontierwright-reference-pytorch-v1",
+                "bundle_id": CAPABILITY_V1_BUNDLE_ID,
+                "bundle_version": CAPABILITY_V1_BUNDLE_VERSION,
+                "bundle_hash": capability_v1_bundle_hash(),
+                "scoring": CAPABILITY_V1_SCORING,
+                "preset": "zero-8m",
+                "device": "cpu",
+                "axes": axes,
+                "task_counts": capability_v1_task_counts(),
+                "elapsed_seconds": 0.1,
+                "parameter_count": 1,
+                "tokenizer_fingerprint": "fixture-tokenizer",
+                "python_version": "fixture",
+                "torch_version": "fixture",
+            },
+        }
+
+    monkeypatch.setattr(service_module, "run_structured_command", fake_capability_backend)
+
+    app = FrontierwrightApp(
+        view=get_status(project),
+        resources=get_resource_view(project),
+        build=get_build_view(project),
+        data=get_data_view(project),
+        paths=get_paths_view(project),
+        candidates=get_candidates_view(project),
+        history=get_history_view(project),
+        root=project,
+        language="en",
+    )
+    actions = app._action_items()
+    action_index = [item.action_id for item in actions].index(
+        "measure_candidate_capability"
+    )
+
+    async with app.run_test(size=(140, 55)) as pilot:
+        await pilot.press("a")
+        await pilot.pause()
+        for _ in range(action_index):
+            await pilot.press("j")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, WorkflowFormScreen)
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, CandidateScreen)
+        assert app.screen.compare.candidate_model_id == "candidate-1"
+
+    candidate_stats = get_stats_view(project, "candidate-1")
+    assert candidate_stats.measured is True
+    assert candidate_stats.scale_hash == CAPABILITY_V1_SCALE.sha256
+    assert candidate_stats.stats == {
+        "general": 100.0,
+        "reasoning": 100.0,
+        "math": 100.0,
+        "coding": 100.0,
+    }
