@@ -108,6 +108,24 @@ class ReferenceEvaluationConfig:
 
 
 @dataclass(frozen=True)
+class ReferenceGenerationConfig:
+    preset: ModelPreset
+    max_new_tokens: int
+    temperature: float
+    seed: int
+    device: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "preset": asdict(self.preset),
+            "max_new_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+            "seed": self.seed,
+            "device": self.device,
+        }
+
+
+@dataclass(frozen=True)
 class ReferenceConfig:
     preset: ModelPreset
     steps: int
@@ -372,6 +390,47 @@ def _load_evaluation_config(
             64 * 1024 * 1024,
             "max_dataset_bytes",
         ),
+    )
+
+
+def _load_generation_config(
+    request: dict[str, Any],
+) -> ReferenceGenerationConfig:
+    raw = request.get("config", {})
+    if not isinstance(raw, dict):
+        raise ValueError("config must be an object")
+
+    allowed = {"preset", "max_new_tokens", "temperature", "seed", "device"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            "generation config does not support keys: " + ", ".join(unknown)
+        )
+
+    preset_name = _preset_name_for_request(request, raw)
+    preset = PRESETS[preset_name]
+    device = raw.get("device", "auto")
+    if not isinstance(device, str) or device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device must be auto, cpu, or cuda")
+
+    seed = raw.get("seed", 42)
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("seed must be a nonnegative integer")
+
+    return ReferenceGenerationConfig(
+        preset=preset,
+        max_new_tokens=_positive_int(
+            raw.get("max_new_tokens"),
+            64,
+            "max_new_tokens",
+        ),
+        temperature=_nonnegative_float(
+            raw.get("temperature"),
+            0.0,
+            "temperature",
+        ),
+        seed=seed,
+        device=device,
     )
 
 
@@ -1593,6 +1652,98 @@ def _evaluate(
     }
 
 
+def _generate(
+    request: dict[str, Any],
+    config: ReferenceGenerationConfig,
+) -> dict[str, object]:
+    torch = _import_torch()
+    model_source_path = request.get("model_source_path")
+    prompt = request.get("prompt")
+    if not isinstance(model_source_path, str) or not model_source_path:
+        raise ValueError("model_source_path is required")
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("prompt must be a nonempty string")
+
+    prompt_bytes = prompt.encode("utf-8")
+    if not prompt_bytes:
+        raise ValueError("prompt must encode to at least one byte")
+
+    device = _select_device(torch, config.device)
+    model = _load_reference_model(
+        torch,
+        config.preset,
+        model_source_path=model_source_path,
+        device=device,
+    )
+    model.eval()
+
+    generated_ids: list[int] = []
+    token_history = list(prompt_bytes)
+    generator = None
+    if config.temperature > 0.0:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(config.seed)
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(config.max_new_tokens):
+            context = token_history[-config.preset.context_length :]
+            tokens = torch.tensor(
+                [context],
+                dtype=torch.long,
+                device=device,
+            )
+            logits = model(tokens)[0, -1]
+            if config.temperature == 0.0:
+                next_token = int(torch.argmax(logits).item())
+            else:
+                probabilities = torch.softmax(logits / config.temperature, dim=-1)
+                sampled = torch.multinomial(
+                    probabilities,
+                    num_samples=1,
+                    generator=generator,
+                )
+                next_token = int(sampled.item())
+            generated_ids.append(next_token)
+            token_history.append(next_token)
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = max(time.perf_counter() - start, 1e-9)
+    continuation_bytes = bytes(generated_ids)
+    continuation_text = continuation_bytes.decode("utf-8", errors="replace")
+
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "operation": "generate",
+        "prompt": prompt,
+        "continuation_text": continuation_text,
+        "generated_text": prompt + continuation_text,
+        "generated_token_ids": generated_ids,
+        "metrics": {
+            "backend_id": REFERENCE_BACKEND_ID,
+            "preset": config.preset.name,
+            "device": device,
+            "max_new_tokens": config.max_new_tokens,
+            "temperature": config.temperature,
+            "seed": config.seed,
+            "prompt_bytes": len(prompt_bytes),
+            "context_bytes_used": min(
+                len(prompt_bytes),
+                config.preset.context_length,
+            ),
+            "generated_tokens": len(generated_ids),
+            "elapsed_seconds": elapsed,
+            "tokens_per_second": len(generated_ids) / elapsed,
+            "parameter_count": _parameter_count(model),
+            "stop_reason": "max_new_tokens",
+            "python_version": sys.version.split()[0],
+            "torch_version": str(torch.__version__),
+        },
+    }
+
+
 def _birth(request: dict[str, Any]) -> dict[str, object]:
     """Materialize exact initial bytes for a Frontierwright zero-model root."""
 
@@ -2156,6 +2307,14 @@ def main(argv: list[str] | None = None) -> int:
                     "reference evaluation requires a materialized model_source_path"
                 )
             _emit(_evaluate(request, _load_evaluation_config(request)))
+            return 0
+        if operation == "generate":
+            model_source_path = request.get("model_source_path")
+            if not isinstance(model_source_path, str) or not model_source_path:
+                raise ValueError(
+                    "reference generation requires a materialized model_source_path"
+                )
+            _emit(_generate(request, _load_generation_config(request)))
             return 0
         path_id = request.get("path_id")
         if path_id not in SUPPORTED_PATHS:

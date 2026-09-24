@@ -136,6 +136,14 @@ def test_portable_export_is_builtin_operate_intervention() -> None:
     assert item.training_path_id is None
 
 
+def test_reference_generation_is_builtin_operate_intervention() -> None:
+    item = intervention_by_id("frontierwright.operate.generate-reference")
+    assert item is not None
+    assert item.family is InterventionFamily.OPERATE
+    assert item.surface is InterventionSurface.OPERATION
+    assert item.training_path_id is None
+
+
 def test_dpo_is_a_builtin_align_training_intervention() -> None:
     item = intervention_for_training_path(TrainingPathId.DPO)
     assert item.intervention_id == "frontierwright.align.dpo"

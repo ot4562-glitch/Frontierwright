@@ -36,6 +36,7 @@ from frontierwright.service import (
     EvaluationRunView,
     ExportVerifyView,
     ExportView,
+    GenerationView,
     HistoryView,
     InterventionsView,
     LabAdaptersView,
@@ -58,6 +59,7 @@ from frontierwright.service import (
     disconnect_lab_adapter,
     execute_training_plan,
     export_champion_bundle,
+    generate_reference_text,
     get_birth_view,
     get_build_view,
     get_candidates_view,
@@ -224,6 +226,10 @@ def _export_payload(view: ExportView) -> dict[str, object]:
 
 
 def _export_verify_payload(view: ExportVerifyView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _generation_payload(view: GenerationView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -601,6 +607,14 @@ def _print_export_verify(view: ExportVerifyView) -> None:
     console.print(f"Authenticity: {view.authenticity}")
     if view.manifest_sha256:
         console.print(f"Manifest: {view.manifest_sha256}")
+
+
+def _print_generation(view: GenerationView) -> None:
+    console.print("[bold]REFERENCE GENERATION[/bold]")
+    console.print(f"Model: {view.model_id} · {view.model_format}")
+    console.print(f"Fingerprint: {view.model_fingerprint}")
+    console.print("")
+    console.print(view.generated_text)
 
 
 def _print_compare(view: CompareView) -> None:
@@ -1119,6 +1133,65 @@ def operate_verify(
         _emit_json(_export_verify_payload(view))
         return
     _print_export_verify(view)
+
+
+@operate_app.command("generate")
+def operate_generate(
+    prompt: Annotated[str, typer.Argument(help="Prompt text for the current Champion.")],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    python_executable: Annotated[
+        str,
+        typer.Option(
+            "--python",
+            help="Python executable for the isolated PyTorch inference environment.",
+        ),
+    ] = sys.executable,
+    max_new_tokens: Annotated[
+        int,
+        typer.Option("--max-new-tokens", min=1, help="Number of byte tokens to generate."),
+    ] = 64,
+    temperature: Annotated[
+        float,
+        typer.Option(
+            "--temperature",
+            min=0.0,
+            help="0 for greedy decoding; positive values enable sampling.",
+        ),
+    ] = 0.0,
+    seed: Annotated[int, typer.Option("--seed", min=0)] = 42,
+    device: Annotated[
+        str,
+        typer.Option("--device", help="auto, cpu, or cuda."),
+    ] = "auto",
+    timeout_seconds: Annotated[
+        float,
+        typer.Option("--timeout", help="Maximum generation backend wall time in seconds."),
+    ] = 60.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = generate_reference_text(
+            path,
+            prompt=prompt,
+            python_executable=python_executable,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            seed=seed,
+            device=device,
+            timeout_seconds=timeout_seconds,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_generation_payload(view))
+        return
+    _print_generation(view)
 
 
 @app.command("import")

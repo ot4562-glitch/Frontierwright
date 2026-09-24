@@ -7,6 +7,7 @@ from frontierwright.reference_backend import (
     _apply_qlora_parametrizations,
     _build_model,
     _load_config,
+    _load_generation_config,
     _merge_lora_parametrizations,
     _objective_for_path,
     _parameter_count,
@@ -340,3 +341,47 @@ def test_reference_dpo_rejects_identical_preferences(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="chosen and rejected must differ"):
         _read_preference_pairs(data, max_bytes=4096)
+
+
+def test_reference_generation_config_allows_greedy_and_rejects_negative_temperature(
+    tmp_path: Path,
+) -> None:
+    import pytest
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "frontierwright_reference_backend": (
+                    "frontierwright-reference-pytorch-v1"
+                ),
+                "preset": "zero-8m",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    greedy = _load_generation_config(
+        {
+            "model_source_path": str(model),
+            "config": {
+                "max_new_tokens": 4,
+                "temperature": 0.0,
+                "seed": 9,
+                "device": "cpu",
+            },
+        }
+    )
+    assert greedy.max_new_tokens == 4
+    assert greedy.temperature == 0.0
+    assert greedy.seed == 9
+    assert greedy.preset.name == "zero-8m"
+
+    with pytest.raises(ValueError, match="temperature"):
+        _load_generation_config(
+            {
+                "model_source_path": str(model),
+                "config": {"temperature": -0.1},
+            }
+        )

@@ -421,6 +421,24 @@ class ExportVerifyView:
 
 
 @dataclass(frozen=True)
+class GenerationView:
+    schema_version: int = 1
+    intervention_id: str = "frontierwright.operate.generate-reference"
+    intervention_version: str = "1"
+    model_id: str | None = None
+    model_fingerprint: str | None = None
+    model_format: str | None = None
+    prompt: str = ""
+    continuation_text: str = ""
+    generated_text: str = ""
+    generated_token_ids: list[int] = field(default_factory=list)
+    metrics: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class CompareView:
     schema_version: int = 1
     champion_model_id: str | None = None
@@ -1570,6 +1588,223 @@ def verify_export_bundle(destination: Path) -> ExportVerifyView:
         manifest_path=str(verified.manifest_path),
         manifest_sha256=verified.manifest_sha256,
         authenticity="NOT_SIGNED",
+    )
+
+
+def _reference_model_preset(model: ModelState) -> str:
+    if model.model_format not in {
+        ModelFormat.HUGGINGFACE,
+        ModelFormat.FRONTIERWRIGHT_QUANTIZED,
+    }:
+        raise FrontierwrightError(
+            "GENERATION_MODEL_UNSUPPORTED",
+            "Reference generation requires a Frontierwright reference model artifact.",
+            12,
+        )
+    config_path = Path(model.checkpoint).resolve() / "config.json"
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise FrontierwrightError(
+            "GENERATION_MODEL_UNSUPPORTED",
+            "Current model does not contain a readable reference config.json.",
+            12,
+        ) from exc
+    if (
+        not isinstance(raw, dict)
+        or raw.get("frontierwright_reference_backend") != REFERENCE_BACKEND_ID
+    ):
+        raise FrontierwrightError(
+            "GENERATION_MODEL_UNSUPPORTED",
+            "Current model is not a Frontierwright reference-backend model.",
+            12,
+        )
+    preset = raw.get("preset")
+    if not isinstance(preset, str) or preset not in PRESETS:
+        raise FrontierwrightError(
+            "GENERATION_MODEL_UNSUPPORTED",
+            "Current reference model has an unsupported preset.",
+            12,
+        )
+    return preset
+
+
+def generate_reference_text(
+    root: Path,
+    *,
+    prompt: str,
+    python_executable: str,
+    max_new_tokens: int = 64,
+    temperature: float = 0.0,
+    seed: int = 42,
+    device: str = "auto",
+    timeout_seconds: float = 60.0,
+) -> GenerationView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before generation.",
+            10,
+        )
+    if not isinstance(prompt, str) or not prompt:
+        raise FrontierwrightError(
+            "GENERATION_PROMPT_INVALID",
+            "Prompt must be a nonempty string.",
+            2,
+        )
+    if (
+        isinstance(max_new_tokens, bool)
+        or not isinstance(max_new_tokens, int)
+        or max_new_tokens <= 0
+    ):
+        raise FrontierwrightError(
+            "GENERATION_CONFIG_INVALID",
+            "max_new_tokens must be a positive integer.",
+            2,
+        )
+    if (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not math.isfinite(float(temperature))
+        or float(temperature) < 0
+    ):
+        raise FrontierwrightError(
+            "GENERATION_CONFIG_INVALID",
+            "temperature must be finite and nonnegative.",
+            2,
+        )
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise FrontierwrightError(
+            "GENERATION_CONFIG_INVALID",
+            "seed must be a nonnegative integer.",
+            2,
+        )
+    if device not in {"auto", "cpu", "cuda"}:
+        raise FrontierwrightError(
+            "GENERATION_CONFIG_INVALID",
+            "device must be auto, cpu, or cuda.",
+            2,
+        )
+    if timeout_seconds <= 0 or not math.isfinite(timeout_seconds):
+        raise FrontierwrightError(
+            "INVALID_TIMEOUT",
+            "Generation timeout must be finite and positive.",
+            2,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Generation Python executable must be nonempty.",
+            2,
+        )
+
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required before generation.",
+            12,
+        )
+    model = state.champion.model
+    _verify_model_artifact_integrity(registry, model.model_id)
+    preset = _reference_model_preset(model)
+
+    intervention = intervention_by_id("frontierwright.operate.generate-reference")
+    if intervention is None:
+        raise FrontierwrightError(
+            "INTERVENTION_NOT_FOUND",
+            "Built-in reference generation intervention is unavailable.",
+            4,
+        )
+
+    operations_root = registry.state_dir / "operations"
+    request_path = operations_root / f"generate-{uuid4().hex}.json"
+    request: dict[str, object] = {
+        "schema_version": 1,
+        "backend_id": REFERENCE_BACKEND_ID,
+        "operation": "generate",
+        "model_source_path": str(Path(model.checkpoint).resolve()),
+        "prompt": prompt,
+        "config": {
+            "preset": preset,
+            "max_new_tokens": max_new_tokens,
+            "temperature": float(temperature),
+            "seed": seed,
+            "device": device,
+        },
+    }
+    _write_state_json(request_path, request)
+
+    cleanup_error: OSError | None = None
+    try:
+        result = run_structured_command(
+            (
+                python_executable,
+                "-m",
+                "frontierwright.reference_backend",
+                "{request_json}",
+            ),
+            environment_overrides={"PYTHONUNBUFFERED": "1"},
+            request_path=request_path,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        try:
+            request_path.unlink(missing_ok=True)
+        except OSError as exc:
+            cleanup_error = exc
+        try:
+            operations_root.rmdir()
+        except OSError:
+            pass
+
+    if cleanup_error is not None:
+        raise FrontierwrightError(
+            "GENERATION_REQUEST_CLEANUP_FAILED",
+            "Generation completed but the temporary prompt request file could not be removed.",
+            4,
+        ) from cleanup_error
+
+    if result.get("operation") != "generate" or result.get("prompt") != prompt:
+        raise FrontierwrightError(
+            "GENERATION_RESULT_INVALID",
+            "Generation backend returned mismatched operation or prompt evidence.",
+            14,
+        )
+    continuation = result.get("continuation_text")
+    generated_text = result.get("generated_text")
+    token_ids = result.get("generated_token_ids")
+    metrics = result.get("metrics")
+    if (
+        not isinstance(continuation, str)
+        or not isinstance(generated_text, str)
+        or generated_text != prompt + continuation
+        or not isinstance(token_ids, list)
+        or not all(
+            isinstance(item, int)
+            and not isinstance(item, bool)
+            and 0 <= item < 256
+            for item in token_ids
+        )
+        or len(token_ids) != max_new_tokens
+        or not isinstance(metrics, dict)
+    ):
+        raise FrontierwrightError(
+            "GENERATION_RESULT_INVALID",
+            "Generation backend returned invalid structured output.",
+            14,
+        )
+
+    return GenerationView(
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        model_format=model.model_format.value,
+        prompt=prompt,
+        continuation_text=continuation,
+        generated_text=generated_text,
+        generated_token_ids=list(token_ids),
+        metrics=dict(metrics),
     )
 
 
