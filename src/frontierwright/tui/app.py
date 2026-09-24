@@ -162,6 +162,8 @@ class CandidateScreen(ModalScreen[str | None]):
     BINDINGS = [
         Binding("escape", "cancel", "Back"),
         Binding("p", "promote", "Promote"),
+        Binding("u", "promote_unmeasured", "Promote unmeasured"),
+        Binding("v", "promote_build_override", "Promote build override"),
         Binding("r", "reject", "Reject"),
     ]
 
@@ -178,6 +180,12 @@ class CandidateScreen(ModalScreen[str | None]):
 
     def action_promote(self) -> None:
         self.dismiss("promote")
+
+    def action_promote_unmeasured(self) -> None:
+        self.dismiss("promote_unmeasured")
+
+    def action_promote_build_override(self) -> None:
+        self.dismiss("promote_build_override")
 
     def action_reject(self) -> None:
         self.dismiss("reject")
@@ -697,6 +705,20 @@ class FrontierwrightApp(App[None]):
             if result == "promote":
                 promote_candidate(self.root, model_id)
                 self.notify("Candidate promoted.")
+            elif result == "promote_unmeasured":
+                promote_candidate(
+                    self.root,
+                    model_id,
+                    allow_unmeasured=True,
+                )
+                self.notify("Candidate promoted with explicit unmeasured override.")
+            elif result == "promote_build_override":
+                promote_candidate(
+                    self.root,
+                    model_id,
+                    allow_build_violations=True,
+                )
+                self.notify("Candidate promoted with explicit build-violation override.")
             elif result == "reject":
                 reject_candidate(self.root, model_id)
                 self.notify("Candidate rejected.")
