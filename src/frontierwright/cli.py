@@ -74,6 +74,7 @@ from frontierwright.service import (
     get_data_preparation_plugins,
     get_data_view,
     get_evaluation_packs,
+    get_fit_opportunities,
     get_history_view,
     get_interventions_view,
     get_lab_adapters,
@@ -2060,6 +2061,36 @@ def workload_bind_eval(
                 console.print(f"Missing {kind}: " + ", ".join(str(x) for x in values))
 
 
+@workload_app.command("next")
+def workload_next(
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Model ID; defaults to current Champion."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        plan = get_fit_opportunities(path, model)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    payload = {"ok": True, **plan.to_payload()}
+    if json_output:
+        _emit_json(payload)
+        return
+
+    console.print(f"[bold]NEXT EXPERIMENTS · {plan.edition.value}[/bold]")
+    for index, item in enumerate(plan.opportunities, start=1):
+        console.print(f"{index}. [{item.opportunity_class.value}] {item.title}")
+        console.print(f"   Why: {item.reason}")
+        console.print(f"   Action: {item.action}")
+        console.print(f"   Success: {item.success_criterion}")
+    console.print(plan.note)
+
+
 @workload_app.command("set")
 def workload_set(
     name: Annotated[str, typer.Option("--name", help="Workload profile name.")],
@@ -3536,6 +3567,7 @@ def play(
     data = get_data_view(path)
     workload = get_workload_view(path)
     workload_fit = get_workload_fit(path)
+    fit_opportunities = get_fit_opportunities(path)
     paths = get_paths_view(path)
     candidates = get_candidates_view(path)
     history = get_history_view(path)
@@ -3549,6 +3581,7 @@ def play(
         data=data,
         workload=workload,
         workload_fit=workload_fit,
+        fit_opportunities=fit_opportunities,
         paths=paths,
         candidates=candidates,
         history=history,

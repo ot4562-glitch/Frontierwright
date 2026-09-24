@@ -26,6 +26,7 @@ Implemented now:
 - detected resource profiles persisted in SQLite and shown through CLI/JSON/TUI;
 - versioned Workload Profiles persist explicit languages/domains/task mixture, context demand, latency/throughput constraints, privacy boundary, hard capability floors, and optional explicit decision-utility weights/scales;
 - Workload Fit evaluates each declared requirement as PASS / FAIL / UNKNOWN from exact current-model evidence and refuses to treat generic capability as proof of user-domain coverage;
+- an edition-aware evidence planner maps UNKNOWN constraints to the next required measurement and measured FAIL constraints to bounded, falsifiable experiments; it exposes the same logic through `frontierwright workload next` and the TUI while deliberately returning no predicted performance gain;
 - Candidate comparison includes a raw Pareto surface across comparable capability, serving latency/TTFT/TPOT/throughput, measured VRAM/RSS, and artifact-storage evidence; unknown or mismatched runtime conditions remain unknown;
 - optional user utility is computed only when the user supplies both a positive weight and normalization scale for every selected measured metric; missing evidence yields INCOMPLETE, raw Pareto evidence remains visible, and utility never auto-promotes a Candidate;
 - bf16/fp16 kept `UNKNOWN` until backend-specific capability calibration instead of hardware-name guessing;

@@ -84,6 +84,7 @@ from frontierwright.exporting import (
     publish_portable_export,
     verify_portable_export,
 )
+from frontierwright.fit_planner import FitOpportunityPlan, plan_fit_opportunities
 from frontierwright.interventions import (
     assess_training_interventions,
     intervention_by_id,
@@ -5094,6 +5095,47 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
         ),
         workload_evaluation_coverage=workload_evaluation_coverage,
         note=str(payload.get("note")) if payload.get("note") else None,
+    )
+
+
+def get_fit_opportunities(
+    root: Path,
+    model_id: str | None = None,
+) -> FitOpportunityPlan:
+    registry = Registry(root)
+    if not registry.exists:
+        return plan_fit_opportunities(
+            edition=EditionProfile.STUDIO,
+            model_id=None,
+            workload_configured=False,
+            constraints=[],
+            model_fit=None,
+            workload_evaluation_coverage=None,
+        )
+
+    state = registry.read()
+    raw_edition = state.project.get("edition_profile")
+    try:
+        edition = EditionProfile(
+            str(raw_edition) if raw_edition is not None else EditionProfile.STUDIO.value
+        )
+    except ValueError:
+        edition = EditionProfile.STUDIO
+
+    fit = get_workload_fit(root, model_id)
+    target_model_id = model_id or fit.model_id
+    if target_model_id is None and state.champion is not None:
+        target_model_id = state.champion.model.model_id
+    model_fit = (
+        _latest_model_fit_from_state(state, target_model_id) if target_model_id is not None else {}
+    )
+    return plan_fit_opportunities(
+        edition=edition,
+        model_id=target_model_id,
+        workload_configured=fit.configured,
+        constraints=fit.constraints,
+        model_fit=model_fit,
+        workload_evaluation_coverage=fit.workload_evaluation_coverage,
     )
 
 

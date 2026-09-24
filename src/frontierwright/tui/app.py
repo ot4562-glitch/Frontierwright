@@ -16,6 +16,7 @@ from frontierwright.domain import ModelOrigin
 from frontierwright.editions import EditionProfile, policy_for
 from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
+from frontierwright.fit_planner import FitOpportunityPlan, plan_fit_opportunities
 from frontierwright.i18n import tr
 from frontierwright.paths import TrainingPathId
 from frontierwright.reference_backend import backend_spec_payload
@@ -41,6 +42,7 @@ from frontierwright.service import (
     get_build_view,
     get_candidates_view,
     get_data_view,
+    get_fit_opportunities,
     get_history_view,
     get_paths_view,
     get_resource_view,
@@ -624,6 +626,7 @@ class FrontierwrightApp(App[None]):
         data: DataView | None = None,
         workload: WorkloadView | None = None,
         workload_fit: WorkloadFitView | None = None,
+        fit_opportunities: FitOpportunityPlan | None = None,
         paths: PathsView | None = None,
         candidates: CandidateView | None = None,
         history: HistoryView | None = None,
@@ -638,6 +641,14 @@ class FrontierwrightApp(App[None]):
         self.data = data or DataView()
         self.workload = workload or WorkloadView()
         self.workload_fit = workload_fit or WorkloadFitView()
+        self.fit_opportunities = fit_opportunities or plan_fit_opportunities(
+            edition=EditionProfile.STUDIO,
+            model_id=None,
+            workload_configured=False,
+            constraints=[],
+            model_fit=None,
+            workload_evaluation_coverage=None,
+        )
         self.paths = paths or PathsView()
         self.candidates = candidates or CandidateView()
         self.history = history or HistoryView()
@@ -1159,6 +1170,29 @@ class FrontierwrightApp(App[None]):
         elif fit.note:
             lines.append(fit.note)
 
+        opportunities = self.fit_opportunities.opportunities
+        if opportunities:
+            if edition is EditionProfile.ACADEMY:
+                heading = "WHAT TO TRY NEXT"
+            elif edition is EditionProfile.LAB:
+                heading = "EXPERIMENT QUEUE"
+            else:
+                heading = "NEXT EXPERIMENTS"
+            lines.extend(["", heading])
+            for index, opportunity in enumerate(opportunities[:3], start=1):
+                lines.append(f"  {index}. {opportunity.title}")
+                if edition is EditionProfile.ACADEMY:
+                    lines.append(f"     Why: {opportunity.reason}")
+                elif edition is EditionProfile.LAB:
+                    evidence = ", ".join(opportunity.evidence_keys) or "measured Pareto evidence"
+                    lines.append(
+                        f"     {opportunity.opportunity_class.value} · evidence={evidence}"
+                    )
+                    lines.append(f"     success={opportunity.success_criterion}")
+                else:
+                    lines.append(f"     {opportunity.reason}")
+            lines.append("  No gain is predicted; each item is a falsifiable experiment.")
+
         coverage = fit.workload_evaluation_coverage
         if coverage:
             lines.extend(["", "WORKLOAD EVALUATION COVERAGE"])
@@ -1274,6 +1308,7 @@ class FrontierwrightApp(App[None]):
         self.data = get_data_view(self.root)
         self.workload = get_workload_view(self.root)
         self.workload_fit = get_workload_fit(self.root)
+        self.fit_opportunities = get_fit_opportunities(self.root)
         self.paths = get_paths_view(self.root)
         self.candidates = get_candidates_view(self.root)
         self.history = get_history_view(self.root)

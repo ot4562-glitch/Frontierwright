@@ -203,6 +203,9 @@ The rc2 development line is already moving beyond stock-model selection:
   capability floors as versioned evidence.
 - **Measured model fit** links real inference receipts to the exact model instead of
   treating currently-free system memory as post-load headroom.
+- **Evidence-driven next experiments** turn FAIL/UNKNOWN workload constraints into
+  falsifiable measurements or bounded interventions. Frontierwright never predicts that
+  a listed experiment will improve the model; success is defined by comparable evidence.
 - **Pareto Candidate comparison** keeps capability, latency, throughput, VRAM/RAM and
   artifact-size gains/regressions visible side by side.
 - **Explicit user utility** is optional: a user must provide both a weight and a
