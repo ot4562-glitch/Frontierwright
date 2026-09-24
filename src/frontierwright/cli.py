@@ -11,6 +11,7 @@ from typing import Annotated, NoReturn
 import typer
 from rich.console import Console
 
+from frontierwright import __version__
 from frontierwright.data import DatasetClassification, DatasetRole
 from frontierwright.domain import ModelOrigin
 from frontierwright.editions import EditionProfile
@@ -146,6 +147,27 @@ app.add_typer(operate_app, name="operate")
 app.add_typer(lab_app, name="lab")
 
 console = Console()
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"frontierwright {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _root_callback(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Show Frontierwright version and exit.",
+        ),
+    ] = False,
+) -> None:
+    del version
 
 
 def _emit_json(payload: dict[str, object]) -> None:

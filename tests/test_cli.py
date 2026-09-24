@@ -8,6 +8,12 @@ from frontierwright.cli import app
 runner = CliRunner()
 
 
+def test_cli_reports_release_candidate_version() -> None:
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == "frontierwright 1.0.0rc1"
+
+
 def test_cli_json_contract_is_stable_for_zero_project(tmp_path: Path) -> None:
     result = runner.invoke(
         app,

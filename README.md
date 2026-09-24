@@ -75,6 +75,8 @@ idempotency for expensive actions
 
 ## Current development state
 
+**Current release candidate: `1.0.0rc1`.** The canonical v1 candidate gate is defined by `tools/v1_release_gate.py` and contains 20 explicit release criteria.
+
 The first executable v1 vertical slice is implemented.
 
 Implemented now:

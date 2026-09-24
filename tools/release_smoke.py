@@ -85,6 +85,10 @@ def main() -> int:
         _run([str(python), "-m", "pip", "install", "--upgrade", "pip"])
         _run([str(python), "-m", "pip", "install", str(wheel)])
         _run([str(cli), "--help"])
+        version_result = _run([str(cli), "--version"])
+        version = version_result.stdout.strip()
+        if version != "frontierwright 1.0.0rc1":
+            raise SystemExit(f"installed CLI reported unexpected version: {version!r}")
 
         init = _run(
             [
@@ -131,6 +135,7 @@ def main() -> int:
                 {
                     "ok": True,
                     "wheel": wheel.name,
+                    "version": version,
                     "python": str(python),
                     "project": str(project_root),
                     "edition_profile": status_payload.get("edition_profile"),
