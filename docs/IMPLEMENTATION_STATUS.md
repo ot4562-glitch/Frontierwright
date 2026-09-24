@@ -31,6 +31,7 @@ Implemented now:
 - bf16/fp16 kept `UNKNOWN` until backend-specific capability calibration instead of hardware-name guessing;
 - raw benchmark `EvaluationReceipt` ingestion with exact model-id/fingerprint matching;
 - strict lm-evaluation-harness result import pins exact harness revision, source hash, task/version/metric identity, standard-error metadata and metric direction while keeping external results as raw evidence until an explicit frozen scale maps them;
+- Hugging Face LightEval saved-result import pins an explicit evaluator version/revision, source hash, declared task version and metric direction from `config_tasks`, skips the mixed aggregate `all` row, preserves standard-error evidence, and imports only aggregate result JSON rather than copying detail Parquet prompts/responses;
 - workload-evaluation binding manifests connect exact stored evaluation receipt task/version/metric identities to declared workload languages/domains/tasks; stale profile hashes, wrong models, missing measurements, or name-only inference are rejected, and Workload Fit remains UNKNOWN until every declared workload dimension has explicit evidence coverage;
 - vLLM serve-benchmark import pins exact runtime version and comparable workload-condition hash, imports latency/TTFT/TPOT/ITL/aggregate-throughput evidence, and deliberately refuses to invent server RSS/VRAM or per-request p50 throughput from client-only results;
 - immutable frozen capability-scale manifests with content hash and explicit task/version/weight/anchor mapping;

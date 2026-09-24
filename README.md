@@ -209,7 +209,7 @@ The rc2 development line is already moving beyond stock-model selection:
   normalization scale for every metric they want combined. Missing evidence makes the
   result INCOMPLETE; Frontierwright never invents cross-unit conversion or hides the
   underlying Pareto trade-off.
-- **External evidence adapters** can import exact-version lm-evaluation-harness and vLLM
+- **External evidence adapters** can import exact-version lm-evaluation-harness, LightEval, and vLLM
   benchmark receipts without automatically turning arbitrary external scores into
   Frontierwright stats. Workload language/domain/task coverage becomes PASS only through
   an explicit binding to exact stored receipt task/version/metric identities; Frontierwright

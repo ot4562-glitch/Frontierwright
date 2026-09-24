@@ -20,6 +20,9 @@ from frontierwright.evaluations import EvaluationReceipt, RawMeasurement
 LM_EVAL_ADAPTER_ID = "frontierwright.evaluator.lm-eval-import"
 LM_EVAL_ADAPTER_VERSION = "1"
 LM_EVAL_EVALUATOR_ID = "eleutherai.lm-evaluation-harness"
+LIGHTEVAL_ADAPTER_ID = "frontierwright.evaluator.lighteval-import"
+LIGHTEVAL_ADAPTER_VERSION = "1"
+LIGHTEVAL_EVALUATOR_ID = "huggingface.lighteval"
 
 
 @dataclass(frozen=True)
@@ -266,6 +269,241 @@ def import_lm_eval_results(
         source_sha256=source_sha256,
         evaluator_id=LM_EVAL_EVALUATOR_ID,
         evaluator_version=harness_version.strip(),
+        receipt=receipt,
+        task_count=len(task_versions),
+        measurement_count=len(measurements),
+        stderr_count=sum(len(item) for item in stderr.values()),
+    )
+
+
+def _lighteval_task_config(
+    config_tasks: dict[str, Any],
+    result_task_id: str,
+) -> dict[str, Any]:
+    base_name = result_task_id
+    if "|" in result_task_id:
+        parts = result_task_id.split("|")
+        if parts[-1].isdigit():
+            base_name = "|".join(parts[:-1])
+    matches: list[dict[str, Any]] = []
+    for raw_config in config_tasks.values():
+        if not isinstance(raw_config, dict):
+            continue
+        name = raw_config.get("name")
+        if isinstance(name, str) and name in {result_task_id, base_name}:
+            matches.append(raw_config)
+    if len(matches) != 1:
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_TASK_CONFIG_AMBIGUOUS",
+            (
+                "LightEval task result must match exactly one config_tasks entry by its "
+                f"declared task name: {result_task_id!r}. Found {len(matches)}."
+            ),
+            2,
+        )
+    return matches[0]
+
+
+def _lighteval_metric_directions(task_config: dict[str, Any], task_id: str) -> dict[str, bool]:
+    raw_metrics = task_config.get("metric")
+    if not isinstance(raw_metrics, list):
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_INVALID",
+            f"LightEval config for {task_id!r} must include metric definitions.",
+            2,
+        )
+    directions: dict[str, bool] = {}
+    for item in raw_metrics:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("metric_name")
+        direction = item.get("higher_is_better")
+        if isinstance(name, str) and name and isinstance(direction, bool):
+            directions[name] = direction
+    if not directions:
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_DIRECTION_UNKNOWN",
+            f"LightEval task {task_id!r} has no metric direction metadata.",
+            2,
+        )
+    return directions
+
+
+def import_lighteval_results(
+    path: Path,
+    *,
+    model_id: str,
+    model_fingerprint: str,
+    lighteval_version: str,
+) -> ExternalEvaluationImport:
+    """Convert a LightEval result JSON into raw Frontierwright evaluation evidence.
+
+    The importer follows LightEval's saved result structure and requires exact metric
+    direction metadata from config_tasks. Aggregate  rows are skipped because they
+    mix task identities and therefore are unsuitable as atomic workload evidence.
+    """
+
+    version = lighteval_version.strip()
+    if not version:
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_VERSION_REQUIRED",
+            "An exact LightEval version or immutable revision is required.",
+            2,
+        )
+    try:
+        raw_bytes = path.read_bytes()
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_INVALID",
+            "LightEval results must be readable UTF-8 JSON.",
+            2,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_INVALID",
+            "LightEval results root must be an object.",
+            2,
+        )
+
+    results = _mapping(payload.get("results"), "results")
+    versions = _mapping(payload.get("versions", {}), "versions")
+    config_tasks = _mapping(payload.get("config_tasks", {}), "config_tasks")
+    config_general = _mapping(payload.get("config_general", {}), "config_general")
+    source_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+    measurements: list[RawMeasurement] = []
+    stderr: dict[str, dict[str, float]] = {}
+    task_versions: dict[str, str] = {}
+    task_config_keys: dict[str, str] = {}
+
+    for result_task_id, raw_task_result in sorted(results.items()):
+        if result_task_id == "all":
+            continue
+        if not isinstance(result_task_id, str) or not result_task_id:
+            raise FrontierwrightError(
+                "EXTERNAL_EVALUATION_INVALID",
+                "LightEval task result IDs must be nonempty strings.",
+                2,
+            )
+        task_result = _mapping(raw_task_result, f"results[{result_task_id!r}]")
+        raw_version = versions.get(result_task_id, "UNVERSIONED")
+        if isinstance(raw_version, bool) or not isinstance(raw_version, (str, int, float)):
+            raise FrontierwrightError(
+                "EXTERNAL_EVALUATION_INVALID",
+                f"LightEval task version for {result_task_id!r} must be scalar.",
+                2,
+            )
+        task_version = str(raw_version)
+        task_versions[result_task_id] = task_version
+        task_config = _lighteval_task_config(config_tasks, result_task_id)
+        directions = _lighteval_metric_directions(task_config, result_task_id)
+        config_name = task_config.get("name")
+        if isinstance(config_name, str):
+            task_config_keys[result_task_id] = config_name
+
+        task_stderr: dict[str, float] = {}
+        for metric_name, raw_value in sorted(task_result.items()):
+            if not isinstance(metric_name, str) or not metric_name:
+                continue
+            stderr_metric = _stderr_metric_name(metric_name)
+            if stderr_metric is not None:
+                if (
+                    not isinstance(raw_value, bool)
+                    and isinstance(raw_value, (int, float))
+                    and math.isfinite(float(raw_value))
+                ):
+                    task_stderr[stderr_metric] = float(raw_value)
+                continue
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                continue
+            value = float(raw_value)
+            if not math.isfinite(value):
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_INVALID",
+                    f"LightEval metric {result_task_id}/{metric_name} is not finite.",
+                    2,
+                )
+            direction = directions.get(metric_name)
+            if direction is None:
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_DIRECTION_UNKNOWN",
+                    f"LightEval metric direction is missing for {result_task_id}/{metric_name}.",
+                    2,
+                )
+            measurements.append(
+                RawMeasurement(
+                    task_id=f"lighteval:{result_task_id}",
+                    task_version=task_version,
+                    metric=metric_name,
+                    value=value,
+                    higher_is_better=direction,
+                )
+            )
+        if task_stderr:
+            stderr[result_task_id] = task_stderr
+
+    if not measurements:
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_EMPTY",
+            "LightEval results contain no finite numeric task metrics.",
+            2,
+        )
+
+    reported_sha = config_general.get("lighteval_sha")
+    reported_model_sha = config_general.get("model_sha")
+    identity = json.dumps(
+        {
+            "adapter_id": LIGHTEVAL_ADAPTER_ID,
+            "adapter_version": LIGHTEVAL_ADAPTER_VERSION,
+            "source_sha256": source_sha256,
+            "model_id": model_id,
+            "model_fingerprint": model_fingerprint,
+            "evaluator_version": version,
+            "reported_lighteval_sha": reported_sha,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    receipt_id = "receipt-lighteval-" + hashlib.sha256(identity).hexdigest()[:32]
+    receipt = EvaluationReceipt(
+        receipt_id=receipt_id,
+        model_id=model_id,
+        model_fingerprint=model_fingerprint,
+        evaluator_id=LIGHTEVAL_EVALUATOR_ID,
+        evaluator_version=version,
+        conditions={
+            "adapter_id": LIGHTEVAL_ADAPTER_ID,
+            "adapter_version": LIGHTEVAL_ADAPTER_VERSION,
+            "source_format": "lighteval.saved-results",
+            "source_sha256": source_sha256,
+            "source_filename": path.name,
+            "reported_lighteval_sha": (reported_sha if isinstance(reported_sha, str) else None),
+            "reported_model_sha": (
+                reported_model_sha if isinstance(reported_model_sha, str) else None
+            ),
+            "model_name": (
+                config_general.get("model_name")
+                if isinstance(config_general.get("model_name"), str)
+                else None
+            ),
+            "task_versions": task_versions,
+            "task_config_names": task_config_keys,
+            "metric_stderr": stderr,
+            "aggregate_all_row_imported": False,
+            "privacy_note": (
+                "Only aggregate result JSON is imported. LightEval detail Parquet files may "
+                "contain prompts/model responses and remain under the project's data boundary."
+            ),
+        },
+        measurements=tuple(measurements),
+    )
+    return ExternalEvaluationImport(
+        adapter_id=LIGHTEVAL_ADAPTER_ID,
+        adapter_version=LIGHTEVAL_ADAPTER_VERSION,
+        source_sha256=source_sha256,
+        evaluator_id=LIGHTEVAL_EVALUATOR_ID,
+        evaluator_version=version,
         receipt=receipt,
         task_count=len(task_versions),
         measurement_count=len(measurements),

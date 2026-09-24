@@ -86,6 +86,7 @@ from frontierwright.service import (
     get_tokenizers_view,
     get_workload_fit,
     get_workload_view,
+    import_lighteval_evidence,
     import_lm_eval_evidence,
     import_local_model,
     import_vllm_serving_evidence,
@@ -2304,6 +2305,55 @@ def evaluation_import_lm_eval(
         _emit_json(payload)
         return
     console.print("[bold]LM-EVAL EVIDENCE IMPORTED[/bold]")
+    console.print(f"Model: {payload['model_id']}")
+    console.print(f"Evaluator: {payload['evaluator_id']}@{payload['evaluator_version']}")
+    console.print(f"Receipt: {payload['receipt_id']}")
+    console.print(f"Tasks: {payload['task_count']} · metrics: {payload['measurement_count']}")
+    console.print("Capability stats activated: NO")
+    console.print(str(payload["note"]))
+
+
+@evaluation_app.command("import-lighteval")
+def evaluation_import_lighteval(
+    result: Annotated[
+        Path,
+        typer.Argument(help="LightEval saved results JSON."),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    lighteval_version: Annotated[
+        str,
+        typer.Option(
+            "--lighteval-version",
+            help="Exact LightEval version or immutable revision used to create the result.",
+        ),
+    ] = "",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = import_lighteval_evidence(
+            path,
+            result_path=result,
+            model_id=model,
+            lighteval_version=lighteval_version,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    payload = {"ok": True, **view.to_dict()}
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print("[bold]LIGHTEVAL EVIDENCE IMPORTED[/bold]")
     console.print(f"Model: {payload['model_id']}")
     console.print(f"Evaluator: {payload['evaluator_id']}@{payload['evaluator_version']}")
     console.print(f"Receipt: {payload['receipt_id']}")

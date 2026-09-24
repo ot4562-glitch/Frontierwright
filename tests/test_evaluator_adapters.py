@@ -66,9 +66,7 @@ def write_lm_eval_result(path: Path) -> Path:
                     "hellaswag": {"original": 10042, "effective": 10042},
                     "mmlu_abstract_algebra": {"original": 100, "effective": 100},
                 },
-                "samples": {
-                    "hellaswag": [{"doc_id": 0, "target": 1, "resps": [["private"]]}]
-                },
+                "samples": {"hellaswag": [{"doc_id": 0, "target": 1, "resps": [["private"]]}]},
             },
             sort_keys=True,
         ),
@@ -143,9 +141,7 @@ def test_cli_import_lm_eval_preserves_raw_evidence_without_activating_stats(
     assert second.exit_code == 0, second.output
     assert json.loads(second.stdout)["receipt_id"] == payload["receipt_id"]
     imported_events = [
-        item
-        for item in registry.read().history
-        if item["kind"] == "EVALUATION_RECEIPT_IMPORTED"
+        item for item in registry.read().history if item["kind"] == "EVALUATION_RECEIPT_IMPORTED"
     ]
     assert len(imported_events) == 1
 
@@ -180,6 +176,137 @@ def test_lm_eval_import_rejects_missing_metric_direction(tmp_path: Path) -> None
             model.model_id,
             "--harness-version",
             "0.4.9",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "EXTERNAL_EVALUATION_DIRECTION_UNKNOWN"
+
+
+def write_lighteval_result(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "config_general": {
+                    "lighteval_sha": "203045a8431bc9b77245c9998e05fc54509ea07f",
+                    "model_name": "gpt2",
+                    "model_sha": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+                },
+                "results": {
+                    "gsm8k|0": {
+                        "em": 0.42,
+                        "em_stderr": 0.02,
+                        "maj@8": 0.51,
+                        "maj@8_stderr": 0.03,
+                    },
+                    "all": {"em": 0.42, "maj@8": 0.51},
+                },
+                "versions": {"gsm8k|0": 0},
+                "config_tasks": {
+                    "lighteval|gsm8k": {
+                        "name": "gsm8k",
+                        "metric": [
+                            {"metric_name": "em", "higher_is_better": True},
+                            {"metric_name": "maj@8", "higher_is_better": True},
+                        ],
+                    }
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_cli_import_lighteval_preserves_exact_task_metric_evidence(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    registry, model = setup_project(project)
+    result_path = write_lighteval_result(tmp_path / "lighteval.json")
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "import-lighteval",
+            str(result_path),
+            "--path",
+            str(project),
+            "--model",
+            model.model_id,
+            "--lighteval-version",
+            "0.13.0",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["evaluator_id"] == "huggingface.lighteval"
+    assert payload["evaluator_version"] == "0.13.0"
+    assert payload["task_count"] == 1
+    assert payload["measurement_count"] == 2
+    assert payload["stderr_count"] == 2
+    assert payload["capability_stats_activated"] is False
+
+    receipt = registry.get_evaluation_receipt(payload["receipt_id"])
+    assert receipt is not None
+    assert receipt["conditions"]["reported_lighteval_sha"] == (
+        "203045a8431bc9b77245c9998e05fc54509ea07f"
+    )
+    assert receipt["conditions"]["aggregate_all_row_imported"] is False
+    assert receipt["conditions"]["metric_stderr"]["gsm8k|0"] == {
+        "em": 0.02,
+        "maj@8": 0.03,
+    }
+    assert {
+        (item["task_id"], item["task_version"], item["metric"], item["higher_is_better"])
+        for item in receipt["measurements"]
+    } == {
+        ("lighteval:gsm8k|0", "0", "em", True),
+        ("lighteval:gsm8k|0", "0", "maj@8", True),
+    }
+    assert get_stats_view(project, model.model_id).measured is False
+
+
+def test_lighteval_import_requires_direction_metadata(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _, model = setup_project(project)
+    result_path = tmp_path / "bad-lighteval.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "config_general": {"lighteval_sha": "abc"},
+                "results": {"gsm8k|0": {"em": 0.5}},
+                "versions": {"gsm8k|0": 0},
+                "config_tasks": {
+                    "lighteval|gsm8k": {
+                        "name": "gsm8k",
+                        "metric": [{"metric_name": "em"}],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "import-lighteval",
+            str(result_path),
+            "--path",
+            str(project),
+            "--model",
+            model.model_id,
+            "--lighteval-version",
+            "0.13.0",
             "--json",
             "--non-interactive",
             "--yes",
