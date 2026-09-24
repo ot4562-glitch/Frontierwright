@@ -133,8 +133,8 @@ Implemented now:
 - representative calibration receipts with step time, throughput, peak memory, projected storage, and projected wall time;
 - idempotent durable local run attempts with worker/process identity, liveness reconciliation, durable executor results, explicit rerun semantics, and repairable run-receipt export;
 - durable run-usage receipts record measured wall time and output bytes, plus provenance-labelled accounted GPU-hours when GPU count is available; unknown cost dimensions remain unknown instead of being fabricated;
-- budget enforcement modes are explicit in plan views: run-count registry admission, wall-time timeout, accounted GPU-hour timeout, storage admission/finalization gate, and currently unavailable runtime money enforcement;
-- measured output-size budget violations block candidate finalization even when the training backend itself reports success;
+- budget enforcement modes are explicit in plan views: run-count registry admission, wall-time timeout, accounted GPU-hour timeout, storage calibration admission plus a 100 ms local output-tree watchdog and finalization gate, and currently unavailable runtime money enforcement;
+- max_storage_bytes is enforced during local command execution by a 100 ms output-tree watchdog that terminates the backend process group after an observed overrun, then rechecked from durable usage evidence and candidate bytes at finalization; this is not an OS/filesystem quota, so writes between polls may temporarily overshoot the configured byte limit;
 - `max_money` keeps a plan non-ready until an executor with real runtime cost enforcement exists; a projected price alone is not treated as a hard budget;
 - built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` birth, tokenizer-aware from-scratch pretraining, continued pretraining, full-parameter causal SFT, merged-output LoRA SFT, merged-output QLoRA SFT, Direct Preference Optimization (DPO), and teacher-to-smaller-student knowledge distillation for Frontierwright reference-model lineages; trained descendants inherit the exact parent tokenizer artifact;
 - reference QLoRA freezes the base model, packs targeted transformer projection matrices as blockwise NF4 4-bit values with float32 absmax scales, trains only LoRA parameters, records quantized-vs-full target storage evidence, and materializes a normal merged reference checkpoint after training; it does not claim bitsandbytes double quantization or paged optimizers;
@@ -166,7 +166,7 @@ Not implemented yet:
 
 - an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and its official capability runner; the generic raw evaluation-pack runner exists, but no official Capability v1 scale is claimed yet;
 - broad arbitrary-Hugging-Face production adapters; the built-in QLoRA path is intentionally a narrow Frontierwright-reference implementation rather than a claim of arbitrary-architecture compatibility;
-- live output-storage quota enforcement during backend execution, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
+- OS/filesystem-enforced storage quotas with zero polling overshoot, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
 - public dataset discovery/download adapters and richer prepared tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
 - remote/server/Slurm executor implementations and concrete private Lab adapters;
 - stronger executor-boundary attestation beyond the current adapter-declared trust contract.

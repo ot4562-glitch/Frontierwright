@@ -10,8 +10,10 @@ import hashlib
 import json
 import math
 import os
+import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
@@ -512,6 +514,7 @@ def _substitute_argv(argv: tuple[str, ...], *, request_json: Path) -> list[str]:
 
 
 MAX_BACKEND_OUTPUT_BYTES = 1024 * 1024
+BACKEND_WATCH_INTERVAL_SECONDS = 0.1
 
 
 def _read_bounded_output(handle: BinaryIO, label: str) -> str:
@@ -533,18 +536,96 @@ def _read_bounded_output(handle: BinaryIO, label: str) -> str:
         ) from exc
 
 
+def _output_tree_size_bytes(root: Path) -> int:
+    if not root.exists():
+        return 0
+    total = 0
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(directory)
+        dirnames[:] = [
+            name for name in dirnames if not (base / name).is_symlink()
+        ]
+        for name in filenames:
+            path = base / name
+            if path.is_symlink():
+                continue
+            try:
+                total += path.stat().st_size
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def _terminate_backend_tree(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    if os.name == "nt":
+        process.kill()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    process.wait(timeout=5)
+
+
 def run_structured_command(
     argv_template: tuple[str, ...],
     *,
     environment_overrides: dict[str, str],
     request_path: Path,
     timeout_seconds: float,
+    output_watch_root: Path | None = None,
+    max_output_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Run one structured JSON request/result command without shell interpolation."""
+
+    if (output_watch_root is None) != (max_output_bytes is None):
+        raise ValueError(
+            "output_watch_root and max_output_bytes must be supplied together"
+        )
+    if max_output_bytes is not None and (
+        isinstance(max_output_bytes, bool)
+        or not isinstance(max_output_bytes, int)
+        or max_output_bytes < 0
+    ):
+        raise ValueError("max_output_bytes must be a nonnegative integer")
 
     argv = _substitute_argv(argv_template, request_json=request_path)
     environment = os.environ.copy()
     environment.update(environment_overrides)
+    popen_kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
 
     try:
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
@@ -554,21 +635,41 @@ def run_structured_command(
                 stdout=stdout_file,
                 stderr=stderr_file,
                 env=environment,
+                **popen_kwargs,
             )
-            try:
-                return_code = process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired as exc:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-                raise FrontierwrightError(
-                    "BACKEND_TIMEOUT",
-                    f"Backend exceeded {timeout_seconds:g} seconds.",
-                    14,
-                ) from exc
+            started = time.monotonic()
+            while True:
+                return_code = process.poll()
+                if return_code is not None:
+                    break
+
+                if output_watch_root is not None and max_output_bytes is not None:
+                    observed_bytes = _output_tree_size_bytes(output_watch_root)
+                    if observed_bytes > max_output_bytes:
+                        _terminate_backend_tree(process)
+                        raise FrontierwrightError(
+                            "STORAGE_BUDGET_REACHED",
+                            (
+                                "Backend output exceeded the runtime storage budget: "
+                                f"{observed_bytes} > {max_output_bytes} bytes."
+                            ),
+                            14,
+                        )
+
+                elapsed = time.monotonic() - started
+                if elapsed >= timeout_seconds:
+                    _terminate_backend_tree(process)
+                    raise FrontierwrightError(
+                        "BACKEND_TIMEOUT",
+                        f"Backend exceeded {timeout_seconds:g} seconds.",
+                        14,
+                    )
+                time.sleep(
+                    min(
+                        BACKEND_WATCH_INTERVAL_SECONDS,
+                        max(0.01, timeout_seconds - elapsed),
+                    )
+                )
 
             stdout = _read_bounded_output(stdout_file, "stdout")
             stderr = _read_bounded_output(stderr_file, "stderr")
@@ -609,19 +710,22 @@ def run_structured_command(
         )
     return payload
 
-
 def _run_backend(
     spec: CommandBackendSpec,
     argv_template: tuple[str, ...],
     *,
     request_path: Path,
     timeout_seconds: float,
+    output_watch_root: Path | None = None,
+    max_output_bytes: int | None = None,
 ) -> dict[str, Any]:
     return run_structured_command(
         argv_template,
         environment_overrides=spec.environment,
         request_path=request_path,
         timeout_seconds=timeout_seconds,
+        output_watch_root=output_watch_root,
+        max_output_bytes=max_output_bytes,
     )
 
 
@@ -723,6 +827,10 @@ def run_training_backend(
         spec.train_argv,
         request_path=request_path,
         timeout_seconds=timeout_seconds,
+        output_watch_root=(
+            output_root if plan.budgets.max_storage_bytes is not None else None
+        ),
+        max_output_bytes=plan.budgets.max_storage_bytes,
     )
     output = result.get("output_model_path")
     metrics = result.get("metrics", {})

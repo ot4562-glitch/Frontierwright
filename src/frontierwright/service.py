@@ -4098,7 +4098,7 @@ def _budget_enforcement_modes(
                     f"HARD_ACCOUNTED_TIMEOUT:{provenance}"
                 )
     if plan.budgets.max_storage_bytes is not None:
-        modes["max_storage_bytes"] = "ADMISSION_AND_FINALIZATION_GATE"
+        modes["max_storage_bytes"] = "RUNTIME_WATCHDOG_AND_FINALIZATION_GATE"
     if plan.budgets.max_money is not None:
         modes["max_money"] = "NOT_RUNTIME_ENFORCEABLE"
     return modes

@@ -108,6 +108,71 @@ else:
     return spec
 
 
+def write_storage_watchdog_backend(root: Path) -> Path:
+    root.mkdir(parents=True)
+    script = root / "backend.py"
+    script.write_text(
+        """
+import json
+import sys
+import time
+from pathlib import Path
+
+request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if request["operation"] == "calibrate":
+    print(json.dumps({
+        "schema_version": 1,
+        "ok": True,
+        "feasible": True,
+        "representative_steps": 1,
+        "step_time_seconds": 0.05,
+        "tokens_per_second": 1000.0,
+        "peak_vram_bytes": 1024,
+        "peak_ram_bytes": 2048,
+        "projected_storage_bytes": 64,
+        "projected_wall_seconds": 5.0,
+        "gpu_count": 1
+    }))
+elif request["operation"] == "train":
+    output = Path(request["output_root"]) / "model"
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "oversized.bin").write_bytes(b"x" * 8192)
+    time.sleep(5)
+    (output / "completed.txt").write_text("should-not-exist", encoding="utf-8")
+    (output / "config.json").write_text(
+        json.dumps({"model_type": "watchdog-fixture"}),
+        encoding="utf-8",
+    )
+    (output / "model.safetensors").write_bytes(b"candidate")
+    print(json.dumps({
+        "schema_version": 1,
+        "ok": True,
+        "output_model_path": str(output),
+        "metrics": {"steps": 1}
+    }))
+else:
+    raise SystemExit(2)
+""".strip()
+        + chr(10),
+        encoding="utf-8",
+    )
+    spec = root / "backend.json"
+    spec.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "backend_id": "storage-watchdog-backend",
+                "supported_paths": ["LORA_SFT"],
+                "calibrate_argv": [sys.executable, str(script), "{request_json}"],
+                "train_argv": [sys.executable, str(script), "{request_json}"],
+                "environment": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return spec
+
+
 def setup_project(tmp_path: Path) -> tuple[Path, Path]:
     project = tmp_path / "project"
     import_local_model(
@@ -357,7 +422,7 @@ def test_plan_reports_actual_budget_enforcement_modes(tmp_path: Path) -> None:
     assert calibrated.budget_enforcement == {
         "max_gpu_hours": "HARD_ACCOUNTED_TIMEOUT:CALIBRATION_REPORTED",
         "max_runs": "HARD_REGISTRY_ADMISSION",
-        "max_storage_bytes": "ADMISSION_AND_FINALIZATION_GATE",
+        "max_storage_bytes": "RUNTIME_WATCHDOG_AND_FINALIZATION_GATE",
         "max_wall_seconds": "HARD_LOCAL_TIMEOUT",
     }
 
@@ -532,6 +597,53 @@ def test_durable_result_reconciliation_creates_exactly_one_candidate(tmp_path: P
     assert first.usage["measured_by"] == "fixture-executor"
     assert len(state.candidates) == 1
     assert state.project["champion_id"] != first.candidate_model_id
+
+
+def test_runtime_storage_watchdog_terminates_backend_before_completion(
+    tmp_path: Path,
+) -> None:
+    project, _ = setup_project(tmp_path)
+    backend_spec = write_storage_watchdog_backend(tmp_path / "watchdog-backend")
+    plan = create_training_plan(
+        project,
+        path_id=TrainingPathId.LORA_SFT,
+        backend_spec_path=backend_spec,
+        dataset_id=None,
+        permission=PermissionLevel.EXECUTE_BOUNDED,
+        budgets=HardBudgets(
+            max_wall_seconds=20,
+            max_storage_bytes=1024,
+        ),
+        config={},
+    )
+    calibrated = calibrate_training_plan(
+        project,
+        plan_id=plan.plan_id or "",
+        backend_spec_path=backend_spec,
+    )
+    assert calibrated.ready is True
+    assert calibrated.budget_enforcement["max_storage_bytes"] == (
+        "RUNTIME_WATCHDOG_AND_FINALIZATION_GATE"
+    )
+
+    with pytest.raises(FrontierwrightError, match="runtime storage budget"):
+        execute_training_plan(
+            project,
+            plan_id=plan.plan_id or "",
+            backend_spec_path=backend_spec,
+            dry_run=False,
+            rerun=False,
+        )
+
+    state = Registry(project).read()
+    assert len(state.runs) == 1
+    run = state.runs[0]
+    assert run["status"] == "INCOMPLETE"
+    assert run["error_code"] == "STORAGE_BUDGET_REACHED"
+    assert state.candidates == ()
+    output_root = registry_output = project / ".frontierwright" / "candidates" / str(run["run_id"])
+    assert (registry_output / "model" / "oversized.bin").is_file()
+    assert not (output_root / "model" / "completed.txt").exists()
 
 
 def test_measured_output_storage_budget_blocks_candidate_finalization(
