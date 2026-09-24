@@ -21,6 +21,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from frontierwright.capability_v1 import (
+    CAPABILITY_V1_BUNDLE_ID,
+    CAPABILITY_V1_BUNDLE_VERSION,
+    CAPABILITY_V1_SCORING,
+    CAPABILITY_V1_TASKS,
+    capability_v1_bundle_hash,
+    capability_v1_task_counts,
+)
 from frontierwright.reference_merge import merge_reference_models
 from frontierwright.reference_quantization import (
     load_quantized_reference_state,
@@ -94,6 +102,17 @@ PRESETS: dict[str, ModelPreset] = {
         context_length=128,
     ),
 }
+
+
+@dataclass
+class _CapabilityAxisAccumulator:
+    correct: int = 0
+    total: int = 0
+    margins: list[float] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.margins is None:
+            self.margins = []
 
 
 @dataclass(frozen=True)
@@ -1788,6 +1807,164 @@ def _evaluate(
     }
 
 
+
+def _capability_choice_score(
+    torch: Any,
+    model: Any,
+    *,
+    tokenizer_payload: dict[str, Any],
+    prompt: str,
+    choice: str,
+    context_length: int,
+    device: str,
+) -> float:
+    prompt_ids = encode_with_tokenizer(prompt.encode("utf-8"), tokenizer_payload)
+    choice_ids = encode_with_tokenizer((" " + choice).encode("utf-8"), tokenizer_payload)
+    if not prompt_ids or not choice_ids:
+        raise ValueError("capability task tokenizer produced an empty sequence")
+
+    sequence = prompt_ids + choice_ids
+    maximum_tokens = context_length + 1
+    trimmed = max(0, len(sequence) - maximum_tokens)
+    window = sequence[trimmed:]
+    choice_start = len(prompt_ids) - trimmed
+    if choice_start < 1:
+        raise ValueError("capability task prompt leaves no conditioning token in context")
+
+    inputs = torch.tensor([window[:-1]], dtype=torch.long, device=device)
+    targets = torch.tensor(window[1:], dtype=torch.long, device=device)
+    logits = model(inputs)[0]
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    first_target = choice_start - 1
+    selected = log_probs[first_target:, :].gather(
+        1,
+        targets[first_target:].unsqueeze(1),
+    )
+    if int(selected.numel()) <= 0:
+        raise ValueError("capability task produced no scored answer tokens")
+    return float(selected.mean().detach().cpu().item())
+
+
+def _capability_v1(request: dict[str, Any]) -> dict[str, object]:
+    torch = _import_torch()
+    model_source_path = request.get("model_source_path")
+    if not isinstance(model_source_path, str) or not model_source_path:
+        raise ValueError("model_source_path is required")
+    raw_config = request.get("config", {})
+    if not isinstance(raw_config, dict):
+        raise ValueError("config must be an object")
+    unknown = sorted(set(raw_config) - {"device"})
+    if unknown:
+        raise ValueError(
+            "capability_v1 config does not support keys: " + ", ".join(unknown)
+        )
+    requested_device = raw_config.get("device", "auto")
+    if not isinstance(requested_device, str) or requested_device not in {
+        "auto",
+        "cpu",
+        "cuda",
+    }:
+        raise ValueError("device must be auto, cpu, or cuda")
+
+    preset_name = _preset_name_for_request(request, {})
+    preset = PRESETS[preset_name]
+    device = _select_device(torch, requested_device)
+    model = _load_reference_model(
+        torch,
+        preset,
+        model_source_path=model_source_path,
+        device=device,
+    )
+    model.eval()
+    tokenizer_payload, _ = _reference_tokenizer_for_model(model_source_path)
+
+    per_axis: dict[str, _CapabilityAxisAccumulator] = {
+        axis: _CapabilityAxisAccumulator()
+        for axis in capability_v1_task_counts()
+    }
+    start = time.perf_counter()
+    with torch.no_grad():
+        for task in CAPABILITY_V1_TASKS:
+            prompt = (
+                "Question: "
+                + task.prompt
+                + "\nChoose the best answer from the four options.\nAnswer:"
+            )
+            scores = [
+                _capability_choice_score(
+                    torch,
+                    model,
+                    tokenizer_payload=tokenizer_payload,
+                    prompt=prompt,
+                    choice=choice,
+                    context_length=preset.context_length,
+                    device=device,
+                )
+                for choice in task.choices
+            ]
+            prediction = max(range(4), key=lambda index: (scores[index], -index))
+            correct_score = scores[task.correct_index]
+            best_wrong = max(
+                score
+                for index, score in enumerate(scores)
+                if index != task.correct_index
+            )
+            axis_key = task.axis.value.lower()
+            bucket = per_axis[axis_key]
+            bucket.total += 1
+            if prediction == task.correct_index:
+                bucket.correct += 1
+            bucket.margins.append(correct_score - best_wrong)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = max(time.perf_counter() - start, 1e-9)
+
+    expected_counts = capability_v1_task_counts()
+    axis_results: list[dict[str, object]] = []
+    for axis_key in ("general", "reasoning", "math", "coding"):
+        bucket = per_axis[axis_key]
+        correct = bucket.correct
+        total = bucket.total
+        margins = bucket.margins
+        if total != expected_counts[axis_key] or total <= 0:
+            raise ValueError(f"capability axis {axis_key} task count mismatch")
+        axis_results.append(
+            {
+                "axis": axis_key,
+                "task_id": f"{CAPABILITY_V1_BUNDLE_ID}.{axis_key}",
+                "task_version": CAPABILITY_V1_BUNDLE_VERSION,
+                "accuracy": correct / total,
+                "correct": correct,
+                "total": total,
+                "mean_correct_margin_nats": (
+                    sum(float(value) for value in margins) / total
+                ),
+            }
+        )
+
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "operation": "capability_v1",
+        "metrics": {
+            "backend_id": REFERENCE_BACKEND_ID,
+            "bundle_id": CAPABILITY_V1_BUNDLE_ID,
+            "bundle_version": CAPABILITY_V1_BUNDLE_VERSION,
+            "bundle_hash": capability_v1_bundle_hash(),
+            "scoring": CAPABILITY_V1_SCORING,
+            "preset": preset.name,
+            "device": device,
+            "axes": axis_results,
+            "task_counts": expected_counts,
+            "elapsed_seconds": elapsed,
+            "parameter_count": _parameter_count(model),
+            "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer_payload),
+            "python_version": sys.version.split()[0],
+            "torch_version": str(torch.__version__),
+        },
+    }
+
+
 def _generate(
     request: dict[str, Any],
     config: ReferenceGenerationConfig,
@@ -2567,6 +2744,9 @@ def main(argv: list[str] | None = None) -> int:
                     request=request,
                 )
             )
+            return 0
+        if operation == "capability_v1":
+            _emit(_capability_v1(request))
             return 0
         if operation == "evaluate":
             model_source_path = request.get("model_source_path")

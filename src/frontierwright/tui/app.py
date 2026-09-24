@@ -49,6 +49,7 @@ from frontierwright.service import (
     promote_candidate,
     reconcile_training_run,
     reject_candidate,
+    run_capability_v1,
     set_build_intent,
     train_project_tokenizer,
 )
@@ -843,6 +844,18 @@ class FrontierwrightApp(App[None]):
                 )
             )
 
+        if self.view.champion_model_id is not None:
+            items.append(
+                ActionItem(
+                    "capability_v1",
+                    "Measure Capability v1",
+                    (
+                        "Run the frozen 64-task General/Reasoning/Math/Coding "
+                        "bundle and update real stats."
+                    ),
+                )
+            )
+
         if self.view.champion_model_id is None:
             if self.view.origin == ModelOrigin.ZERO.value:
                 if self._first_dataset_id(DatasetRole.PRETRAIN):
@@ -1102,6 +1115,27 @@ class FrontierwrightApp(App[None]):
             self._reconcile_latest_run()
             return
 
+        if action_id == "capability_v1":
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="MEASURE FRONTIERWRIGHT CAPABILITY v1",
+                    description=(
+                        "Runs the frozen 64-task local bundle. 100 is the 50% accuracy "
+                        "reference anchor, not a maximum; raw evidence remains inspectable."
+                    ),
+                    fields=[
+                        FormField(
+                            "python",
+                            "Evaluation Python executable",
+                            self._reference_python_default(),
+                        ),
+                        FormField("device", "Device (auto/cpu/cuda)", "auto"),
+                    ],
+                ),
+                self._submit_capability_v1,
+            )
+            return
+
         if action_id == "evaluate_candidate":
             model_id = self._selected_candidate_model_id()
             self.push_screen(
@@ -1345,6 +1379,24 @@ class FrontierwrightApp(App[None]):
                 detail = run.error_message or run.error_code or run.status
                 self.notify(f"Run {run.status}: {detail}", severity="warning")
         except FrontierwrightError as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_capability_v1(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            result = run_capability_v1(
+                self.root,
+                python_executable=values["python"],
+                device=(values.get("device") or "auto").lower(),
+            )
+            self._refresh_all()
+            rendered = ", ".join(
+                f"{axis.title()}={result.stats.get(axis, '?')}"
+                for axis in ("general", "reasoning", "math", "coding")
+            )
+            self.notify("Capability v1 measured: " + rendered)
+        except (FrontierwrightError, KeyError, ValueError) as exc:
             self.notify(str(exc), severity="error")
 
     def _submit_candidate_evaluation(self, values: dict[str, str] | None) -> None:

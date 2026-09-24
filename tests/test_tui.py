@@ -313,3 +313,26 @@ async def test_tui_can_initialize_academy_project_from_uninitialized_directory(
     assert status.project_name == "My Model"
     assert status.origin == "ZERO"
     assert status.edition_profile == "ACADEMY"
+
+
+def test_tui_action_center_exposes_capability_v1_for_current_champion(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    setup_candidate_project(project)
+
+    app = FrontierwrightApp(
+        view=get_status(project),
+        resources=get_resource_view(project),
+        build=get_build_view(project),
+        data=get_data_view(project),
+        paths=get_paths_view(project),
+        candidates=get_candidates_view(project),
+        history=get_history_view(project),
+        root=project,
+        language="en",
+    )
+
+    actions = {item.action_id: item for item in app._action_items()}
+    assert "capability_v1" in actions
+    assert actions["capability_v1"].title == "Measure Capability v1"

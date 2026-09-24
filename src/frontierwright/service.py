@@ -17,6 +17,16 @@ from frontierwright.artifact_store import (
     verify_manifest_digest,
     verify_sealed_artifact,
 )
+from frontierwright.capability_v1 import (
+    CAPABILITY_V1_BUNDLE_ID,
+    CAPABILITY_V1_BUNDLE_VERSION,
+    CAPABILITY_V1_EVALUATOR_ID,
+    CAPABILITY_V1_EVALUATOR_VERSION,
+    CAPABILITY_V1_SCALE,
+    CAPABILITY_V1_SCORING,
+    capability_v1_bundle_hash,
+    capability_v1_task_counts,
+)
 from frontierwright.data import (
     DatasetClassification,
     DatasetDescriptor,
@@ -261,6 +271,28 @@ class EvaluationRunView:
     replayed: bool = False
     measurements: list[dict[str, object]] = field(default_factory=list)
     conditions: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CapabilityV1RunView:
+    schema_version: int = 1
+    bundle_id: str = CAPABILITY_V1_BUNDLE_ID
+    bundle_version: str = CAPABILITY_V1_BUNDLE_VERSION
+    bundle_hash: str | None = None
+    scale_id: str | None = None
+    scale_version: str | None = None
+    scale_hash: str | None = None
+    model_id: str | None = None
+    model_fingerprint: str | None = None
+    receipt_id: str | None = None
+    receipt_sha256: str | None = None
+    replayed: bool = False
+    task_counts: dict[str, int] = field(default_factory=dict)
+    axis_results: list[dict[str, object]] = field(default_factory=list)
+    stats: dict[str, float | None] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

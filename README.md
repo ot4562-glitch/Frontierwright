@@ -40,6 +40,7 @@ Read these in this order:
 1. `product/PRODUCT_DECISIONS_OVERRIDE_20260922.md` — **highest-precedence product decisions**
 2. `product/EDITION_ARCHITECTURE_DECISION_20260923.md` — **frozen Studio / Academy / Lab edition architecture and lifecycle boundary**
 3. `product/V1_IMPLEMENTATION_BLUEPRINT_20260922.md` — v1 implementation contract
+4. `product/CAPABILITY_V1_SPEC_20260924.md` — frozen Capability v1 task/scoring/scale contract
 
 If an older planning document conflicts with any canonical document above, the canonical documents win within their stated scope.
 
@@ -151,6 +152,9 @@ Implemented now:
 - `frontierwright eval run` produces raw cross-entropy/perplexity receipts pinned to exact model and dataset fingerprints, preparation-recipe evidence, evaluation config, and Python/PyTorch runtime versions;
 - identical model/data/config evaluation requests replay the existing durable receipt without rerunning the evaluator, while dataset/model drift is rejected before execution;
 - generated raw evaluation evidence remains separate from capability stats: Frontierwright does not invent a player-facing stat until an explicit frozen capability scale maps the evidence;
+- official Frontierwright Capability v1 ships as a frozen local 64-task four-choice bundle with 16 General, 16 Reasoning, 16 Math, and 16 Coding probes; the exact task bundle and scale are hash-locked and versioned rather than silently changing under the same stat name;
+- Capability v1 scores each choice by mean conditional token log-probability using the exact tokenizer bound to the model, stores raw accuracy/count/margin evidence, and maps each axis with the frozen anchors 0% -> 0, 25% chance -> 50, 50% -> 100, and 100% -> 200, so 100 remains a reference anchor rather than a cap;
+- `frontierwright eval capability-v1` generates/replays the durable Capability v1 receipt and activates the frozen-scale character stats; the keyboard TUI Action Center exposes the same operation through the shared service layer;
 - `frontierwright eval compare` evaluates champion and candidate under the same pack/data/config and reports raw deltas plus direction-normalized `improvement_delta` without choosing or promoting a winner; stored comparable raw receipts are also surfaced automatically in the normal Candidate compare view/TUI;
 - deterministic evaluation replay revalidates model/data/config/evaluator identity, so a conflicting receipt cannot silently occupy a generated receipt ID;
 - evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
@@ -164,7 +168,6 @@ Implemented now:
 
 Not implemented yet:
 
-- an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and its official capability runner; the generic raw evaluation-pack runner exists, but no official Capability v1 scale is claimed yet;
 - broad arbitrary-Hugging-Face production adapters; the built-in QLoRA path is intentionally a narrow Frontierwright-reference implementation rather than a claim of arbitrary-architecture compatibility;
 - OS/filesystem-enforced storage quotas with zero polling overshoot, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
 - public dataset discovery/download adapters and richer prepared tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
