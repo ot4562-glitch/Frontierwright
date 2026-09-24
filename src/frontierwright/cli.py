@@ -18,6 +18,7 @@ from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
 from frontierwright.evaluations import REFERENCE_LM_PACK
 from frontierwright.execution import BackendDataBoundary, HardBudgets, PermissionLevel
+from frontierwright.observations import ObservationOutcome
 from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import (
     BYTE_SHARDS_PLUGIN_ID,
@@ -87,6 +88,7 @@ from frontierwright.service import (
     get_stats_view,
     get_status,
     get_tokenizers_view,
+    get_usage_observation_summary,
     get_workload_fit,
     get_workload_view,
     import_external_evaluation_evidence,
@@ -114,6 +116,7 @@ from frontierwright.service import (
     promote_candidate,
     quantize_reference_model,
     reconcile_training_run,
+    record_usage_observation,
     reject_candidate,
     repair_run_receipt,
     run_capability_v1,
@@ -135,6 +138,8 @@ app = typer.Typer(
 project_app = typer.Typer(help="Create and inspect Frontierwright project state.")
 resources_app = typer.Typer(help="Detect and inspect project compute resources.")
 workload_app = typer.Typer(help="Describe the user workload the model should fit.")
+observe_app = typer.Typer(help="Record privacy-minimal evidence from real model use.")
+observe_app = typer.Typer(help="Record privacy-minimal evidence from real model use.")
 build_app = typer.Typer(help="Inspect and edit the desired model build.")
 stats_app = typer.Typer(help="Inspect or ingest capability evaluation evidence.")
 evaluation_app = typer.Typer(help="Run and inspect raw evaluation packs.")
@@ -151,6 +156,8 @@ lab_app.add_typer(lab_adapters_app, name="adapters")
 app.add_typer(project_app, name="project")
 app.add_typer(resources_app, name="resources")
 app.add_typer(workload_app, name="workload")
+app.add_typer(observe_app, name="observe")
+app.add_typer(observe_app, name="observe")
 app.add_typer(build_app, name="build")
 app.add_typer(stats_app, name="stats")
 app.add_typer(evaluation_app, name="eval")
@@ -2128,6 +2135,133 @@ def resources_show(
     _print_resources(view)
 
 
+@observe_app.command("record")
+def observe_record(
+    task: Annotated[
+        str, typer.Argument(help="Short task/category label; raw prompts are not stored.")
+    ],
+    outcome: Annotated[
+        str,
+        typer.Option(
+            "--outcome",
+            help="SUCCESS, FAILURE, CORRECTED, or ABSTAINED.",
+        ),
+    ],
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    domain: Annotated[str | None, typer.Option("--domain")] = None,
+    language: Annotated[str | None, typer.Option("--language")] = None,
+    failure_category: Annotated[str | None, typer.Option("--failure-category")] = None,
+    latency_seconds: Annotated[float | None, typer.Option("--latency-seconds")] = None,
+    classification: Annotated[
+        str | None,
+        typer.Option(
+            "--classification",
+            help="Defaults to active workload privacy, otherwise PRIVATE.",
+        ),
+    ] = None,
+    idempotency_key: Annotated[
+        str | None,
+        typer.Option(
+            "--idempotency-key",
+            help="Optional caller key for retry-safe ingestion. Omit it for distinct real uses.",
+        ),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        parsed_outcome = ObservationOutcome(outcome.strip().upper())
+        parsed_classification = (
+            DatasetClassification(classification.strip().upper())
+            if classification is not None
+            else None
+        )
+        view = record_usage_observation(
+            path,
+            task=task,
+            outcome=parsed_outcome,
+            model_id=model,
+            domain=domain,
+            language=language,
+            failure_category=failure_category,
+            latency_seconds=latency_seconds,
+            classification=parsed_classification,
+            idempotency_key=idempotency_key,
+        )
+    except (FrontierwrightError, ValueError) as exc:
+        if isinstance(exc, FrontierwrightError):
+            _fail(exc, json_output=json_output)
+        _fail(
+            FrontierwrightError(
+                "INVALID_USAGE_OBSERVATION",
+                "outcome/classification is invalid.",
+                2,
+            ),
+            json_output=json_output,
+        )
+    payload = {"ok": True, **view.to_dict()}
+    if json_output:
+        _emit_json(payload)
+        return
+    observation = view.observation
+    console.print("[bold]USAGE EVIDENCE RECORDED[/bold]")
+    console.print(f"Model: {observation.get('model_id')}")
+    console.print(f"Task: {observation.get('task')} · outcome={observation.get('outcome')}")
+    console.print(f"Replayed: {'YES' if view.replayed else 'NO'}")
+    console.print("Prompt/response content stored: NO")
+    console.print("This is operational evidence, not an RL reward.")
+
+
+@observe_app.command("summary")
+def observe_summary(
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        summary = get_usage_observation_summary(path, model)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    payload = {"ok": True, **summary.to_payload()}
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print("[bold]REAL-USE OBSERVATIONS[/bold]")
+    console.print(f"Model: {summary.model_id or 'NONE'} · total={summary.total}")
+    console.print(
+        f"SUCCESS {summary.direct_successes} · FAILURE {summary.failures} · "
+        f"CORRECTED {summary.corrected} · ABSTAINED {summary.abstained}"
+    )
+    if summary.direct_success_rate is not None:
+        lo, hi = summary.direct_success_rate_ci95 or (0.0, 1.0)
+        console.print(
+            f"Direct success rate: {summary.direct_success_rate:.3f} "
+            f"(Wilson 95% CI {lo:.3f}–{hi:.3f})"
+        )
+    for item in summary.by_task:
+        console.print(
+            f"  {item.task}: total={item.total} success={item.direct_successes} "
+            f"failure={item.failures} corrected={item.corrected} abstained={item.abstained}"
+        )
+    if summary.failure_categories:
+        console.print(
+            "Failure categories: "
+            + ", ".join(f"{key}={value}" for key, value in summary.failure_categories.items())
+        )
+    console.print(summary.note)
+
+
 @workload_app.command("show")
 def workload_show(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
@@ -3792,6 +3926,7 @@ def play(
     data = get_data_view(path)
     workload = get_workload_view(path)
     workload_fit = get_workload_fit(path)
+    usage_observations = get_usage_observation_summary(path)
     fit_opportunities = get_fit_opportunities(path)
     paths = get_paths_view(path)
     candidates = get_candidates_view(path)
@@ -3806,6 +3941,7 @@ def play(
         data=data,
         workload=workload,
         workload_fit=workload_fit,
+        usage_observations=usage_observations,
         fit_opportunities=fit_opportunities,
         paths=paths,
         candidates=candidates,

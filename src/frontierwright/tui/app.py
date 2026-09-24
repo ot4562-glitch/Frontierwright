@@ -18,6 +18,7 @@ from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.fit_planner import FitOpportunityPlan, plan_fit_opportunities
 from frontierwright.i18n import tr
+from frontierwright.observations import ObservationOutcome, ObservationSummary
 from frontierwright.paths import TrainingPathId
 from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.service import (
@@ -48,6 +49,7 @@ from frontierwright.service import (
     get_resource_view,
     get_status,
     get_tokenizers_view,
+    get_usage_observation_summary,
     get_workload_fit,
     get_workload_view,
     import_local_model,
@@ -55,6 +57,7 @@ from frontierwright.service import (
     profile_reference_inference,
     promote_candidate,
     reconcile_training_run,
+    record_usage_observation,
     reject_candidate,
     run_capability_v1,
     set_build_intent,
@@ -661,6 +664,7 @@ class FrontierwrightApp(App[None]):
         data: DataView | None = None,
         workload: WorkloadView | None = None,
         workload_fit: WorkloadFitView | None = None,
+        usage_observations: ObservationSummary | None = None,
         fit_opportunities: FitOpportunityPlan | None = None,
         paths: PathsView | None = None,
         candidates: CandidateView | None = None,
@@ -676,6 +680,9 @@ class FrontierwrightApp(App[None]):
         self.data = data or DataView()
         self.workload = workload or WorkloadView()
         self.workload_fit = workload_fit or WorkloadFitView()
+        self.usage_observations = usage_observations or ObservationSummary(
+            model_id=view.champion_model_id
+        )
         self.fit_opportunities = fit_opportunities or plan_fit_opportunities(
             edition=EditionProfile.STUDIO,
             model_id=None,
@@ -1055,6 +1062,64 @@ class FrontierwrightApp(App[None]):
             lines.append("")
         return "\n".join(lines).rstrip()
 
+    def _real_use_lines(self, edition: EditionProfile) -> list[str]:
+        observed = self.usage_observations
+        lines = ["", "REAL USE"]
+        if observed.total == 0:
+            if edition is EditionProfile.ACADEMY:
+                lines.append(
+                    "No real-use outcomes recorded yet. This is optional evidence, not homework."
+                )
+            elif edition is EditionProfile.LAB:
+                lines.append("No operational outcome evidence recorded for this exact model.")
+            else:
+                lines.append(
+                    "No real-use outcomes yet. Record what works, fails, or needs correction."
+                )
+            return lines
+
+        lines.append(
+            f"{observed.total} uses · success {observed.direct_successes} · "
+            f"failure {observed.failures} · corrected {observed.corrected} · "
+            f"abstained {observed.abstained}"
+        )
+        if observed.direct_success_rate is not None and observed.direct_success_rate_ci95:
+            lo, hi = observed.direct_success_rate_ci95
+            lines.append(
+                f"Direct success {observed.direct_success_rate:.1%} · "
+                f"Wilson 95% CI {lo:.1%}–{hi:.1%}"
+            )
+        if observed.by_task:
+            top = observed.by_task[0]
+            if edition is EditionProfile.ACADEMY:
+                lines.append(
+                    f"Most useful lesson source: {top.task} · "
+                    f"{top.failures + top.corrected} failures/corrections"
+                )
+                lines.append(
+                    "These are observations, not RL rewards. Turn repeats into a real "
+                    "eval/data set."
+                )
+            elif edition is EditionProfile.LAB:
+                lines.append(
+                    f"Highest observed issue task: {top.task} · n={top.total} · "
+                    f"failure={top.failures} · corrected={top.corrected}"
+                )
+                lines.append(
+                    "Operational observations require promotion into versioned "
+                    "eval/data/reward evidence before training."
+                )
+            else:
+                lines.append(
+                    f"Most observed friction: {top.task} · "
+                    f"{top.failures + top.corrected} failures/corrections"
+                )
+                lines.append(
+                    "Use repeated failures to choose the next bounded experiment; "
+                    "no gain is assumed."
+                )
+        return lines
+
     def _workload_text(self) -> str:
         if not self.view.initialized:
             return tr(self.language, "no_project")
@@ -1065,47 +1130,40 @@ class FrontierwrightApp(App[None]):
 
         if not self.workload.configured:
             if edition is EditionProfile.ACADEMY:
-                return chr(10).join(
-                    [
-                        "OPTIONAL LEARNING CONTEXT",
-                        (
-                            "Describe what you want the model to do. This is not a "
-                            "personality quiz; "
-                            "it is evidence about real tasks."
-                        ),
-                        "",
-                        (
-                            "You can learn the birth/training/evaluation loop without it, "
-                            "then add a "
-                            "workload when you want to study model trade-offs."
-                        ),
-                    ]
-                )
-            if edition is EditionProfile.LAB:
-                return chr(10).join(
-                    [
-                        "WORKLOAD / SERVING CONTRACT — NOT DEFINED",
-                        (
-                            "Define task mixture, serving constraints, privacy, and "
-                            "capability floors "
-                            "before claiming model utility or frontier progress."
-                        ),
-                    ]
-                )
-            return chr(10).join(
-                [
+                lines = [
+                    "OPTIONAL LEARNING CONTEXT",
+                    (
+                        "Describe what you want the model to do. This is not a personality "
+                        "quiz; it is evidence about real tasks."
+                    ),
+                    "",
+                    (
+                        "You can learn the birth/training/evaluation loop without it, then "
+                        "add a workload when you want to study model trade-offs."
+                    ),
+                ]
+            elif edition is EditionProfile.LAB:
+                lines = [
+                    "WORKLOAD / SERVING CONTRACT — NOT DEFINED",
+                    (
+                        "Define task mixture, serving constraints, privacy, and capability "
+                        "floors before claiming model utility or frontier progress."
+                    ),
+                ]
+            else:
+                lines = [
                     "YOUR WORKLOAD — NOT DEFINED",
                     (
                         "Frontierwright can measure the model, but it cannot yet judge whether "
                         "the model fits your real work."
                     ),
                     (
-                        "Define languages, domains, task weights, context, "
-                        "latency/throughput needs, "
-                        "privacy, and hard capability floors."
+                        "Define languages, domains, task weights, context, latency/throughput "
+                        "needs, privacy, and hard capability floors."
                     ),
                 ]
-            )
+            lines.extend(self._real_use_lines(edition))
+            return chr(10).join(lines)
 
         profile = self.workload.profile
         languages = profile.get("languages")
@@ -1204,6 +1262,8 @@ class FrontierwrightApp(App[None]):
                     )
         elif fit.note:
             lines.append(fit.note)
+
+        lines.extend(self._real_use_lines(edition))
 
         opportunities = self.fit_opportunities.opportunities
         if opportunities:
@@ -1343,6 +1403,7 @@ class FrontierwrightApp(App[None]):
         self.data = get_data_view(self.root)
         self.workload = get_workload_view(self.root)
         self.workload_fit = get_workload_fit(self.root)
+        self.usage_observations = get_usage_observation_summary(self.root)
         self.fit_opportunities = get_fit_opportunities(self.root)
         self.paths = get_paths_view(self.root)
         self.candidates = get_candidates_view(self.root)
@@ -1564,6 +1625,28 @@ class FrontierwrightApp(App[None]):
                 "Tell Frontierwright what this model must do well on your machine.",
             )
             items = [resource_action, workload_action, dataset_action]
+        if self.view.champion_model_id is not None:
+            observe_title = {
+                EditionProfile.ACADEMY: "Record what happened in real use",
+                EditionProfile.STUDIO: "Record real-use outcome",
+                EditionProfile.LAB: "Record operational outcome evidence",
+            }[edition]
+            observe_description = {
+                EditionProfile.ACADEMY: (
+                    "Mark a real use as success, failure, corrected, or abstained so later "
+                    "experiments can learn from actual mistakes without storing the prompt."
+                ),
+                EditionProfile.STUDIO: (
+                    "Track a real task outcome against this exact Champion; prompt/response "
+                    "content is not stored by this evidence record."
+                ),
+                EditionProfile.LAB: (
+                    "Attach privacy-minimal production outcome metadata to the exact model and "
+                    "active workload. This is operational evidence, not an RL reward."
+                ),
+            }[edition]
+            items.append(ActionItem("record_observation", observe_title, observe_description))
+
         if self.build.mode == "INTENT":
             items.append(
                 ActionItem(
@@ -1758,6 +1841,29 @@ class FrontierwrightApp(App[None]):
                 self.notify("Resources detected.")
             except FrontierwrightError as exc:
                 self.notify(str(exc), severity="error")
+            return
+
+        if action_id == "record_observation":
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="RECORD REAL-USE OUTCOME",
+                    description=(
+                        "Record outcome metadata for this exact model. Prompt/response content is "
+                        "not stored here, and this record is not an RL reward."
+                    ),
+                    fields=[
+                        FormField("task", "Task/category", "general-use"),
+                        FormField(
+                            "outcome", "Outcome (SUCCESS/FAILURE/CORRECTED/ABSTAINED)", "SUCCESS"
+                        ),
+                        FormField("domain", "Domain (optional)", ""),
+                        FormField("language", "Language (optional)", ""),
+                        FormField("failure_category", "Failure/correction category (optional)", ""),
+                        FormField("latency", "Latency seconds (optional)", ""),
+                    ],
+                ),
+                self._submit_observation,
+            )
             return
 
         if action_id == "set_workload":
@@ -2287,6 +2393,25 @@ class FrontierwrightApp(App[None]):
             )
             self._refresh_all()
             self.notify("Measured build targets updated.")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_observation(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            raw_latency = values.get("latency", "").strip()
+            record_usage_observation(
+                self.root,
+                task=values["task"],
+                outcome=ObservationOutcome(values["outcome"].strip().upper()),
+                domain=values.get("domain") or None,
+                language=values.get("language") or None,
+                failure_category=values.get("failure_category") or None,
+                latency_seconds=float(raw_latency) if raw_latency else None,
+            )
+            self._refresh_all()
+            self.notify("Real-use outcome recorded. No prompt/response content was stored.")
         except (FrontierwrightError, KeyError, ValueError) as exc:
             self.notify(str(exc), severity="error")
 

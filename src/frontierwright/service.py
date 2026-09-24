@@ -106,6 +106,15 @@ from frontierwright.local_executor import (
     terminate_worker_tree,
 )
 from frontierwright.models import discover_history_evidence, inspect_local_model
+from frontierwright.observations import (
+    OBSERVATION_EVENT_KIND,
+    OBSERVATION_SOURCE_EXPLICIT,
+    ObservationOutcome,
+    ObservationSummary,
+    UsageObservation,
+    observation_from_event,
+    summarize_observations,
+)
 from frontierwright.paths import PathAvailability, PathContext, TrainingPathId
 from frontierwright.recipes import (
     BUILTIN_DATA_PREPARATION_PLUGINS,
@@ -283,6 +292,16 @@ class WorkloadFitView:
     workload_evaluation_coverage: dict[str, object] = field(default_factory=dict)
     synthetic_utility_score: None = None
     note: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class UsageObservationRecordView:
+    schema_version: int = 1
+    replayed: bool = False
+    observation: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -5250,6 +5269,122 @@ def detect_resources(root: Path) -> ResourceView:
     return get_resource_view(root)
 
 
+def _usage_observations_from_state(state: ProjectState) -> list[UsageObservation]:
+    observations: list[UsageObservation] = []
+    for event in state.history:
+        if event.get("kind") != OBSERVATION_EVENT_KIND:
+            continue
+        details = event.get("details")
+        if not isinstance(details, dict):
+            continue
+        observation = observation_from_event(details)
+        if observation is not None:
+            observations.append(observation)
+    return observations
+
+
+def get_usage_observation_summary(root: Path, model_id: str | None = None) -> ObservationSummary:
+    registry = Registry(root)
+    if not registry.exists:
+        return ObservationSummary(model_id=None)
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None and state.champion is not None:
+        target_model_id = state.champion.model.model_id
+    if target_model_id is not None:
+        registry.get_model(target_model_id)
+    return summarize_observations(
+        _usage_observations_from_state(state),
+        model_id=target_model_id,
+    )
+
+
+def record_usage_observation(
+    root: Path,
+    *,
+    task: str,
+    outcome: ObservationOutcome,
+    model_id: str | None = None,
+    domain: str | None = None,
+    language: str | None = None,
+    failure_category: str | None = None,
+    latency_seconds: float | None = None,
+    classification: DatasetClassification | None = None,
+    idempotency_key: str | None = None,
+) -> UsageObservationRecordView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before recording usage evidence.",
+            10,
+        )
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "Establish a Champion or specify --model before recording usage evidence.",
+                12,
+            )
+        target_model_id = state.champion.model.model_id
+    model = registry.get_model(target_model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+
+    workload = get_workload_view(root)
+    resolved_classification = classification
+    if resolved_classification is None:
+        raw_privacy = workload.profile.get("privacy") if workload.configured else None
+        try:
+            resolved_classification = (
+                DatasetClassification(str(raw_privacy))
+                if isinstance(raw_privacy, str)
+                else DatasetClassification.PRIVATE
+            )
+        except ValueError:
+            resolved_classification = DatasetClassification.PRIVATE
+
+    clean_key = idempotency_key.strip() if isinstance(idempotency_key, str) else None
+    if clean_key:
+        identity_material = f"{model.fingerprint}\0{clean_key}".encode()
+        observation_id = f"observation-{hashlib.sha256(identity_material).hexdigest()[:32]}"
+    else:
+        observation_id = f"observation-{uuid4().hex}"
+
+    observation = UsageObservation(
+        observation_id=observation_id,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        task=task,
+        outcome=outcome,
+        workload_profile_hash=workload.profile_hash if workload.configured else None,
+        domain=domain,
+        language=language,
+        failure_category=failure_category,
+        latency_seconds=latency_seconds,
+        classification=resolved_classification,
+        source=OBSERVATION_SOURCE_EXPLICIT,
+        idempotency_key=clean_key,
+    )
+    payload = observation.to_payload()
+
+    if clean_key:
+        for existing in _usage_observations_from_state(state):
+            if existing.observation_id != observation.observation_id:
+                continue
+            if existing.to_payload() != payload:
+                raise FrontierwrightError(
+                    "USAGE_OBSERVATION_IDEMPOTENCY_CONFLICT",
+                    "The idempotency key already identifies different usage evidence.",
+                    13,
+                )
+            return UsageObservationRecordView(replayed=True, observation=existing.to_payload())
+
+    registry.record_event(OBSERVATION_EVENT_KIND, payload)
+    return UsageObservationRecordView(replayed=False, observation=payload)
+
+
 def get_workload_view(root: Path) -> WorkloadView:
     registry = Registry(root)
     if not registry.exists:
@@ -5417,6 +5552,7 @@ def get_fit_opportunities(
         constraints=fit.constraints,
         model_fit=model_fit,
         workload_evaluation_coverage=fit.workload_evaluation_coverage,
+        observation_summary=get_usage_observation_summary(root, target_model_id).to_payload(),
     )
 
 

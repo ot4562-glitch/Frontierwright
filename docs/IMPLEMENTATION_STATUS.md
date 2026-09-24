@@ -106,6 +106,8 @@ Implemented now:
 - training creates a `PENDING` candidate and never silently changes the champion;
 - candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
 - `frontierwright workload compare-models` compares any two registered models, including a historical stock/open baseline and an already-promoted descendant, without requiring Candidate status; it reuses measured capability/workload/serving/resource/storage/Pareto/user-utility evidence and never fills missing dimensions from parameter-count guesses;
+- privacy-minimal Usage Observations bind SUCCESS/FAILURE/CORRECTED/ABSTAINED outcomes to the exact model fingerprint and active workload hash without storing prompt/response content; optional idempotency keys make connector retries safe while repeated real uses remain distinct evidence;
+- real-use summaries expose task/failure-category counts and Wilson uncertainty for direct-success rates, and repeated failures/corrections feed the evidence-driven fit planner without being mislabeled as RL rewards or predicted gains;
 - promotion re-checks current champion/build/evaluation state transactionally, enforces frozen-scale build floors by default, and records explicit override evidence when a user intentionally accepts an unmeasured or build-violating candidate;
 - stable JSON/non-interactive machine surfaces for project/model/birth/evolve/optimize/operate/export/generation/resource/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter operations;
 - mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;

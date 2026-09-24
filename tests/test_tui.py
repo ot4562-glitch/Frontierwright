@@ -15,6 +15,7 @@ from frontierwright.capability_v1 import (
 )
 from frontierwright.domain import Axis, ModelOrigin, ModelState
 from frontierwright.evaluations import EvaluationReceipt, RawMeasurement, apply_scale
+from frontierwright.observations import ObservationSummary, TaskObservationSummary
 from frontierwright.registry import Registry
 from frontierwright.service import (
     CompareView,
@@ -355,6 +356,58 @@ def test_tui_workload_experience_differs_by_edition() -> None:
     assert "Hash: sha256:demo" in lab_text
     assert "unknown constraints remain UNKNOWN" in lab_text
     assert "Explicit decision utility" in lab_text
+
+
+def test_tui_real_use_evidence_is_explained_differently_by_edition() -> None:
+    observations = ObservationSummary(
+        model_id="model-live",
+        total=6,
+        direct_successes=2,
+        failures=2,
+        corrected=1,
+        abstained=1,
+        evaluable=5,
+        direct_success_rate=0.4,
+        direct_success_rate_ci95=(0.12, 0.77),
+        by_task=(
+            TaskObservationSummary(
+                task="coding",
+                total=4,
+                direct_successes=1,
+                failures=2,
+                corrected=1,
+                abstained=0,
+                direct_success_rate=0.25,
+                direct_success_rate_ci95=(0.05, 0.70),
+            ),
+        ),
+        failure_categories={"tool-selection": 2},
+    )
+    base = replace(make_view(), champion_model_id="model-live")
+    academy = FrontierwrightApp(view=base, usage_observations=observations)
+    studio = FrontierwrightApp(
+        view=replace(base, edition_profile="STUDIO", edition_name="Frontierwright Studio"),
+        usage_observations=observations,
+    )
+    lab = FrontierwrightApp(
+        view=replace(base, edition_profile="LAB", edition_name="Frontierwright Lab"),
+        usage_observations=observations,
+    )
+
+    academy_text = academy._workload_text()
+    studio_text = studio._workload_text()
+    lab_text = lab._workload_text()
+    assert "REAL USE" in academy_text
+    assert "lesson source" in academy_text
+    assert "not RL rewards" in academy_text
+    assert "Most observed friction" in studio_text
+    assert "next bounded experiment" in studio_text
+    assert "Highest observed issue task" in lab_text
+    assert "versioned eval/data/reward evidence" in lab_text
+
+    assert any(item.title == "Record what happened in real use" for item in academy._action_items())
+    assert any(item.title == "Record real-use outcome" for item in studio._action_items())
+    assert any(item.title == "Record operational outcome evidence" for item in lab._action_items())
 
 
 def test_tui_action_priority_differs_by_edition() -> None:

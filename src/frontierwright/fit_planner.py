@@ -88,6 +88,7 @@ def plan_fit_opportunities(
     constraints: list[dict[str, object]],
     model_fit: dict[str, object] | None,
     workload_evaluation_coverage: dict[str, object] | None,
+    observation_summary: dict[str, object] | None = None,
 ) -> FitOpportunityPlan:
     """Return falsifiable next experiments without forecasting improvement."""
 
@@ -382,6 +383,68 @@ def plan_fit_opportunities(
                 ),
                 evidence_keys=("privacy.serving_boundary",),
                 success_criterion="Serving evidence passes the workload privacy constraint.",
+            ),
+        )
+
+    observed = observation_summary or {}
+    observed_failures = observed.get("failures")
+    observed_corrected = observed.get("corrected")
+    failure_count = (
+        int(observed_failures)
+        if isinstance(observed_failures, int) and not isinstance(observed_failures, bool)
+        else 0
+    )
+    corrected_count = (
+        int(observed_corrected)
+        if isinstance(observed_corrected, int) and not isinstance(observed_corrected, bool)
+        else 0
+    )
+    if failure_count + corrected_count > 0:
+        categories = observed.get("failure_categories")
+        category_text = ""
+        if isinstance(categories, dict) and categories:
+            top = sorted(
+                (
+                    (str(key), int(value))
+                    for key, value in categories.items()
+                    if isinstance(value, int) and not isinstance(value, bool) and value > 0
+                ),
+                key=lambda item: (-item[1], item[0].casefold()),
+            )[:3]
+            if top:
+                category_text = "; top categories=" + ", ".join(
+                    f"{name}:{count}" for name, count in top
+                )
+        _append_unique(
+            items,
+            seen,
+            FitOpportunity(
+                opportunity_id="learn-from-observed-failures",
+                opportunity_class=OpportunityClass.CONTINUAL_IMPROVEMENT,
+                action=(
+                    "frontierwright observe summary; turn repeated real-use failures into "
+                    "versioned evaluation/data evidence, then run one bounded intervention"
+                ),
+                title=_edition_title(
+                    edition,
+                    academy="Turn real mistakes into the next lesson",
+                    studio="Use real failures for the next targeted experiment",
+                    lab="Promote production failures into controlled eval/data/reward evidence",
+                ),
+                reason=(
+                    f"The exact model has {failure_count} failed and {corrected_count} "
+                    f"user-corrected observed uses{category_text}. These observations are "
+                    "operational evidence, not RL rewards and not proof of the best intervention."
+                ),
+                evidence_keys=(
+                    "usage_observations.failures",
+                    "usage_observations.corrected",
+                ),
+                success_criterion=(
+                    "Repeated failures are represented in versioned evaluation/data evidence, and "
+                    "a descendant is tested against the same real-use failure pattern with "
+                    "regressions still visible."
+                ),
             ),
         )
 

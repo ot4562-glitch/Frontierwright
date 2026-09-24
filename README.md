@@ -195,6 +195,16 @@ This comparison is not tied to Candidate status. It reuses the same capability, 
 serving/resource, artifact-size, paired-item, Pareto, and explicit user-utility evidence
 that Frontierwright has actually measured; missing dimensions remain UNKNOWN.
 
+Close the loop with privacy-minimal real-use evidence. These records are **not RL rewards** and do not store prompt/response content by default:
+
+```bash
+frontierwright observe record coding --outcome FAILURE --failure-category tool-selection --path .
+frontierwright observe summary --path .
+frontierwright workload next --path .
+```
+
+Repeated failures/corrections become evidence for the next bounded experiment. Frontierwright still requires them to be promoted into versioned evaluation/data/reward evidence before training or RL can claim to learn from them.
+
 AI agents and automation should use the non-interactive CLI/JSON contract instead of
 driving the TUI:
 

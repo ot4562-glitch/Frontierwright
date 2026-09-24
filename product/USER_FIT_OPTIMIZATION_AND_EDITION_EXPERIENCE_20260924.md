@@ -235,6 +235,8 @@ The endless development loop is supplied by reality:
 
 New open models, new hardware, new training algorithms, new data, and changing user requirements are all new development content.
 
+Implementation note (2026-09-25): Frontierwright now has a privacy-minimal Usage Observation evidence layer. It records outcome metadata against the exact model/workload without storing prompt/response content by default, summarizes uncertainty, and can surface repeated failures/corrections as the next experiment opportunity. These observations remain operational evidence until deliberately converted into versioned evaluation/data/reward artifacts; they are not automatically RL rewards.
+
 ## 11. Three editions: one core, genuinely different experiences
 
 Edition remains a UX/policy profile. Model identity and lineage remain edition-independent.
