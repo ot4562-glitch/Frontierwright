@@ -456,6 +456,13 @@ def _print_workload(view: WorkloadView) -> None:
         console.print("Critical capability floors:")
         for axis, value in sorted(floors.items()):
             console.print(f"  {axis.title()}: {value}")
+    utility_weights = profile.get("utility_weights")
+    utility_scales = profile.get("utility_scales")
+    if isinstance(utility_weights, dict) and utility_weights and isinstance(utility_scales, dict):
+        console.print("Explicit user utility:")
+        for key, value in sorted(utility_weights.items()):
+            console.print(f"  {key}: weight={value} · scale={utility_scales.get(key)}")
+        console.print("  Missing comparable evidence keeps the relative utility result INCOMPLETE.")
 
 
 def _print_workload_fit(view: WorkloadFitView) -> None:
@@ -895,6 +902,31 @@ def _print_compare(view: CompareView) -> None:
         reason = view.pareto.get("inference_profile_reason")
         if reason:
             console.print(f"  Runtime evidence: {reason}")
+        utility = view.pareto.get("explicit_user_utility")
+        if isinstance(utility, dict):
+            status = utility.get("status")
+            if status == "COMPLETE":
+                console.print(
+                    f"  USER UTILITY: {utility.get('relation')} · "
+                    f"delta={utility.get('utility_delta')}"
+                )
+                contributions = utility.get("contributions")
+                if isinstance(contributions, list):
+                    for item in contributions:
+                        if isinstance(item, dict):
+                            console.print(
+                                f"    {item.get('metric_key')}: "
+                                f"{item.get('contribution')} "
+                                f"(weight={item.get('weight')}, scale={item.get('scale')})"
+                            )
+            elif status == "INCOMPLETE":
+                missing = utility.get("missing_metrics")
+                missing_text = (
+                    ", ".join(str(item) for item in missing)
+                    if isinstance(missing, list)
+                    else "unknown"
+                )
+                console.print(f"  USER UTILITY: INCOMPLETE · missing {missing_text}")
 
     console.print("")
     console.print(f"Promotion eligible: {'YES' if view.promotion_eligible else 'NO'}")
@@ -1980,6 +2012,20 @@ def workload_set(
         list[str] | None,
         typer.Option("--floor", help="Repeat capability-axis=value hard floor."),
     ] = None,
+    utility_weight: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--utility-weight",
+            help="Repeat measured-metric=weight for explicit user utility.",
+        ),
+    ] = None,
+    utility_scale: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--utility-scale",
+            help="Repeat the same measured-metric=normalization-scale; required with weights.",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
@@ -2006,6 +2052,8 @@ def workload_set(
             min_tokens_per_second=min_tokens_per_second,
             privacy=privacy_value,
             critical_floors=_parse_float_assignments(floor or [], "floor"),
+            utility_weights=_parse_float_assignments(utility_weight or [], "utility-weight"),
+            utility_scales=_parse_float_assignments(utility_scale or [], "utility-scale"),
         )
         view = set_workload_profile(path, profile)
     except FrontierwrightError as exc:

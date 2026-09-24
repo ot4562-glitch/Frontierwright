@@ -12,8 +12,26 @@ from typing import Any
 from frontierwright.data import DatasetClassification
 from frontierwright.errors import FrontierwrightError
 
-WORKLOAD_PROFILE_SCHEMA_VERSION = 1
+WORKLOAD_PROFILE_SCHEMA_VERSION = 2
 WORKLOAD_PROFILE_SOURCE_EXPLICIT = "EXPLICIT_USER"
+
+SUPPORTED_UTILITY_METRICS: frozenset[str] = frozenset(
+    {
+        "capability.general",
+        "capability.reasoning",
+        "capability.math",
+        "capability.coding",
+        "serving.latency_p50",
+        "serving.throughput_p50",
+        "serving.ttft_p50",
+        "serving.tpot_p50",
+        "serving.itl_p50",
+        "serving.output_throughput_aggregate",
+        "resource.peak_vram",
+        "resource.process_rss",
+        "storage.model_artifact",
+    }
+)
 
 
 def _clean_labels(values: list[str] | tuple[str, ...], field_name: str) -> tuple[str, ...]:
@@ -73,6 +91,8 @@ class WorkloadProfile:
     min_tokens_per_second: float | None = None
     privacy: DatasetClassification = DatasetClassification.PRIVATE
     critical_floors: dict[str, float] = field(default_factory=dict)
+    utility_weights: dict[str, float] = field(default_factory=dict)
+    utility_scales: dict[str, float] = field(default_factory=dict)
     source: str = WORKLOAD_PROFILE_SOURCE_EXPLICIT
     schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
 
@@ -177,6 +197,69 @@ class WorkloadProfile:
                 )
             floors[axis] = value
         object.__setattr__(self, "critical_floors", dict(sorted(floors.items())))
+
+        utility_weights: dict[str, float] = {}
+        utility_scales: dict[str, float] = {}
+        for raw_key, raw_value in self.utility_weights.items():
+            key = str(raw_key).strip()
+            if key not in SUPPORTED_UTILITY_METRICS:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"unsupported utility metric: {key!r}",
+                    2,
+                )
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"utility weight for {key!r} must be numeric.",
+                    2,
+                )
+            value = float(raw_value)
+            if not math.isfinite(value) or value <= 0:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"utility weight for {key!r} must be finite and positive.",
+                    2,
+                )
+            utility_weights[key] = value
+        for raw_key, raw_value in self.utility_scales.items():
+            key = str(raw_key).strip()
+            if key not in SUPPORTED_UTILITY_METRICS:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"unsupported utility metric: {key!r}",
+                    2,
+                )
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"utility scale for {key!r} must be numeric.",
+                    2,
+                )
+            value = float(raw_value)
+            if not math.isfinite(value) or value <= 0:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"utility scale for {key!r} must be finite and positive.",
+                    2,
+                )
+            utility_scales[key] = value
+        if set(utility_weights) != set(utility_scales):
+            missing_scales = sorted(set(utility_weights) - set(utility_scales))
+            missing_weights = sorted(set(utility_scales) - set(utility_weights))
+            details: list[str] = []
+            if missing_scales:
+                details.append("missing scales for " + ", ".join(missing_scales))
+            if missing_weights:
+                details.append("missing weights for " + ", ".join(missing_weights))
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                "utility_weights and utility_scales must name the same metrics: "
+                + "; ".join(details),
+                2,
+            )
+        object.__setattr__(self, "utility_weights", dict(sorted(utility_weights.items())))
+        object.__setattr__(self, "utility_scales", dict(sorted(utility_scales.items())))
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -317,6 +400,8 @@ def workload_profile_from_payload(payload: dict[str, object]) -> WorkloadProfile
         min_tokens_per_second=optional_float("min_tokens_per_second"),
         privacy=privacy,
         critical_floors=mapping("critical_floors"),
+        utility_weights=mapping("utility_weights"),
+        utility_scales=mapping("utility_scales"),
         source=str(payload.get("source", WORKLOAD_PROFILE_SOURCE_EXPLICIT)),
         schema_version=int(raw_schema_version),
     )
@@ -624,14 +709,10 @@ def compare_pareto_metrics(
             relation = ParetoMetricRelation.SAME
         else:
             improvement_delta = (
-                raw_delta
-                if item.direction is ParetoDirection.HIGHER_BETTER
-                else -raw_delta
+                raw_delta if item.direction is ParetoDirection.HIGHER_BETTER else -raw_delta
             )
             relation = (
-                ParetoMetricRelation.BETTER
-                if improvement_delta > 0
-                else ParetoMetricRelation.WORSE
+                ParetoMetricRelation.BETTER if improvement_delta > 0 else ParetoMetricRelation.WORSE
             )
         metrics.append(
             ParetoMetricEvidence(
@@ -662,3 +743,120 @@ def compare_pareto_metrics(
     else:
         final_relation = ParetoRelation.EQUIVALENT
     return ParetoComparison(relation=final_relation, metrics=tuple(metrics))
+
+
+class ExplicitUtilityStatus(StrEnum):
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    COMPLETE = "COMPLETE"
+    INCOMPLETE = "INCOMPLETE"
+
+
+class ExplicitUtilityRelation(StrEnum):
+    CANDIDATE_PREFERRED = "CANDIDATE_PREFERRED"
+    CHAMPION_PREFERRED = "CHAMPION_PREFERRED"
+    TIE = "TIE"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class UtilityContribution:
+    metric_key: str
+    weight: float
+    scale: float
+    improvement_delta: float
+    normalized_improvement: float
+    contribution: float
+    evidence_source: str | None
+
+    def to_payload(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ExplicitUtilityComparison:
+    status: ExplicitUtilityStatus
+    relation: ExplicitUtilityRelation
+    utility_delta: float | None
+    contributions: tuple[UtilityContribution, ...]
+    missing_metrics: tuple[str, ...] = ()
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "status": self.status.value,
+            "relation": self.relation.value,
+            "utility_delta": self.utility_delta,
+            "contributions": [item.to_payload() for item in self.contributions],
+            "missing_metrics": list(self.missing_metrics),
+            "note": (
+                "This is an explicit user-defined relative utility delta, not a model "
+                "capability score. Every weighted metric uses a user-supplied normalization "
+                "scale and remains auditable beside the raw Pareto evidence."
+            ),
+        }
+
+
+def compare_explicit_user_utility(
+    profile: WorkloadProfile,
+    pareto: ParetoComparison,
+) -> ExplicitUtilityComparison:
+    """Apply only explicit user weights/scales to directly comparable evidence.
+
+    Frontierwright never invents cross-unit normalization. If the user has weighted a
+    metric but comparable Champion/Candidate evidence is missing, utility remains
+    INCOMPLETE rather than silently renormalizing the remaining dimensions.
+    """
+
+    if not profile.utility_weights:
+        return ExplicitUtilityComparison(
+            status=ExplicitUtilityStatus.NOT_CONFIGURED,
+            relation=ExplicitUtilityRelation.UNKNOWN,
+            utility_delta=None,
+            contributions=(),
+        )
+
+    by_key = {item.key: item for item in pareto.metrics}
+    missing: list[str] = []
+    contributions: list[UtilityContribution] = []
+    for key, weight in profile.utility_weights.items():
+        item = by_key.get(key)
+        if item is None or item.improvement_delta is None:
+            missing.append(key)
+            continue
+        scale = profile.utility_scales[key]
+        normalized = item.improvement_delta / scale
+        contribution = weight * normalized
+        contributions.append(
+            UtilityContribution(
+                metric_key=key,
+                weight=weight,
+                scale=scale,
+                improvement_delta=item.improvement_delta,
+                normalized_improvement=normalized,
+                contribution=contribution,
+                evidence_source=item.evidence_source,
+            )
+        )
+
+    if missing:
+        return ExplicitUtilityComparison(
+            status=ExplicitUtilityStatus.INCOMPLETE,
+            relation=ExplicitUtilityRelation.UNKNOWN,
+            utility_delta=None,
+            contributions=tuple(contributions),
+            missing_metrics=tuple(sorted(missing)),
+        )
+
+    utility_delta = sum(item.contribution for item in contributions)
+    if math.isclose(utility_delta, 0.0, rel_tol=1e-9, abs_tol=1e-12):
+        relation = ExplicitUtilityRelation.TIE
+        utility_delta = 0.0
+    elif utility_delta > 0:
+        relation = ExplicitUtilityRelation.CANDIDATE_PREFERRED
+    else:
+        relation = ExplicitUtilityRelation.CHAMPION_PREFERRED
+    return ExplicitUtilityComparison(
+        status=ExplicitUtilityStatus.COMPLETE,
+        relation=relation,
+        utility_delta=utility_delta,
+        contributions=tuple(contributions),
+    )

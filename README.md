@@ -195,24 +195,30 @@ idempotency for expensive actions
 
 ---
 
-## Development directions
+## User-fit development layer
 
-The next major layers are centered on **user-fit optimization**, not cosmetic game
-mechanics:
+The rc2 development line is already moving beyond stock-model selection:
 
-1. **Workload Profiles** — versioned task/language/context/latency/privacy mixtures
-   built from explicit user input or permitted local observations.
-2. **Measured model fit** — combine inference profiles with resource snapshots to show
-   actual post-load VRAM/RAM/latency/throughput headroom.
-3. **Broader evaluation adapters** — ingest mature suites while preserving exact task,
-   evaluator, runtime, and raw evidence identity.
-4. **Pareto candidate selection** — capability, reliability, latency, throughput,
-   VRAM/RAM/storage and cost without hiding trade-offs in one magic score.
-5. **Real RL adapters** — real rollout/reward/policy-optimization workflows for Lab;
-   preference optimization is not mislabeled as RL.
-6. **Hardware-fit descendants** — measured pruning, distillation, quantization and
-   architecture transforms instead of forcing users to choose only stock released
-   sizes.
+- **Workload Profiles** pin task/language/context/latency/privacy requirements and hard
+  capability floors as versioned evidence.
+- **Measured model fit** links real inference receipts to the exact model instead of
+  treating currently-free system memory as post-load headroom.
+- **Pareto Candidate comparison** keeps capability, latency, throughput, VRAM/RAM and
+  artifact-size gains/regressions visible side by side.
+- **Explicit user utility** is optional: a user must provide both a weight and a
+  normalization scale for every metric they want combined. Missing evidence makes the
+  result INCOMPLETE; Frontierwright never invents cross-unit conversion or hides the
+  underlying Pareto trade-off.
+- **External evidence adapters** can import exact-version lm-evaluation-harness and vLLM
+  benchmark receipts without automatically turning arbitrary external scores into
+  Frontierwright stats.
+- **Real RL foundations** include a rollout/reward/policy-optimization contract and a
+  reference verifier-driven policy-gradient path; DPO remains correctly labeled as
+  preference optimization.
+
+The next major layers are workload-specific evaluation coverage, broader evaluator and
+serving adapters, hardware-fit descendants with measured runtime effects, scalable Lab
+training/RL executors, and the continual use → failure/reward → intervention loop.
 
 ---
 

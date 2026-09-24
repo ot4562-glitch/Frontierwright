@@ -131,6 +131,7 @@ from frontierwright.workloads import (
     ParetoMetricInput,
     WorkloadProfile,
     assess_workload_fit,
+    compare_explicit_user_utility,
     compare_pareto_metrics,
     workload_profile_from_payload,
 )
@@ -7343,7 +7344,23 @@ def _candidate_pareto_evidence(
         )
     )
 
-    payload = compare_pareto_metrics(metrics).to_payload()
+    comparison = compare_pareto_metrics(metrics)
+    payload = comparison.to_payload()
+    workload_row = state.workload_profile
+    if workload_row is not None and isinstance(workload_row.get("profile"), dict):
+        profile = workload_profile_from_payload(dict(workload_row["profile"]))
+        payload["explicit_user_utility"] = compare_explicit_user_utility(
+            profile, comparison
+        ).to_payload()
+    else:
+        payload["explicit_user_utility"] = {
+            "status": "NOT_CONFIGURED",
+            "relation": "UNKNOWN",
+            "utility_delta": None,
+            "contributions": [],
+            "missing_metrics": [],
+            "note": "No active workload profile defines explicit user utility settings.",
+        }
     payload["inference_profile_comparable"] = inference_comparable
     if not champion_profile or not candidate_profile:
         payload["inference_profile_reason"] = (

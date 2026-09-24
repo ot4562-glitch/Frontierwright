@@ -13,16 +13,39 @@ from frontierwright.errors import FrontierwrightError
 from frontierwright.registry import Registry
 from frontierwright.service import get_workload_fit, get_workload_view, set_workload_profile
 from frontierwright.workloads import (
+    ExplicitUtilityRelation,
+    ExplicitUtilityStatus,
     ParetoDirection,
     ParetoMetricInput,
     ParetoRelation,
     WorkloadConstraintStatus,
     WorkloadProfile,
     assess_workload_fit,
+    compare_explicit_user_utility,
     compare_pareto_metrics,
+    workload_profile_from_payload,
 )
 
 runner = CliRunner()
+
+
+def test_workload_profile_v1_payload_remains_readable_without_invented_utility() -> None:
+    profile = workload_profile_from_payload(
+        {
+            "schema_version": 1,
+            "name": "Legacy workload",
+            "languages": ["en"],
+            "domains": [],
+            "task_weights": {},
+            "privacy": "PRIVATE",
+            "critical_floors": {"general": 50},
+        }
+    )
+
+    assert profile.schema_version == 1
+    assert profile.utility_weights == {}
+    assert profile.utility_scales == {}
+    assert profile.to_payload()["schema_version"] == 1
 
 
 def test_workload_profile_is_canonical_and_hash_stable() -> None:
@@ -169,6 +192,14 @@ def test_cli_workload_set_and_show_json_contract(tmp_path: Path) -> None:
             "general=60",
             "--floor",
             "coding=55.5",
+            "--utility-weight",
+            "capability.coding=2",
+            "--utility-scale",
+            "capability.coding=10",
+            "--utility-weight",
+            "serving.latency_p50=1",
+            "--utility-scale",
+            "serving.latency_p50=0.25",
             "--json",
             "--non-interactive",
             "--yes",
@@ -189,6 +220,14 @@ def test_cli_workload_set_and_show_json_contract(tmp_path: Path) -> None:
     assert payload["profile"]["critical_floors"] == {
         "coding": 55.5,
         "general": 60.0,
+    }
+    assert payload["profile"]["utility_weights"] == {
+        "capability.coding": 2.0,
+        "serving.latency_p50": 1.0,
+    }
+    assert payload["profile"]["utility_scales"] == {
+        "capability.coding": 10.0,
+        "serving.latency_p50": 0.25,
     }
     profile_hash = payload["profile_hash"]
 
@@ -416,6 +455,95 @@ def test_pareto_comparison_refuses_to_infer_missing_evidence() -> None:
     )
     assert comparison.relation is ParetoRelation.INSUFFICIENT_EVIDENCE
     assert comparison.metrics[0].relation.value == "UNKNOWN"
+
+
+def test_explicit_user_utility_requires_user_normalization_and_keeps_breakdown() -> None:
+    profile = WorkloadProfile(
+        name="Latency-sensitive reasoning",
+        utility_weights={
+            "capability.reasoning": 2.0,
+            "serving.latency_p50": 1.0,
+        },
+        utility_scales={
+            "capability.reasoning": 10.0,
+            "serving.latency_p50": 0.1,
+        },
+    )
+    pareto = compare_pareto_metrics(
+        [
+            ParetoMetricInput(
+                key="capability.reasoning",
+                category="CAPABILITY",
+                direction=ParetoDirection.HIGHER_BETTER,
+                champion_value=50.0,
+                candidate_value=60.0,
+                unit="frontierwright-capability-v1",
+                evidence_source="scale",
+            ),
+            ParetoMetricInput(
+                key="serving.latency_p50",
+                category="SERVING",
+                direction=ParetoDirection.LOWER_BETTER,
+                champion_value=0.4,
+                candidate_value=0.3,
+                unit="seconds",
+                evidence_source="profile",
+            ),
+        ]
+    )
+
+    utility = compare_explicit_user_utility(profile, pareto)
+    payload = utility.to_payload()
+
+    assert utility.status is ExplicitUtilityStatus.COMPLETE
+    assert utility.relation is ExplicitUtilityRelation.CANDIDATE_PREFERRED
+    assert utility.utility_delta == pytest.approx(3.0)
+    by_key = {item["metric_key"]: item for item in payload["contributions"]}
+    assert by_key["capability.reasoning"]["normalized_improvement"] == pytest.approx(1.0)
+    assert by_key["capability.reasoning"]["contribution"] == pytest.approx(2.0)
+    assert by_key["serving.latency_p50"]["normalized_improvement"] == pytest.approx(1.0)
+    assert by_key["serving.latency_p50"]["contribution"] == pytest.approx(1.0)
+
+
+def test_explicit_user_utility_is_incomplete_if_any_weighted_metric_is_unmeasured() -> None:
+    profile = WorkloadProfile(
+        name="Memory-aware",
+        utility_weights={"resource.peak_vram": 1.0},
+        utility_scales={"resource.peak_vram": float(1024**3)},
+    )
+    pareto = compare_pareto_metrics(
+        [
+            ParetoMetricInput(
+                key="resource.peak_vram",
+                category="RESOURCE",
+                direction=ParetoDirection.LOWER_BETTER,
+                champion_value=None,
+                candidate_value=5 * 1024**3,
+                unit="bytes",
+            )
+        ]
+    )
+
+    utility = compare_explicit_user_utility(profile, pareto)
+
+    assert utility.status is ExplicitUtilityStatus.INCOMPLETE
+    assert utility.relation is ExplicitUtilityRelation.UNKNOWN
+    assert utility.utility_delta is None
+    assert utility.missing_metrics == ("resource.peak_vram",)
+
+
+def test_workload_profile_rejects_partial_or_unsupported_utility_contract() -> None:
+    with pytest.raises(FrontierwrightError, match="same metrics"):
+        WorkloadProfile(
+            name="Bad utility",
+            utility_weights={"capability.general": 1.0},
+        )
+    with pytest.raises(FrontierwrightError, match="unsupported utility metric"):
+        WorkloadProfile(
+            name="Bad metric",
+            utility_weights={"capability.vision": 1.0},
+            utility_scales={"capability.vision": 10.0},
+        )
 
 
 def test_workload_context_requirement_uses_profiled_model_capacity(tmp_path: Path) -> None:

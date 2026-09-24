@@ -191,6 +191,75 @@ def _compare_text(view: CompareView) -> str:
         reason = view.pareto.get("inference_profile_reason")
         if reason:
             lines.append(f"Runtime: {reason}")
+        utility = view.pareto.get("explicit_user_utility")
+        if isinstance(utility, dict):
+            status = str(utility.get("status") or "NOT_CONFIGURED")
+            if status == "COMPLETE":
+                delta = utility.get("utility_delta")
+                delta_text = (
+                    f"{delta:+.3f}"
+                    if isinstance(delta, (int, float)) and not isinstance(delta, bool)
+                    else "?"
+                )
+                lines.extend(["", f"USER UTILITY  {utility.get('relation')} · Δ {delta_text}"])
+                contributions = utility.get("contributions")
+                if isinstance(contributions, list):
+                    for item in contributions:
+                        if not isinstance(item, dict):
+                            continue
+                        contribution = item.get("contribution")
+                        contribution_text = (
+                            f"{contribution:+.3f}"
+                            if isinstance(contribution, (int, float))
+                            and not isinstance(contribution, bool)
+                            else "?"
+                        )
+                        lines.append(
+                            f"  {item.get('metric_key')}: {contribution_text} "
+                            f"(w={item.get('weight')}, scale={item.get('scale')})"
+                        )
+            elif status == "INCOMPLETE":
+                missing = utility.get("missing_metrics")
+                lines.extend(["", "USER UTILITY  INCOMPLETE"])
+                if isinstance(missing, list) and missing:
+                    lines.append("Missing comparable evidence: " + ", ".join(map(str, missing)))
+        utility = view.pareto.get("explicit_user_utility")
+        if isinstance(utility, dict):
+            status = str(utility.get("status") or "NOT_CONFIGURED")
+            if status == "COMPLETE":
+                delta = utility.get("utility_delta")
+                delta_text = (
+                    f"{delta:+.3f}"
+                    if isinstance(delta, (int, float)) and not isinstance(delta, bool)
+                    else "?"
+                )
+                lines.extend(
+                    [
+                        "",
+                        f"USER UTILITY  {utility.get('relation')} · Δ {delta_text}",
+                    ]
+                )
+                contributions = utility.get("contributions")
+                if isinstance(contributions, list):
+                    for item in contributions:
+                        if not isinstance(item, dict):
+                            continue
+                        contribution = item.get("contribution")
+                        contribution_text = (
+                            f"{contribution:+.3f}"
+                            if isinstance(contribution, (int, float))
+                            and not isinstance(contribution, bool)
+                            else "?"
+                        )
+                        lines.append(
+                            f"  {item.get('metric_key')}: {contribution_text} "
+                            f"(w={item.get('weight')}, scale={item.get('scale')})"
+                        )
+            elif status == "INCOMPLETE":
+                missing = utility.get("missing_metrics")
+                lines.extend(["", "USER UTILITY  INCOMPLETE"])
+                if isinstance(missing, list) and missing:
+                    lines.append("Missing comparable evidence: " + ", ".join(map(str, missing)))
     lines.extend(
         [
             "",
@@ -997,6 +1066,8 @@ class FrontierwrightApp(App[None]):
         domains = profile.get("domains")
         tasks = profile.get("task_weights")
         floors = profile.get("critical_floors")
+        utility_weights = profile.get("utility_weights")
+        utility_scales = profile.get("utility_scales")
         if edition is EditionProfile.ACADEMY:
             lines = [
                 "WHAT SHOULD THIS MODEL LEARN TO FIT?",
@@ -1047,6 +1118,16 @@ class FrontierwrightApp(App[None]):
             lines.append("Capability floors:")
             for axis, value in sorted(floors.items()):
                 lines.append(f"  {str(axis).title():10} >= {value}")
+        if (
+            edition is not EditionProfile.ACADEMY
+            and isinstance(utility_weights, dict)
+            and utility_weights
+            and isinstance(utility_scales, dict)
+        ):
+            lines.append("Explicit decision utility:")
+            for key, weight in sorted(utility_weights.items()):
+                lines.append(f"  {key}: weight={weight} · scale={utility_scales.get(key)}")
+            lines.append("  Missing comparable evidence keeps utility INCOMPLETE.")
 
         fit = self.workload_fit
         lines.extend(["", f"FIT EVIDENCE: {fit.overall_status}"])
@@ -1594,6 +1675,8 @@ class FrontierwrightApp(App[None]):
             current_domains = workload_payload.get("domains")
             current_tasks = workload_payload.get("task_weights")
             current_floors = workload_payload.get("critical_floors")
+            current_utility_weights = workload_payload.get("utility_weights")
+            current_utility_scales = workload_payload.get("utility_scales")
             workload_fields = [
                 FormField(
                     "name",
@@ -1645,6 +1728,24 @@ class FrontierwrightApp(App[None]):
                             "min_tps",
                             "Minimum throughput tok/s",
                             str(workload_payload.get("min_tokens_per_second") or ""),
+                        ),
+                        FormField(
+                            "utility_weights",
+                            "Decision weights (metric=weight, comma separated)",
+                            ", ".join(
+                                f"{k}={v}" for k, v in sorted(current_utility_weights.items())
+                            )
+                            if isinstance(current_utility_weights, dict)
+                            else "",
+                            "capability.coding=2, serving.latency_p50=1",
+                        ),
+                        FormField(
+                            "utility_scales",
+                            "Decision scales (same metric=meaningful delta)",
+                            ", ".join(f"{k}={v}" for k, v in sorted(current_utility_scales.items()))
+                            if isinstance(current_utility_scales, dict)
+                            else "",
+                            "capability.coding=10, serving.latency_p50=0.25",
                         ),
                     ]
                 )
@@ -2134,6 +2235,8 @@ class FrontierwrightApp(App[None]):
                 min_tokens_per_second=optional_float(values.get("min_tps", "")),
                 privacy=privacy,
                 critical_floors=weighted(values.get("floors", "")),
+                utility_weights=weighted(values.get("utility_weights", "")),
+                utility_scales=weighted(values.get("utility_scales", "")),
             )
             set_workload_profile(self.root, profile)
             self._refresh_all()

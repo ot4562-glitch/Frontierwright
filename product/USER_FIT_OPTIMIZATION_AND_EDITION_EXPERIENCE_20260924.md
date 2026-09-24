@@ -102,7 +102,7 @@ The profile may be:
 Capability is what the model can do.
 Utility is how valuable that capability is to this user under this workload and cost envelope.
 
-A future Utility Profile may combine:
+A Utility Profile may combine:
 - user-defined capability weights;
 - hard floors;
 - latency/throughput preferences;
@@ -111,9 +111,18 @@ A future Utility Profile may combine:
 - reliability penalties;
 - task success rates from real use.
 
-Frontierwright must preserve the raw measurements behind every derived utility score.
+The first rc2 implementation stores an explicit decision policy alongside the Workload
+Profile. For every weighted measured metric the user must declare both a positive
+weight and a positive normalization scale. Frontierwright does **not** infer how many
+seconds, bytes, or capability points should equal one another. The resulting value is a
+relative Champion-to-Candidate utility delta, never an absolute model-intelligence score.
+If any weighted metric lacks comparable evidence, the utility result is INCOMPLETE;
+Frontierwright does not silently renormalize the remaining dimensions.
 
-A single overall utility number, if introduced, must never hide Pareto trade-offs.
+Frontierwright must preserve the raw measurements behind every derived utility result.
+
+A single overall utility number must never hide Pareto trade-offs. Raw Pareto evidence
+remains visible and promotion remains an explicit human decision.
 
 ## 6. Resource headroom is actionable evidence
 

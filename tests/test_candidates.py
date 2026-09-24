@@ -325,8 +325,7 @@ def test_promoted_candidate_becomes_current_state_even_when_one_axis_is_lower(
 
     history = get_history_view(project)
     assert any(
-        event["kind"] == "CANDIDATE_PROMOTED"
-        and event["details"]["model_id"] == candidate.model_id
+        event["kind"] == "CANDIDATE_PROMOTED" and event["details"]["model_id"] == candidate.model_id
         for event in history.events
     )
     assert registry.read().project["champion_id"] == candidate.model_id
@@ -386,6 +385,18 @@ def test_compare_includes_workload_regressions_and_measured_pareto_tradeoffs(
             max_latency_seconds=0.35,
             min_tokens_per_second=22.0,
             critical_floors={"general": 125.0},
+            utility_weights={
+                "capability.general": 1.0,
+                "capability.coding": 2.0,
+                "serving.latency_p50": 1.0,
+                "resource.peak_vram": 0.5,
+            },
+            utility_scales={
+                "capability.general": 10.0,
+                "capability.coding": 10.0,
+                "serving.latency_p50": 0.1,
+                "resource.peak_vram": 1000.0,
+            },
         ),
     )
 
@@ -445,3 +456,12 @@ def test_compare_includes_workload_regressions_and_measured_pareto_tradeoffs(
     assert metrics["serving.latency_p50"]["relation"] == "BETTER"
     assert metrics["serving.throughput_p50"]["relation"] == "BETTER"
     assert metrics["resource.peak_vram"]["relation"] == "WORSE"
+    utility = view.pareto["explicit_user_utility"]
+    assert utility["status"] == "COMPLETE"
+    assert utility["relation"] == "CANDIDATE_PREFERRED"
+    assert utility["utility_delta"] == pytest.approx(1.5)
+    contributions = {item["metric_key"]: item for item in utility["contributions"]}
+    assert contributions["capability.general"]["contribution"] == pytest.approx(-1.0)
+    assert contributions["capability.coding"]["contribution"] == pytest.approx(2.0)
+    assert contributions["serving.latency_p50"]["contribution"] == pytest.approx(1.0)
+    assert contributions["resource.peak_vram"]["contribution"] == pytest.approx(-0.5)

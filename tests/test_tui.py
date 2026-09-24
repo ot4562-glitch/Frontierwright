@@ -58,6 +58,63 @@ def test_candidate_compare_keeps_keyboard_shortcuts_visible() -> None:
     assert "[P]" not in rendered
 
 
+def test_candidate_compare_shows_pareto_and_explicit_user_utility_together() -> None:
+    view = CompareView(
+        champion_model_id="champion",
+        candidate_model_id="candidate",
+        candidate_status="PENDING",
+        scale_comparable=True,
+        champion_stats={"general": 50.0},
+        candidate_stats={"general": 60.0},
+        deltas={"general": 10.0},
+        pareto={
+            "relation": "TRADEOFF",
+            "metrics": [
+                {
+                    "key": "capability.general",
+                    "champion_value": 50.0,
+                    "candidate_value": 60.0,
+                    "relation": "BETTER",
+                },
+                {
+                    "key": "resource.peak_vram",
+                    "champion_value": 4_000,
+                    "candidate_value": 5_000,
+                    "relation": "WORSE",
+                },
+            ],
+            "explicit_user_utility": {
+                "status": "COMPLETE",
+                "relation": "CANDIDATE_PREFERRED",
+                "utility_delta": 0.5,
+                "contributions": [
+                    {
+                        "metric_key": "capability.general",
+                        "weight": 1.0,
+                        "scale": 10.0,
+                        "contribution": 1.0,
+                    },
+                    {
+                        "metric_key": "resource.peak_vram",
+                        "weight": 0.5,
+                        "scale": 1000.0,
+                        "contribution": -0.5,
+                    },
+                ],
+                "missing_metrics": [],
+            },
+        },
+    )
+
+    rendered = _compare_text(view)
+    assert "EVIDENCE PARETO  TRADEOFF" in rendered
+    assert "▲ capability.general: 50.0 -> 60.0" in rendered
+    assert "▼ resource.peak_vram: 4000 -> 5000" in rendered
+    assert "USER UTILITY  CANDIDATE_PREFERRED · Δ +0.500" in rendered
+    assert "capability.general: +1.000 (w=1.0, scale=10.0)" in rendered
+    assert "resource.peak_vram: -0.500 (w=0.5, scale=1000.0)" in rendered
+
+
 def test_edition_help_and_stat_precision_are_intentionally_different() -> None:
     uncertainty: dict[str, object] = {
         "stat_lower": 55.0,
@@ -213,6 +270,14 @@ def test_tui_workload_experience_differs_by_edition() -> None:
             "min_tokens_per_second": 15.0,
             "privacy": "PRIVATE",
             "critical_floors": {"general": 60.0},
+            "utility_weights": {
+                "capability.general": 2.0,
+                "serving.latency_p50": 1.0,
+            },
+            "utility_scales": {
+                "capability.general": 10.0,
+                "serving.latency_p50": 0.25,
+            },
         },
     )
 
@@ -241,13 +306,17 @@ def test_tui_workload_experience_differs_by_edition() -> None:
     assert "WHAT SHOULD THIS MODEL LEARN TO FIT?" in academy_text
     assert "fake capability points" in academy_text
     assert "Hash:" not in academy_text
+    assert "Explicit decision utility" not in academy_text
 
     assert "YOUR WORKLOAD" in studio_text
     assert "Next evidence: profile the current Champion" in studio_text
+    assert "Explicit decision utility" in studio_text
+    assert "capability.general: weight=2.0 · scale=10.0" in studio_text
 
     assert "WORKLOAD / SERVING REQUIREMENTS" in lab_text
     assert "Hash: sha256:demo" in lab_text
     assert "unknown constraints remain UNKNOWN" in lab_text
+    assert "Explicit decision utility" in lab_text
 
 
 def test_tui_action_priority_differs_by_edition() -> None:
