@@ -410,6 +410,19 @@ class RunView:
 
 
 @dataclass(frozen=True)
+class ActionPreflightView:
+    schema_version: int = 1
+    action: str = ""
+    ready: bool = False
+    would_replay: bool = False
+    blockers: list[str] = field(default_factory=list)
+    details: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class CandidateView:
     schema_version: int = 1
     candidates: list[dict[str, object]] = field(default_factory=list)
@@ -833,13 +846,13 @@ def get_tokenizers_view(root: Path) -> TokenizersView:
     return TokenizersView(tokenizers=items)
 
 
-def train_project_tokenizer(
+def _tokenizer_birth_context(
     root: Path,
     *,
     dataset_id: str,
-    vocab_size: int = 512,
-    max_training_bytes: int = DEFAULT_MAX_TRAINING_BYTES,
-) -> TokenizerView:
+    vocab_size: int,
+    max_training_bytes: int,
+) -> tuple[Registry, dict[str, object], Path, str, bytes, dict[str, object] | None]:
     registry = Registry(root)
     if not registry.exists:
         raise FrontierwrightError(
@@ -859,6 +872,17 @@ def train_project_tokenizer(
             "TOKENIZER_AFTER_MODEL_BIRTH",
             "Train/select the tokenizer before materializing the zero-model root.",
             13,
+        )
+    if (
+        isinstance(vocab_size, bool)
+        or not isinstance(vocab_size, int)
+        or vocab_size < 256
+        or vocab_size > 65_536
+    ):
+        raise FrontierwrightError(
+            "TOKENIZER_CONFIG_INVALID",
+            "vocab_size must be an integer between 256 and 65536.",
+            2,
         )
 
     dataset = next(
@@ -900,6 +924,68 @@ def train_project_tokenizer(
         source_path,
         max_training_bytes=max_training_bytes,
     )
+    existing = next(
+        (
+            item
+            for item in registry.list_tokenizer_artifacts()
+            if item.get("source_dataset_id") == dataset_id
+            and item.get("source_dataset_fingerprint") == source_fingerprint
+            and item.get("requested_vocab_size") == vocab_size
+            and item.get("max_training_bytes") == max_training_bytes
+            and item.get("training_bytes") == len(corpus)
+        ),
+        None,
+    )
+    return registry, dataset, source_path, source_fingerprint, corpus, existing
+
+
+def preflight_project_tokenizer(
+    root: Path,
+    *,
+    dataset_id: str,
+    vocab_size: int = 512,
+    max_training_bytes: int = DEFAULT_MAX_TRAINING_BYTES,
+) -> ActionPreflightView:
+    _, _, source_path, source_fingerprint, corpus, existing = _tokenizer_birth_context(
+        root,
+        dataset_id=dataset_id,
+        vocab_size=vocab_size,
+        max_training_bytes=max_training_bytes,
+    )
+    return ActionPreflightView(
+        action="birth-tokenizer",
+        ready=True,
+        would_replay=existing is not None,
+        details={
+            "dataset_id": dataset_id,
+            "dataset_fingerprint": source_fingerprint,
+            "source_path": str(source_path),
+            "requested_vocab_size": vocab_size,
+            "max_training_bytes": max_training_bytes,
+            "training_bytes": len(corpus),
+            "existing_artifact_id": (
+                existing.get("artifact_id") if existing is not None else None
+            ),
+        },
+    )
+
+
+def train_project_tokenizer(
+    root: Path,
+    *,
+    dataset_id: str,
+    vocab_size: int = 512,
+    max_training_bytes: int = DEFAULT_MAX_TRAINING_BYTES,
+) -> TokenizerView:
+    registry, _, _, source_fingerprint, corpus, existing = _tokenizer_birth_context(
+        root,
+        dataset_id=dataset_id,
+        vocab_size=vocab_size,
+        max_training_bytes=max_training_bytes,
+    )
+    if existing is not None:
+        return _tokenizer_view_from_record(existing, replayed=True)
+
     tokenizers_root = registry.state_dir / "tokenizers"
     staging_root = tokenizers_root / ".staging" / uuid4().hex
     staging_root.mkdir(parents=True, exist_ok=False)
@@ -912,10 +998,10 @@ def train_project_tokenizer(
             max_training_bytes=max_training_bytes,
             corpus=corpus,
         )
-        existing = registry.get_tokenizer_artifact(staged.artifact_id)
-        if existing is not None:
+        existing_by_id = registry.get_tokenizer_artifact(staged.artifact_id)
+        if existing_by_id is not None:
             shutil.rmtree(staging_root, ignore_errors=True)
-            return _tokenizer_view_from_record(existing, replayed=True)
+            return _tokenizer_view_from_record(existing_by_id, replayed=True)
 
         final_root = tokenizers_root / staged.artifact_id
         final_path = final_root / "tokenizer.json"
@@ -4795,13 +4881,13 @@ def _validate_backend_for_plan(
     return backend
 
 
-def calibrate_training_plan(
+def _calibration_preflight_context(
     root: Path,
     *,
     plan_id: str,
     backend_spec_path: Path,
-    timeout_seconds: float = 300.0,
-) -> PlanView:
+    timeout_seconds: float,
+) -> tuple[Registry, TrainingPlan, CommandBackendSpec, float, dict[str, object] | None]:
     registry = Registry(root)
     plan = registry.get_plan(plan_id)
     if plan.permission < PermissionLevel.DRY_RUN:
@@ -4829,6 +4915,55 @@ def calibrate_training_plan(
             "Calibration timeout must be positive.",
             2,
         )
+    existing = registry.latest_calibration_for_plan(plan_id)
+    return registry, plan, backend, effective_timeout, existing
+
+
+def preflight_training_calibration(
+    root: Path,
+    *,
+    plan_id: str,
+    backend_spec_path: Path,
+    timeout_seconds: float = 300.0,
+) -> ActionPreflightView:
+    _, plan, backend, effective_timeout, existing = _calibration_preflight_context(
+        root,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec_path,
+        timeout_seconds=timeout_seconds,
+    )
+    return ActionPreflightView(
+        action="calibrate",
+        ready=True,
+        would_replay=existing is not None,
+        details={
+            "plan_id": plan.plan_id,
+            "backend_id": backend.backend_id,
+            "backend_spec_hash": backend.sha256,
+            "effective_timeout_seconds": effective_timeout,
+            "existing_calibration_id": (
+                existing.get("calibration_id") if existing is not None else None
+            ),
+        },
+    )
+
+
+def calibrate_training_plan(
+    root: Path,
+    *,
+    plan_id: str,
+    backend_spec_path: Path,
+    timeout_seconds: float = 300.0,
+    rerun: bool = False,
+) -> PlanView:
+    registry, plan, backend, effective_timeout, existing = _calibration_preflight_context(
+        root,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec_path,
+        timeout_seconds=timeout_seconds,
+    )
+    if existing is not None and not rerun:
+        return get_plan_view(root, plan_id)
 
     calibration_id = f"calibration-{uuid4().hex}"
     request_path = (

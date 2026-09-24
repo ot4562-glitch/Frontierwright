@@ -27,6 +27,7 @@ from frontierwright.recipes import (
 from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.reference_tokenizer import DEFAULT_MAX_TRAINING_BYTES
 from frontierwright.service import (
+    ActionPreflightView,
     BirthView,
     BuildView,
     CandidateView,
@@ -83,6 +84,7 @@ from frontierwright.service import (
     ingest_stats,
     initialize_project,
     merge_reference_models,
+    preflight_training_calibration,
     prepare_dataset,
     prepare_dataset_mixture,
     profile_reference_inference,
@@ -485,6 +487,16 @@ def _print_lab_adapters(view: LabAdaptersView) -> None:
         kind_values = kinds if isinstance(kinds, list) else []
         console.print(f"  Kinds: {', '.join(str(value) for value in kind_values)}")
         console.print(f"  Manifest: {item.get('manifest_hash')}")
+
+
+def _print_preflight(view: ActionPreflightView) -> None:
+    console.print(f"[bold]DRY RUN[/bold] · {view.action}")
+    console.print(f"Ready: {'YES' if view.ready else 'NO'}")
+    console.print(f"Would replay: {'YES' if view.would_replay else 'NO'}")
+    for key, value in sorted(view.details.items()):
+        console.print(f"{key}: {value}")
+    for blocker in view.blockers:
+        console.print(f"Blocked: {blocker}")
 
 
 def _print_plan(view: PlanView) -> None:
@@ -2394,17 +2406,41 @@ def calibrate_command(
     backend_spec: Annotated[Path, typer.Option("--backend-spec")],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     timeout_seconds: Annotated[float, typer.Option("--timeout-seconds")] = 300.0,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Validate calibration without executing the backend."),
+    ] = False,
+    rerun: Annotated[
+        bool,
+        typer.Option(
+            "--rerun",
+            help="Intentionally repeat calibration instead of replaying evidence.",
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
     try:
+        if dry_run:
+            preview = preflight_training_calibration(
+                path,
+                plan_id=plan_id,
+                backend_spec_path=backend_spec,
+                timeout_seconds=timeout_seconds,
+            )
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
         view = calibrate_training_plan(
             path,
             plan_id=plan_id,
             backend_spec_path=backend_spec,
             timeout_seconds=timeout_seconds,
+            rerun=rerun,
         )
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)

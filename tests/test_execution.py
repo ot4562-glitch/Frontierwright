@@ -27,6 +27,7 @@ from frontierwright.service import (
     get_paths_view,
     get_run_view,
     import_local_model,
+    preflight_training_calibration,
     prepare_dataset_snapshot,
     promote_candidate,
     reconcile_training_run,
@@ -1017,3 +1018,89 @@ def test_sealed_candidate_manifest_binds_preparation_recipe(tmp_path: Path) -> N
     assert manifest["dataset_fingerprint"] == prepared["fingerprint"]
     assert manifest["dataset_recipe_id"] == prepared["preparation_recipe_id"]
     assert manifest["dataset_recipe_hash"] == prepared["preparation_recipe_hash"]
+
+
+def test_calibration_replays_by_default_and_rerun_is_explicit(tmp_path: Path) -> None:
+    project, backend_spec = setup_project(tmp_path)
+    plan = create_training_plan(
+        project,
+        path_id=TrainingPathId.LORA_SFT,
+        backend_spec_path=backend_spec,
+        dataset_id=None,
+        permission=PermissionLevel.EXECUTE_SINGLE,
+        budgets=HardBudgets(max_runs=1, max_storage_bytes=4096),
+        config={"epochs": 1},
+    )
+    plan_id = plan.plan_id or ""
+
+    first = calibrate_training_plan(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+    )
+    first_id = first.calibration["calibration_id"] if first.calibration else None
+    assert isinstance(first_id, str)
+    assert len(Registry(project).read().calibrations) == 1
+
+    replay = calibrate_training_plan(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+    )
+    assert replay.calibration is not None
+    assert replay.calibration["calibration_id"] == first_id
+    assert len(Registry(project).read().calibrations) == 1
+
+    rerun = calibrate_training_plan(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+        rerun=True,
+    )
+    assert rerun.calibration is not None
+    assert rerun.calibration["calibration_id"] != first_id
+    assert len(Registry(project).read().calibrations) == 2
+
+
+def test_calibration_preflight_has_no_backend_or_registry_side_effects(tmp_path: Path) -> None:
+    project, backend_spec = setup_project(tmp_path)
+    plan = create_training_plan(
+        project,
+        path_id=TrainingPathId.LORA_SFT,
+        backend_spec_path=backend_spec,
+        dataset_id=None,
+        permission=PermissionLevel.EXECUTE_SINGLE,
+        budgets=HardBudgets(max_runs=1, max_storage_bytes=4096),
+        config={"epochs": 1},
+    )
+    plan_id = plan.plan_id or ""
+
+    preview = preflight_training_calibration(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+    )
+    assert preview.action == "calibrate"
+    assert preview.ready is True
+    assert preview.would_replay is False
+    assert preview.details["plan_id"] == plan_id
+    assert len(Registry(project).read().calibrations) == 0
+
+    calibrated = calibrate_training_plan(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+    )
+    assert calibrated.calibration is not None
+
+    replay_preview = preflight_training_calibration(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+    )
+    assert replay_preview.ready is True
+    assert replay_preview.would_replay is True
+    assert replay_preview.details["existing_calibration_id"] == calibrated.calibration[
+        "calibration_id"
+    ]
+    assert len(Registry(project).read().calibrations) == 1

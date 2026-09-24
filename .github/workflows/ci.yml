@@ -50,3 +50,5 @@ jobs:
         run: python -m pip install -e ".[train,dev]"
       - name: Reference backend tests with PyTorch
         run: python -m pytest tests/test_birth.py tests/test_reference_backend.py tests/test_evaluation_runner.py -q
+      - name: V1 full lifecycle E2E
+        run: python tools/v1_e2e_smoke.py --timeout 180
