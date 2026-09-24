@@ -16,6 +16,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from frontierwright import __version__
+
 
 def _run(argv: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -87,7 +89,7 @@ def main() -> int:
         _run([str(cli), "--help"])
         version_result = _run([str(cli), "--version"])
         version = version_result.stdout.strip()
-        if version != "frontierwright 1.0.0rc1":
+        if version != f"frontierwright {__version__}":
             raise SystemExit(f"installed CLI reported unexpected version: {version!r}")
 
         init = _run(

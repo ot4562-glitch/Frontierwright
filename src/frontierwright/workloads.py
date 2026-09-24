@@ -1,0 +1,664 @@
+"""Versioned user-workload contracts for Frontierwright user-fit optimization."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from dataclasses import asdict, dataclass, field
+from enum import StrEnum
+from typing import Any
+
+from frontierwright.data import DatasetClassification
+from frontierwright.errors import FrontierwrightError
+
+WORKLOAD_PROFILE_SCHEMA_VERSION = 1
+WORKLOAD_PROFILE_SOURCE_EXPLICIT = "EXPLICIT_USER"
+
+
+def _clean_labels(values: list[str] | tuple[str, ...], field_name: str) -> tuple[str, ...]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, str):
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                f"{field_name} entries must be strings.",
+                2,
+            )
+        value = raw.strip()
+        if not value:
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                f"{field_name} entries must be nonempty.",
+                2,
+            )
+        key = value.casefold()
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(value)
+    return tuple(cleaned)
+
+
+def _positive_optional(value: float | None, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FrontierwrightError(
+            "INVALID_WORKLOAD_PROFILE",
+            f"{field_name} must be numeric.",
+            2,
+        )
+    result = float(value)
+    if not math.isfinite(result) or result <= 0:
+        raise FrontierwrightError(
+            "INVALID_WORKLOAD_PROFILE",
+            f"{field_name} must be finite and positive.",
+            2,
+        )
+    return result
+
+
+@dataclass(frozen=True)
+class WorkloadProfile:
+    """Explicit evidence describing what this user actually needs from a model."""
+
+    name: str
+    languages: tuple[str, ...] = ()
+    domains: tuple[str, ...] = ()
+    task_weights: dict[str, float] = field(default_factory=dict)
+    context_tokens_p50: int | None = None
+    context_tokens_p95: int | None = None
+    max_latency_seconds: float | None = None
+    min_tokens_per_second: float | None = None
+    privacy: DatasetClassification = DatasetClassification.PRIVATE
+    critical_floors: dict[str, float] = field(default_factory=dict)
+    source: str = WORKLOAD_PROFILE_SOURCE_EXPLICIT
+    schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        name = self.name.strip()
+        if not name:
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                "Workload profile name must be nonempty.",
+                2,
+            )
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "languages", _clean_labels(self.languages, "languages"))
+        object.__setattr__(self, "domains", _clean_labels(self.domains, "domains"))
+
+        if self.source != WORKLOAD_PROFILE_SOURCE_EXPLICIT:
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                "Only EXPLICIT_USER workload profiles are supported in this release.",
+                2,
+            )
+
+        for field_name in ("context_tokens_p50", "context_tokens_p95"):
+            value = getattr(self, field_name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"{field_name} must be a positive integer.",
+                    2,
+                )
+        if (
+            self.context_tokens_p50 is not None
+            and self.context_tokens_p95 is not None
+            and self.context_tokens_p95 < self.context_tokens_p50
+        ):
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                "context_tokens_p95 cannot be smaller than context_tokens_p50.",
+                2,
+            )
+
+        object.__setattr__(
+            self,
+            "max_latency_seconds",
+            _positive_optional(self.max_latency_seconds, "max_latency_seconds"),
+        )
+        object.__setattr__(
+            self,
+            "min_tokens_per_second",
+            _positive_optional(self.min_tokens_per_second, "min_tokens_per_second"),
+        )
+
+        task_weights: dict[str, float] = {}
+        for raw_key, raw_value in self.task_weights.items():
+            key = str(raw_key).strip()
+            if not key:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    "task_weights keys must be nonempty.",
+                    2,
+                )
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"task weight for {key!r} must be numeric.",
+                    2,
+                )
+            value = float(raw_value)
+            if not math.isfinite(value) or value <= 0:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"task weight for {key!r} must be finite and positive.",
+                    2,
+                )
+            task_weights[key] = value
+        object.__setattr__(self, "task_weights", dict(sorted(task_weights.items())))
+
+        floors: dict[str, float] = {}
+        allowed_axes = {"general", "reasoning", "math", "coding"}
+        for raw_axis, raw_value in self.critical_floors.items():
+            axis = str(raw_axis).strip().lower()
+            if axis not in allowed_axes:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"unsupported critical floor axis: {axis!r}",
+                    2,
+                )
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"critical floor for {axis} must be numeric.",
+                    2,
+                )
+            value = float(raw_value)
+            if not math.isfinite(value) or value < 0:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"critical floor for {axis} must be finite and nonnegative.",
+                    2,
+                )
+            floors[axis] = value
+        object.__setattr__(self, "critical_floors", dict(sorted(floors.items())))
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["languages"] = list(self.languages)
+        payload["domains"] = list(self.domains)
+        payload["privacy"] = self.privacy.value
+        return payload
+
+    @property
+    def profile_hash(self) -> str:
+        canonical = json.dumps(
+            self.to_payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+class WorkloadConstraintStatus(StrEnum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class WorkloadFitConstraint:
+    key: str
+    category: str
+    requirement: object
+    observed: object | None
+    unit: str | None
+    status: WorkloadConstraintStatus
+    evidence_source: str | None
+    reason: str
+
+    def to_payload(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["status"] = self.status.value
+        return payload
+
+
+@dataclass(frozen=True)
+class WorkloadFitAssessment:
+    overall_status: WorkloadConstraintStatus
+    constraints: tuple[WorkloadFitConstraint, ...]
+
+    def to_payload(self) -> dict[str, object]:
+        counts = {status.value: 0 for status in WorkloadConstraintStatus}
+        for item in self.constraints:
+            counts[item.status.value] += 1
+        return {
+            "overall_status": self.overall_status.value,
+            "counts": counts,
+            "constraints": [item.to_payload() for item in self.constraints],
+            "synthetic_utility_score": None,
+            "note": (
+                "Frontierwright does not collapse user fit into one synthetic score. "
+                "Each declared requirement remains independently auditable."
+            ),
+        }
+
+
+def workload_profile_from_payload(payload: dict[str, object]) -> WorkloadProfile:
+    raw_privacy = payload.get("privacy", DatasetClassification.PRIVATE.value)
+    try:
+        privacy = DatasetClassification(str(raw_privacy))
+    except ValueError as exc:
+        raise FrontierwrightError(
+            "INVALID_WORKLOAD_PROFILE",
+            f"unsupported workload privacy classification: {raw_privacy!r}",
+            2,
+        ) from exc
+
+    def labels(key: str) -> tuple[str, ...]:
+        raw = payload.get(key, [])
+        if not isinstance(raw, list):
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                f"{key} must be a list.",
+                2,
+            )
+        return tuple(str(item) for item in raw)
+
+    def mapping(key: str) -> dict[str, float]:
+        raw = payload.get(key, {})
+        if not isinstance(raw, dict):
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                f"{key} must be an object.",
+                2,
+            )
+        return {str(name): float(value) for name, value in raw.items()}
+
+    def optional_int(key: str) -> int | None:
+        raw = payload.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                f"{key} must be an integer.",
+                2,
+            )
+        return int(raw)
+
+    def optional_float(key: str) -> float | None:
+        raw = payload.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_PROFILE",
+                f"{key} must be numeric.",
+                2,
+            )
+        return float(raw)
+
+    raw_schema_version = payload.get("schema_version", WORKLOAD_PROFILE_SCHEMA_VERSION)
+    if isinstance(raw_schema_version, bool) or not isinstance(
+        raw_schema_version, (int, float, str)
+    ):
+        raise FrontierwrightError(
+            "INVALID_WORKLOAD_PROFILE",
+            "schema_version must be an integer.",
+            2,
+        )
+
+    return WorkloadProfile(
+        name=str(payload.get("name", "")),
+        languages=labels("languages"),
+        domains=labels("domains"),
+        task_weights=mapping("task_weights"),
+        context_tokens_p50=optional_int("context_tokens_p50"),
+        context_tokens_p95=optional_int("context_tokens_p95"),
+        max_latency_seconds=optional_float("max_latency_seconds"),
+        min_tokens_per_second=optional_float("min_tokens_per_second"),
+        privacy=privacy,
+        critical_floors=mapping("critical_floors"),
+        source=str(payload.get("source", WORKLOAD_PROFILE_SOURCE_EXPLICIT)),
+        schema_version=int(raw_schema_version),
+    )
+
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def assess_workload_fit(
+    profile: WorkloadProfile,
+    *,
+    capability_stats: dict[str, float | None],
+    inference_metrics: dict[str, object] | None = None,
+    supported_context_tokens: int | None = None,
+    workload_eval_coverage: bool | None = None,
+    serving_boundary: str | None = None,
+) -> WorkloadFitAssessment:
+    """Compare declared requirements with measured evidence without inventing utility.
+
+    A missing measurement is UNKNOWN, never an inferred pass. This deliberately keeps
+    public benchmark capability separate from user-specific task utility.
+    """
+
+    constraints: list[WorkloadFitConstraint] = []
+    metrics = inference_metrics or {}
+
+    for axis, floor in profile.critical_floors.items():
+        observed = _finite_number(capability_stats.get(axis))
+        if observed is None:
+            status = WorkloadConstraintStatus.UNKNOWN
+            reason = "No comparable measured capability value is available for this axis."
+        elif observed >= floor:
+            status = WorkloadConstraintStatus.PASS
+            reason = "Measured capability satisfies the declared hard floor."
+        else:
+            status = WorkloadConstraintStatus.FAIL
+            reason = "Measured capability is below the declared hard floor."
+        constraints.append(
+            WorkloadFitConstraint(
+                key=f"capability.{axis}",
+                category="CAPABILITY",
+                requirement=floor,
+                observed=observed,
+                unit="frontierwright-capability-v1",
+                status=status,
+                evidence_source="CAPABILITY_PROFILE" if observed is not None else None,
+                reason=reason,
+            )
+        )
+
+    if profile.max_latency_seconds is not None:
+        observed = _finite_number(metrics.get("latency_seconds_p50"))
+        if observed is None:
+            status = WorkloadConstraintStatus.UNKNOWN
+            reason = "No measured inference latency receipt exists for this model."
+        elif observed <= profile.max_latency_seconds:
+            status = WorkloadConstraintStatus.PASS
+            reason = "Measured p50 latency is within the declared ceiling."
+        else:
+            status = WorkloadConstraintStatus.FAIL
+            reason = "Measured p50 latency exceeds the declared ceiling."
+        constraints.append(
+            WorkloadFitConstraint(
+                key="serving.latency_p50",
+                category="SERVING",
+                requirement=profile.max_latency_seconds,
+                observed=observed,
+                unit="seconds",
+                status=status,
+                evidence_source="INFERENCE_PROFILE" if observed is not None else None,
+                reason=reason,
+            )
+        )
+
+    if profile.min_tokens_per_second is not None:
+        observed = _finite_number(metrics.get("tokens_per_second_p50"))
+        if observed is None:
+            status = WorkloadConstraintStatus.UNKNOWN
+            reason = "No measured inference throughput receipt exists for this model."
+        elif observed >= profile.min_tokens_per_second:
+            status = WorkloadConstraintStatus.PASS
+            reason = "Measured p50 throughput satisfies the declared floor."
+        else:
+            status = WorkloadConstraintStatus.FAIL
+            reason = "Measured p50 throughput is below the declared floor."
+        constraints.append(
+            WorkloadFitConstraint(
+                key="serving.throughput_p50",
+                category="SERVING",
+                requirement=profile.min_tokens_per_second,
+                observed=observed,
+                unit="tokens/second",
+                status=status,
+                evidence_source="INFERENCE_PROFILE" if observed is not None else None,
+                reason=reason,
+            )
+        )
+
+    if profile.context_tokens_p95 is not None:
+        observed_context = (
+            supported_context_tokens
+            if isinstance(supported_context_tokens, int)
+            and not isinstance(supported_context_tokens, bool)
+            and supported_context_tokens > 0
+            else None
+        )
+        if observed_context is None:
+            status = WorkloadConstraintStatus.UNKNOWN
+            reason = "Model context capacity has not been verified by a compatible receipt."
+        elif observed_context >= profile.context_tokens_p95:
+            status = WorkloadConstraintStatus.PASS
+            reason = "Verified model context capacity covers workload p95 context demand."
+        else:
+            status = WorkloadConstraintStatus.FAIL
+            reason = "Verified model context capacity is below workload p95 demand."
+        constraints.append(
+            WorkloadFitConstraint(
+                key="serving.context_p95",
+                category="SERVING",
+                requirement=profile.context_tokens_p95,
+                observed=observed_context,
+                unit="tokens",
+                status=status,
+                evidence_source="MODEL_CONTEXT_RECEIPT" if observed_context else None,
+                reason=reason,
+            )
+        )
+
+    needs_workload_eval = bool(profile.languages or profile.domains or profile.task_weights)
+    if needs_workload_eval:
+        coverage_status = (
+            WorkloadConstraintStatus.PASS
+            if workload_eval_coverage is True
+            else WorkloadConstraintStatus.UNKNOWN
+        )
+        coverage_reason = (
+            "A workload-specific evaluation receipt covers the declared task surface."
+            if workload_eval_coverage is True
+            else (
+                "Public/core capability evidence is not enough to prove performance on the "
+                "declared languages, domains, and task mixture."
+            )
+        )
+        constraints.append(
+            WorkloadFitConstraint(
+                key="evaluation.workload_coverage",
+                category="EVALUATION",
+                requirement={
+                    "languages": list(profile.languages),
+                    "domains": list(profile.domains),
+                    "task_weights": dict(profile.task_weights),
+                },
+                observed=(True if workload_eval_coverage is True else None),
+                unit=None,
+                status=coverage_status,
+                evidence_source=(
+                    "WORKLOAD_EVALUATION_RECEIPT" if workload_eval_coverage is True else None
+                ),
+                reason=coverage_reason,
+            )
+        )
+
+    if profile.privacy is not DatasetClassification.PUBLIC:
+        normalized_boundary = serving_boundary.upper() if serving_boundary else None
+        allowed = {"LOCAL_MACHINE", "CONTROLLED_PRIVATE"}
+        if normalized_boundary is None:
+            status = WorkloadConstraintStatus.UNKNOWN
+            reason = "No serving-boundary receipt proves where inference executes."
+        elif normalized_boundary in allowed:
+            status = WorkloadConstraintStatus.PASS
+            reason = "Measured/declared serving boundary satisfies the non-public workload."
+        else:
+            status = WorkloadConstraintStatus.FAIL
+            reason = "Serving boundary conflicts with the declared non-public workload."
+        constraints.append(
+            WorkloadFitConstraint(
+                key="privacy.serving_boundary",
+                category="PRIVACY",
+                requirement=profile.privacy.value,
+                observed=normalized_boundary,
+                unit=None,
+                status=status,
+                evidence_source="SERVING_BOUNDARY_RECEIPT" if normalized_boundary else None,
+                reason=reason,
+            )
+        )
+
+    statuses = {item.status for item in constraints}
+    if WorkloadConstraintStatus.FAIL in statuses:
+        overall = WorkloadConstraintStatus.FAIL
+    elif constraints and statuses == {WorkloadConstraintStatus.PASS}:
+        overall = WorkloadConstraintStatus.PASS
+    else:
+        overall = WorkloadConstraintStatus.UNKNOWN
+    return WorkloadFitAssessment(overall, tuple(constraints))
+
+
+class ParetoDirection(StrEnum):
+    HIGHER_BETTER = "HIGHER_BETTER"
+    LOWER_BETTER = "LOWER_BETTER"
+
+
+class ParetoMetricRelation(StrEnum):
+    BETTER = "BETTER"
+    WORSE = "WORSE"
+    SAME = "SAME"
+    UNKNOWN = "UNKNOWN"
+
+
+class ParetoRelation(StrEnum):
+    CANDIDATE_DOMINATES = "CANDIDATE_DOMINATES"
+    CHAMPION_DOMINATES = "CHAMPION_DOMINATES"
+    TRADEOFF = "TRADEOFF"
+    EQUIVALENT = "EQUIVALENT"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+
+
+@dataclass(frozen=True)
+class ParetoMetricInput:
+    """One comparable measured dimension for Champion/Candidate evidence."""
+
+    key: str
+    category: str
+    direction: ParetoDirection
+    champion_value: float | int | None
+    candidate_value: float | int | None
+    unit: str | None = None
+    evidence_source: str | None = None
+
+
+@dataclass(frozen=True)
+class ParetoMetricEvidence:
+    key: str
+    category: str
+    direction: ParetoDirection
+    champion_value: float | None
+    candidate_value: float | None
+    raw_delta: float | None
+    improvement_delta: float | None
+    relation: ParetoMetricRelation
+    unit: str | None
+    evidence_source: str | None
+
+    def to_payload(self) -> dict[str, object]:
+        payload = asdict(self)
+        payload["direction"] = self.direction.value
+        payload["relation"] = self.relation.value
+        return payload
+
+
+@dataclass(frozen=True)
+class ParetoComparison:
+    relation: ParetoRelation
+    metrics: tuple[ParetoMetricEvidence, ...]
+
+    def to_payload(self) -> dict[str, object]:
+        counts = {status.value: 0 for status in ParetoMetricRelation}
+        for metric in self.metrics:
+            counts[metric.relation.value] += 1
+        return {
+            "relation": self.relation.value,
+            "counts": counts,
+            "metrics": [metric.to_payload() for metric in self.metrics],
+            "synthetic_utility_score": None,
+            "note": (
+                "Pareto relation uses only directly comparable measured point estimates. "
+                "It is not a statistical-significance claim and never hides per-axis evidence."
+            ),
+        }
+
+
+def compare_pareto_metrics(
+    inputs: tuple[ParetoMetricInput, ...] | list[ParetoMetricInput],
+) -> ParetoComparison:
+    """Compare measured dimensions without inventing cross-unit utility weights."""
+
+    metrics: list[ParetoMetricEvidence] = []
+    for item in inputs:
+        champion = _finite_number(item.champion_value)
+        candidate = _finite_number(item.candidate_value)
+        if champion is None or candidate is None:
+            metrics.append(
+                ParetoMetricEvidence(
+                    key=item.key,
+                    category=item.category,
+                    direction=item.direction,
+                    champion_value=champion,
+                    candidate_value=candidate,
+                    raw_delta=None,
+                    improvement_delta=None,
+                    relation=ParetoMetricRelation.UNKNOWN,
+                    unit=item.unit,
+                    evidence_source=item.evidence_source,
+                )
+            )
+            continue
+
+        raw_delta = candidate - champion
+        if math.isclose(candidate, champion, rel_tol=1e-9, abs_tol=1e-12):
+            improvement_delta = 0.0
+            relation = ParetoMetricRelation.SAME
+        else:
+            improvement_delta = (
+                raw_delta
+                if item.direction is ParetoDirection.HIGHER_BETTER
+                else -raw_delta
+            )
+            relation = (
+                ParetoMetricRelation.BETTER
+                if improvement_delta > 0
+                else ParetoMetricRelation.WORSE
+            )
+        metrics.append(
+            ParetoMetricEvidence(
+                key=item.key,
+                category=item.category,
+                direction=item.direction,
+                champion_value=champion,
+                candidate_value=candidate,
+                raw_delta=raw_delta,
+                improvement_delta=improvement_delta,
+                relation=relation,
+                unit=item.unit,
+                evidence_source=item.evidence_source,
+            )
+        )
+
+    known = [metric for metric in metrics if metric.relation is not ParetoMetricRelation.UNKNOWN]
+    better = any(metric.relation is ParetoMetricRelation.BETTER for metric in known)
+    worse = any(metric.relation is ParetoMetricRelation.WORSE for metric in known)
+    if not known:
+        final_relation = ParetoRelation.INSUFFICIENT_EVIDENCE
+    elif better and worse:
+        final_relation = ParetoRelation.TRADEOFF
+    elif better:
+        final_relation = ParetoRelation.CANDIDATE_DOMINATES
+    elif worse:
+        final_relation = ParetoRelation.CHAMPION_DOMINATES
+    else:
+        final_relation = ParetoRelation.EQUIVALENT
+    return ParetoComparison(relation=final_relation, metrics=tuple(metrics))

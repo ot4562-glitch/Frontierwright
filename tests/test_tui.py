@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 from textual.widgets import TabbedContent
@@ -17,6 +18,7 @@ from frontierwright.registry import Registry
 from frontierwright.service import (
     CompareView,
     StatusView,
+    WorkloadView,
     get_build_view,
     get_candidates_view,
     get_data_view,
@@ -33,7 +35,55 @@ from frontierwright.tui.app import (
     HelpScreen,
     WorkflowFormScreen,
     _compare_text,
+    _edition_help_text,
+    _stat_line,
 )
+
+
+def test_candidate_compare_keeps_keyboard_shortcuts_visible() -> None:
+    view = CompareView(
+        champion_model_id="champion",
+        candidate_model_id="candidate",
+        candidate_status="PENDING",
+        scale_comparable=True,
+        champion_stats={"general": 50.0},
+        candidate_stats={"general": 75.0},
+        deltas={"general": 25.0},
+    )
+
+    rendered = _compare_text(view)
+    assert "P Promote" in rendered
+    assert "R Reject" in rendered
+    assert "Esc Back" in rendered
+    assert "[P]" not in rendered
+
+
+def test_edition_help_and_stat_precision_are_intentionally_different() -> None:
+    uncertainty: dict[str, object] = {
+        "stat_lower": 55.0,
+        "stat_upper": 90.0,
+        "sample_size": 16,
+    }
+
+    academy_help = _edition_help_text("en", "ACADEMY")
+    studio_help = _edition_help_text("en", "STUDIO")
+    lab_help = _edition_help_text("en", "LAB")
+    assert "UNDERSTAND BY DOING" in academy_help
+    assert "FIT THE MODEL TO YOU" in studio_help
+    assert "CONTROLLED FRONTIER DEVELOPMENT" in lab_help
+
+    academy_stat = _stat_line(
+        axis="general", value=75.0, uncertainty=uncertainty, edition_profile="ACADEMY"
+    )
+    studio_stat = _stat_line(
+        axis="general", value=75.0, uncertainty=uncertainty, edition_profile="STUDIO"
+    )
+    lab_stat = _stat_line(
+        axis="general", value=75.0, uncertainty=uncertainty, edition_profile="LAB"
+    )
+    assert "95% evidence range" in academy_stat
+    assert "[55–90]" in studio_stat
+    assert "CI95[55.0, 90.0] n=16 Wilson" in lab_stat
 
 
 def test_candidate_compare_text_includes_stored_raw_evaluation() -> None:
@@ -119,6 +169,7 @@ async def test_tui_starts_with_required_sections_and_keyboard_navigation() -> No
             "paths",
             "resources",
             "data",
+            "workload",
             "history",
             "candidates",
         ):
@@ -143,6 +194,74 @@ async def test_tui_starts_with_required_sections_and_keyboard_navigation() -> No
         await pilot.press("escape")
         await pilot.pause()
         assert not isinstance(app.screen, HelpScreen)
+
+
+def test_tui_workload_experience_differs_by_edition() -> None:
+    workload = WorkloadView(
+        configured=True,
+        profile_id="workload-demo",
+        profile_hash="sha256:demo",
+        profile_name="Korean economics work",
+        source="EXPLICIT_USER",
+        profile={
+            "languages": ["ko", "en"],
+            "domains": ["economics", "coding"],
+            "task_weights": {"research": 2.0, "coding": 1.0},
+            "context_tokens_p50": 2048,
+            "context_tokens_p95": 8192,
+            "max_latency_seconds": 2.0,
+            "min_tokens_per_second": 15.0,
+            "privacy": "PRIVATE",
+            "critical_floors": {"general": 60.0},
+        },
+    )
+
+    academy = FrontierwrightApp(view=make_view(), workload=workload)
+    studio = FrontierwrightApp(
+        view=replace(
+            make_view(),
+            edition_profile="STUDIO",
+            edition_name="Frontierwright Studio",
+        ),
+        workload=workload,
+    )
+    lab = FrontierwrightApp(
+        view=replace(
+            make_view(),
+            edition_profile="LAB",
+            edition_name="Frontierwright Lab",
+        ),
+        workload=workload,
+    )
+
+    academy_text = academy._workload_text()
+    studio_text = studio._workload_text()
+    lab_text = lab._workload_text()
+
+    assert "WHAT SHOULD THIS MODEL LEARN TO FIT?" in academy_text
+    assert "fake capability points" in academy_text
+    assert "Hash:" not in academy_text
+
+    assert "YOUR WORKLOAD" in studio_text
+    assert "Next evidence: profile the current Champion" in studio_text
+
+    assert "WORKLOAD / SERVING REQUIREMENTS" in lab_text
+    assert "Hash: sha256:demo" in lab_text
+    assert "unknown constraints remain UNKNOWN" in lab_text
+
+
+def test_tui_action_priority_differs_by_edition() -> None:
+    academy = FrontierwrightApp(view=make_view())
+    studio = FrontierwrightApp(view=replace(make_view(), edition_profile="STUDIO"))
+    lab = FrontierwrightApp(view=replace(make_view(), edition_profile="LAB"))
+
+    academy_ids = [item.action_id for item in academy._action_items()[:3]]
+    studio_ids = [item.action_id for item in studio._action_items()[:3]]
+    lab_ids = [item.action_id for item in lab._action_items()[:3]]
+
+    assert academy_ids == ["add_dataset", "detect_resources", "set_workload"]
+    assert studio_ids == ["detect_resources", "set_workload", "add_dataset"]
+    assert lab_ids == ["set_workload", "detect_resources", "add_dataset"]
 
 
 def setup_candidate_project(root: Path) -> None:
@@ -184,9 +303,7 @@ def activate_tui_capability_profile(root: Path) -> None:
         conditions={},
         measurements=tuple(
             RawMeasurement(
-                task_id=(
-                    f"{CAPABILITY_V1_BUNDLE_ID}.{axis.value.lower()}"
-                ),
+                task_id=(f"{CAPABILITY_V1_BUNDLE_ID}.{axis.value.lower()}"),
                 task_version=CAPABILITY_V1_BUNDLE_VERSION,
                 metric="accuracy",
                 value=0.5,
@@ -221,7 +338,7 @@ async def test_tui_candidate_keyboard_selection_and_compare_modal(tmp_path: Path
     async with app.run_test(size=(140, 45)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
 
-        await pilot.press("7")
+        await pilot.press("8")
         await pilot.pause()
         assert tabs.active == "candidates"
         assert app.candidate_index == 0
@@ -267,7 +384,8 @@ async def test_tui_action_center_sets_build_intent_through_shared_service(
         await pilot.pause()
         assert isinstance(app.screen, ActionCenterScreen)
 
-        # Detect resources -> Register dataset -> Set build intent.
+        # Academy: dataset -> resources -> optional workload -> build intent.
+        await pilot.press("j")
         await pilot.press("j")
         await pilot.press("j")
         await pilot.press("enter")
@@ -492,9 +610,7 @@ async def test_tui_keyboard_measures_selected_candidate_capability(
         language="en",
     )
     actions = app._action_items()
-    action_index = [item.action_id for item in actions].index(
-        "measure_candidate_capability"
-    )
+    action_index = [item.action_id for item in actions].index("measure_candidate_capability")
 
     async with app.run_test(size=(140, 55)) as pilot:
         await pilot.press("a")

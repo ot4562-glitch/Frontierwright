@@ -58,8 +58,9 @@ from frontierwright.recipes import (
 )
 from frontierwright.reference_tokenizer import TokenizerArtifact
 from frontierwright.resources import ResourceSnapshot
+from frontierwright.workloads import WorkloadProfile
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 23
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -124,6 +125,15 @@ CREATE TABLE resource_profiles (
     snapshot TEXT NOT NULL,
     active INTEGER NOT NULL CHECK (active IN (0,1))
 );
+CREATE TABLE workload_profiles (
+    profile_id TEXT PRIMARY KEY,
+    profile_hash TEXT NOT NULL UNIQUE,
+    profile_name TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('EXPLICIT_USER')),
+    profile_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0,1))
+);
 CREATE TABLE build_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     mode TEXT NOT NULL CHECK (mode IN ('INTENT','TARGETS_FLOORS')),
@@ -166,7 +176,7 @@ CREATE TABLE capability_profiles (
 CREATE TABLE datasets (
     dataset_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('PRETRAIN','SFT','PREFERENCE')),
+    role TEXT NOT NULL CHECK (role IN ('PRETRAIN','SFT','PREFERENCE','ROLLOUT')),
     provenance TEXT NOT NULL CHECK (
         provenance IN ('LOCAL_USER','INTERNAL_CONNECTED','PUBLIC_DISCOVERED')),
     classification TEXT NOT NULL DEFAULT 'PRIVATE' CHECK (
@@ -522,6 +532,58 @@ SET edition_profile = CASE origin
 END;
 """
 
+MIGRATION_21_TO_22 = """
+CREATE TABLE IF NOT EXISTS workload_profiles (
+    profile_id TEXT PRIMARY KEY,
+    profile_hash TEXT NOT NULL UNIQUE,
+    profile_name TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('EXPLICIT_USER')),
+    profile_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0,1))
+);
+"""
+
+MIGRATION_22_TO_23 = """
+CREATE TABLE datasets_v23 (
+    dataset_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('PRETRAIN','SFT','PREFERENCE','ROLLOUT')),
+    provenance TEXT NOT NULL CHECK (
+        provenance IN ('LOCAL_USER','INTERNAL_CONNECTED','PUBLIC_DISCOVERED')),
+    classification TEXT NOT NULL DEFAULT 'PRIVATE' CHECK (
+        classification IN ('PUBLIC','INTERNAL','CONFIDENTIAL','PRIVATE')),
+    source_path TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    total_bytes INTEGER NOT NULL,
+    file_count INTEGER NOT NULL,
+    manifest_json TEXT NOT NULL,
+    license TEXT,
+    domain TEXT,
+    language TEXT,
+    token_count INTEGER,
+    created_at TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0,1)),
+    source_dataset_id TEXT REFERENCES datasets_v23(dataset_id),
+    preparation_recipe_id TEXT,
+    preparation_recipe_hash TEXT
+);
+INSERT INTO datasets_v23 (
+    dataset_id, name, role, provenance, classification, source_path,
+    fingerprint, total_bytes, file_count, manifest_json, license,
+    domain, language, token_count, created_at, active, source_dataset_id,
+    preparation_recipe_id, preparation_recipe_hash
+)
+SELECT
+    dataset_id, name, role, provenance, classification, source_path,
+    fingerprint, total_bytes, file_count, manifest_json, license,
+    domain, language, token_count, created_at, active, source_dataset_id,
+    preparation_recipe_id, preparation_recipe_hash
+FROM datasets;
+DROP TABLE datasets;
+ALTER TABLE datasets_v23 RENAME TO datasets;
+"""
+
 MIGRATION_10_TO_11 = """
 CREATE TABLE IF NOT EXISTS model_births (
     model_id TEXT PRIMARY KEY REFERENCES models(model_id),
@@ -593,6 +655,7 @@ class ProjectState:
     candidates: tuple[Candidate, ...]
     history: tuple[dict[str, Any], ...]
     resource_profile: dict[str, Any] | None
+    workload_profile: dict[str, Any] | None
     build_state: dict[str, Any] | None
     capability_profile: dict[str, Any] | None
     datasets: tuple[dict[str, Any], ...]
@@ -1111,6 +1174,37 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 )
                 connection.commit()
                 version = 21
+
+            if version == 21:
+                connection.executescript("BEGIN IMMEDIATE;" + chr(10) + MIGRATION_21_TO_22)
+                connection.execute("PRAGMA user_version = 22")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 21, "to_version": 22},
+                )
+                connection.commit()
+                version = 22
+
+            if version == 22:
+                connection.commit()
+                connection.execute("PRAGMA foreign_keys = OFF")
+                try:
+                    connection.executescript(
+                        "BEGIN IMMEDIATE;" + chr(10) + MIGRATION_22_TO_23
+                    )
+                    connection.execute("PRAGMA user_version = 23")
+                    self.event(
+                        connection,
+                        "SCHEMA_MIGRATED",
+                        {"from_version": 22, "to_version": 23},
+                    )
+                    connection.commit()
+                finally:
+                    if connection.in_transaction:
+                        connection.rollback()
+                    connection.execute("PRAGMA foreign_keys = ON")
+                version = 23
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -3523,6 +3617,69 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 },
             )
 
+    def save_workload_profile(self, profile: WorkloadProfile) -> dict[str, Any]:
+        profile_hash = profile.profile_hash
+        profile_id = "workload-" + profile_hash.removeprefix("sha256:")[:24]
+        payload = profile.to_payload()
+        created_at = timestamp()
+        with self.connect(write=True) as connection:
+            existing = connection.execute(
+                "SELECT * FROM workload_profiles WHERE profile_hash = ?",
+                (profile_hash,),
+            ).fetchone()
+            if existing is not None:
+                if not bool(existing["active"]):
+                    connection.execute("UPDATE workload_profiles SET active = 0")
+                    connection.execute(
+                        "UPDATE workload_profiles SET active = 1 WHERE profile_hash = ?",
+                        (profile_hash,),
+                    )
+                    self.event(
+                        connection,
+                        "WORKLOAD_PROFILE_ACTIVATED",
+                        {"profile_id": existing["profile_id"], "profile_hash": profile_hash},
+                    )
+                stored_id = str(existing["profile_id"])
+            else:
+                connection.execute("UPDATE workload_profiles SET active = 0")
+                connection.execute(
+                    "INSERT INTO workload_profiles ("
+                    "profile_id, profile_hash, profile_name, source, profile_json, "
+                    "created_at, active"
+                    ") VALUES (?, ?, ?, ?, ?, ?, 1)",
+                    (
+                        profile_id,
+                        profile_hash,
+                        profile.name,
+                        profile.source,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                        created_at,
+                    ),
+                )
+                self.event(
+                    connection,
+                    "WORKLOAD_PROFILE_SET",
+                    {
+                        "profile_id": profile_id,
+                        "profile_hash": profile_hash,
+                        "profile_name": profile.name,
+                        "source": profile.source,
+                    },
+                )
+                stored_id = profile_id
+
+        stored = self.read().workload_profile
+        if stored is None or stored.get("profile_id") != stored_id:
+            raise FrontierwrightError(
+                "REGISTRY_ERROR",
+                "Workload profile was not active after persistence.",
+                4,
+            )
+        return stored
+
+    def get_active_workload_profile(self) -> dict[str, Any] | None:
+        return self.read().workload_profile
+
     def save_resource_snapshot(
         self,
         snapshot: ResourceSnapshot,
@@ -3601,6 +3758,17 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             if resource_profile is not None:
                 resource_profile["snapshot"] = json.loads(resource_profile["snapshot"])
                 resource_profile["active"] = bool(resource_profile["active"])
+
+            workload_row = connection.execute(
+                "SELECT * FROM workload_profiles WHERE active = 1 "
+                "ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            workload_profile = dict(workload_row) if workload_row else None
+            if workload_profile is not None:
+                workload_profile["active"] = bool(workload_profile["active"])
+                workload_profile["profile"] = json.loads(
+                    workload_profile.pop("profile_json")
+                )
 
             build_row = connection.execute(
                 "SELECT * FROM build_state WHERE singleton = 1"
@@ -3689,6 +3857,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 candidates,
                 history,
                 resource_profile,
+                workload_profile,
                 build_state,
                 capability_profile,
                 tuple(datasets),

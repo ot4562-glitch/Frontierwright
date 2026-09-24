@@ -3,6 +3,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from frontierwright import __version__
 from frontierwright.cli import app
 
 runner = CliRunner()
@@ -11,7 +12,7 @@ runner = CliRunner()
 def test_cli_reports_release_candidate_version() -> None:
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0, result.output
-    assert result.stdout.strip() == "frontierwright 1.0.0rc1"
+    assert result.stdout.strip() == f"frontierwright {__version__}"
 
 
 def test_cli_json_contract_is_stable_for_zero_project(tmp_path: Path) -> None:

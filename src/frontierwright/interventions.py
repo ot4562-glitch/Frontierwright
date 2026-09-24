@@ -211,6 +211,12 @@ BUILTIN_INTERVENTION_PLUGINS: tuple[InterventionPlugin, ...] = (
         path_id=TrainingPathId.DPO,
     ),
     _training_plugin(
+        intervention_id="frontierwright.align.reinforcement-learning",
+        family=InterventionFamily.ALIGN,
+        title="Reinforcement learning policy optimization",
+        path_id=TrainingPathId.RL_POLICY_OPTIMIZATION,
+    ),
+    _training_plugin(
         intervention_id="frontierwright.evolve.distill",
         family=InterventionFamily.EVOLVE,
         title="Knowledge distillation",

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from frontierwright.data import DatasetClassification
 from frontierwright.domain import ModelOrigin, ModelState
 from frontierwright.errors import FrontierwrightError
 from frontierwright.registry import Registry
@@ -15,7 +16,9 @@ from frontierwright.service import (
     promote_candidate,
     reject_candidate,
     set_build_targets,
+    set_workload_profile,
 )
+from frontierwright.workloads import WorkloadProfile
 
 
 def create_project(root: Path) -> tuple[Registry, ModelState, ModelState]:
@@ -367,3 +370,78 @@ def test_champion_status_surface_reads_promoted_candidate_profile(tmp_path: Path
     assert status.champion_model_id == candidate.model_id
     assert status.stats["general"] == pytest.approx(120)
     assert status.stats["coding"] == pytest.approx(140)
+
+
+def test_compare_includes_workload_regressions_and_measured_pareto_tradeoffs(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+    set_workload_profile(
+        project,
+        WorkloadProfile(
+            name="Latency-sensitive coding",
+            privacy=DatasetClassification.PUBLIC,
+            max_latency_seconds=0.35,
+            min_tokens_per_second=22.0,
+            critical_floors={"general": 125.0},
+        ),
+    )
+
+    common = {
+        "measurement_scope": "steady_state_generation_excludes_model_load",
+        "execution_boundary": "LOCAL_MACHINE",
+        "device": "cuda",
+        "max_new_tokens": 16,
+        "measured_runs": 3,
+    }
+    registry.record_event(
+        "INFERENCE_PROFILE_MEASURED",
+        {
+            "model_id": champion.model_id,
+            "model_fingerprint": champion.fingerprint,
+            "metrics": {
+                **common,
+                "latency_seconds_p50": 0.4,
+                "tokens_per_second_p50": 20.0,
+                "peak_vram_bytes": 6_000,
+                "max_sampled_process_rss_bytes": 3_000,
+            },
+        },
+    )
+    registry.record_event(
+        "INFERENCE_PROFILE_MEASURED",
+        {
+            "model_id": candidate.model_id,
+            "model_fingerprint": candidate.fingerprint,
+            "metrics": {
+                **common,
+                "latency_seconds_p50": 0.3,
+                "tokens_per_second_p50": 24.0,
+                "peak_vram_bytes": 7_000,
+                "max_sampled_process_rss_bytes": 2_800,
+            },
+        },
+    )
+
+    view = compare_candidate(project, candidate.model_id)
+
+    assert view.workload_comparison["configured"] is True
+    regressions = view.workload_comparison["regressions"]
+    assert isinstance(regressions, list)
+    assert any(
+        item["key"] == "capability.general"
+        and item["champion_status"] == "PASS"
+        and item["candidate_status"] == "FAIL"
+        for item in regressions
+    )
+    assert view.pareto["relation"] == "TRADEOFF"
+    assert view.pareto["synthetic_utility_score"] is None
+    assert view.pareto["inference_profile_comparable"] is True
+    metrics = {item["key"]: item for item in view.pareto["metrics"]}
+    assert metrics["capability.general"]["relation"] == "WORSE"
+    assert metrics["capability.coding"]["relation"] == "BETTER"
+    assert metrics["serving.latency_p50"]["relation"] == "BETTER"
+    assert metrics["serving.throughput_p50"]["relation"] == "BETTER"
+    assert metrics["resource.peak_vram"]["relation"] == "WORSE"

@@ -13,6 +13,7 @@ from frontierwright.reference_backend import (
     _parameter_count,
     _read_corpus,
     _read_preference_pairs,
+    _read_rl_episodes,
     _trainable_parameter_count,
     backend_spec_payload,
 )
@@ -28,19 +29,19 @@ def test_reference_backend_declares_pretraining_full_sft_and_lora() -> None:
         "LORA_SFT",
         "QLORA_SFT",
         "DPO",
+        "RL_POLICY_OPTIMIZATION",
         "DISTILL",
     ]
 
 
 def test_reference_backend_objective_labels_are_path_specific() -> None:
     assert _objective_for_path("FROM_SCRATCH_PRETRAINING") == "causal_lm_pretraining"
-    assert _objective_for_path("CONTINUED_PRETRAINING") == (
-        "causal_lm_continued_pretraining"
-    )
+    assert _objective_for_path("CONTINUED_PRETRAINING") == ("causal_lm_continued_pretraining")
     assert _objective_for_path("FULL_SFT") == "full_parameter_causal_sft"
     assert _objective_for_path("LORA_SFT") == "lora_causal_sft"
     assert _objective_for_path("QLORA_SFT") == "qlora_nf4_causal_sft"
     assert _objective_for_path("DPO") == "direct_preference_optimization"
+    assert _objective_for_path("RL_POLICY_OPTIMIZATION") == "reinforce_verifiable_choice"
     assert _objective_for_path("DISTILL") == "knowledge_distillation"
 
 
@@ -52,9 +53,7 @@ def test_reference_config_infers_preset_from_materialized_model(
     (model / "config.json").write_text(
         json.dumps(
             {
-                "frontierwright_reference_backend": (
-                    "frontierwright-reference-pytorch-v1"
-                ),
+                "frontierwright_reference_backend": ("frontierwright-reference-pytorch-v1"),
                 "preset": "zero-25m",
             }
         ),
@@ -83,9 +82,7 @@ def test_reference_lora_config_is_path_scoped(tmp_path: Path) -> None:
     (model / "config.json").write_text(
         json.dumps(
             {
-                "frontierwright_reference_backend": (
-                    "frontierwright-reference-pytorch-v1"
-                ),
+                "frontierwright_reference_backend": ("frontierwright-reference-pytorch-v1"),
                 "preset": "zero-8m",
             }
         ),
@@ -179,8 +176,7 @@ def test_reference_qlora_packs_nf4_and_merges_when_torch_available() -> None:
     assert details["quantization_type"] == "nf4"
     assert details["quantization_bits"] == 4
     assert (
-        details["quantized_target_storage_bytes"]
-        < details["full_precision_target_storage_bytes"]
+        details["quantized_target_storage_bytes"] < details["full_precision_target_storage_bytes"]
     )
     assert _trainable_parameter_count(model) == details["trainable_parameter_count"]
 
@@ -188,9 +184,7 @@ def test_reference_qlora_packs_nf4_and_merges_when_torch_available() -> None:
     loss = model(tokens).square().mean()
     loss.backward()
     assert any(
-        parameter.grad is not None
-        for parameter in model.parameters()
-        if parameter.requires_grad
+        parameter.grad is not None for parameter in model.parameters() if parameter.requires_grad
     )
 
     _merge_lora_parametrizations(torch, model)
@@ -204,9 +198,7 @@ def test_reference_dpo_config_is_path_scoped(tmp_path: Path) -> None:
     (model / "config.json").write_text(
         json.dumps(
             {
-                "frontierwright_reference_backend": (
-                    "frontierwright-reference-pytorch-v1"
-                ),
+                "frontierwright_reference_backend": ("frontierwright-reference-pytorch-v1"),
                 "preset": "zero-8m",
             }
         ),
@@ -234,17 +226,13 @@ def test_reference_dpo_config_is_path_scoped(tmp_path: Path) -> None:
         )
 
 
-
-
 def test_reference_distill_config_pins_smaller_student_preset(tmp_path: Path) -> None:
     model = tmp_path / "teacher"
     model.mkdir()
     (model / "config.json").write_text(
         json.dumps(
             {
-                "frontierwright_reference_backend": (
-                    "frontierwright-reference-pytorch-v1"
-                ),
+                "frontierwright_reference_backend": ("frontierwright-reference-pytorch-v1"),
                 "preset": "zero-25m",
             }
         ),
@@ -353,9 +341,7 @@ def test_reference_generation_config_allows_greedy_and_rejects_negative_temperat
     (model / "config.json").write_text(
         json.dumps(
             {
-                "frontierwright_reference_backend": (
-                    "frontierwright-reference-pytorch-v1"
-                ),
+                "frontierwright_reference_backend": ("frontierwright-reference-pytorch-v1"),
                 "preset": "zero-8m",
             }
         ),
@@ -385,3 +371,56 @@ def test_reference_generation_config_allows_greedy_and_rejects_negative_temperat
                 "config": {"temperature": -0.1},
             }
         )
+
+
+def test_reference_rl_config_and_episode_schema_are_explicit(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "frontierwright_reference_backend": "frontierwright-reference-pytorch-v1",
+                "preset": "zero-8m",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _load_config(
+        {
+            "path_id": "RL_POLICY_OPTIMIZATION",
+            "model_source_path": str(model),
+            "config": {
+                "steps": 2,
+                "batch_size": 1,
+                "rl": {
+                    "schema_version": 1,
+                    "algorithm_id": "reinforce",
+                    "environment": {
+                        "id": "choice-env",
+                        "version": "1",
+                        "kind": "VERIFIABLE_MULTIPLE_CHOICE",
+                        "config": {},
+                    },
+                    "reward": {
+                        "id": "exact-choice",
+                        "version": "1",
+                        "kind": "EXACT_CORRECT_CHOICE",
+                        "config": {},
+                    },
+                    "algorithm_config": {"reward_baseline": 0.5},
+                },
+            },
+        }
+    )
+    assert config.rl_spec is not None
+    assert config.rl_spec.algorithm_id == "reinforce"
+
+    episodes = tmp_path / "episodes.jsonl"
+    episodes.write_text(
+        '{"prompt":"2+2=","choices":["4","5"],"correct_index":0}\n',
+        encoding="utf-8",
+    )
+    parsed = _read_rl_episodes(episodes, max_bytes=1024)
+    assert len(parsed) == 1
+    assert parsed[0].correct_index == 0
+    assert parsed[0].choices == (b"4", b"5")

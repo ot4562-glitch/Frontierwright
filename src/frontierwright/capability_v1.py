@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass
 
 from frontierwright.domain import Axis
@@ -21,6 +22,9 @@ CAPABILITY_V1_BUNDLE_VERSION = "1"
 CAPABILITY_V1_EVALUATOR_ID = "frontierwright.capability-v1-reference-evaluator"
 CAPABILITY_V1_EVALUATOR_VERSION = "1"
 CAPABILITY_V1_SCORING = "mean-conditional-logprob-v1"
+CAPABILITY_V1_UNCERTAINTY_METHOD = "wilson-score-95-v1"
+CAPABILITY_V1_CONFIDENCE_LEVEL = 0.95
+_CAPABILITY_V1_WILSON_Z = 1.959963984540054
 CAPABILITY_V1_FROZEN_BUNDLE_SHA256 = (
     "52ae4fc38dca0bda9e7d8d2845d985e38afeb9530317d9f716f88cabd25261c8"
 )
@@ -498,6 +502,49 @@ CAPABILITY_V1_TASKS: tuple[CapabilityTask, ...] = (
         2,
     ),
 )
+
+
+
+def capability_v1_uncertainty(
+    correct: int, total: int
+) -> dict[str, object]:
+    """Return a 95% Wilson interval for raw accuracy and the frozen v1 display scale.
+
+    Capability v1 has only 16 items per axis. Returning a point estimate without an
+    uncertainty interval would imply more precision than the evidence supports. The
+    frozen v1 scale is linear (display = 200 * raw accuracy), so the raw Wilson bounds
+    can be mapped directly without changing the frozen benchmark or scale identity.
+    """
+
+    if isinstance(correct, bool) or not isinstance(correct, int):
+        raise ValueError("correct must be an integer")
+    if isinstance(total, bool) or not isinstance(total, int) or total <= 0:
+        raise ValueError("total must be a positive integer")
+    if not 0 <= correct <= total:
+        raise ValueError("correct must be between zero and total")
+
+    p = correct / total
+    z = _CAPABILITY_V1_WILSON_Z
+    z2 = z * z
+    denominator = 1.0 + z2 / total
+    center = (p + z2 / (2.0 * total)) / denominator
+    half = (
+        z
+        * math.sqrt((p * (1.0 - p) + z2 / (4.0 * total)) / total)
+        / denominator
+    )
+    lower = max(0.0, center - half)
+    upper = min(1.0, center + half)
+    return {
+        "method": CAPABILITY_V1_UNCERTAINTY_METHOD,
+        "confidence_level": CAPABILITY_V1_CONFIDENCE_LEVEL,
+        "sample_size": total,
+        "correct_count": correct,
+        "accuracy_lower": lower,
+        "accuracy_upper": upper,
+        "stat_lower": 200.0 * lower,
+        "stat_upper": 200.0 * upper,
+    }
 
 
 def capability_v1_bundle_payload() -> dict[str, object]:

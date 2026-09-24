@@ -15,6 +15,7 @@ class DatasetRole(StrEnum):
     PRETRAIN = "PRETRAIN"
     SFT = "SFT"
     PREFERENCE = "PREFERENCE"
+    ROLLOUT = "ROLLOUT"
 
 
 class DatasetProvenance(StrEnum):

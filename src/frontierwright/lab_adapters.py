@@ -18,7 +18,10 @@ class LabAdapterKind(StrEnum):
     DATASET_SOURCE = "DATASET_SOURCE"
     TRAINER = "TRAINER"
     EXECUTOR = "EXECUTOR"
+    CLUSTER_EXECUTOR = "CLUSTER_EXECUTOR"
     EVALUATOR = "EVALUATOR"
+    ROLLOUT_ENGINE = "ROLLOUT_ENGINE"
+    REWARD_PROVIDER = "REWARD_PROVIDER"
     ARTIFACT_STORE = "ARTIFACT_STORE"
 
 
@@ -134,8 +137,7 @@ def load_lab_adapter_manifest(path: Path) -> LabAdapterManifest:
         if raw.get("schema_version") != 1:
             raise ValueError("schema_version must be 1")
         kinds = tuple(
-            LabAdapterKind(item)
-            for item in _strict_string_list(raw.get("kinds"), "kinds")
+            LabAdapterKind(item) for item in _strict_string_list(raw.get("kinds"), "kinds")
         )
         capabilities = _strict_string_list(
             raw.get("capabilities", []),

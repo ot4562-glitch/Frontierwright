@@ -26,6 +26,7 @@ from frontierwright.capability_v1 import (
     CAPABILITY_V1_SCORING,
     capability_v1_bundle_hash,
     capability_v1_task_counts,
+    capability_v1_uncertainty,
 )
 from frontierwright.data import (
     DatasetClassification,
@@ -57,6 +58,10 @@ from frontierwright.evaluations import (
     apply_scale,
     load_capability_scale,
     load_evaluation_receipt,
+)
+from frontierwright.evaluator_adapters import (
+    ExternalEvaluationImport,
+    import_lm_eval_results,
 )
 from frontierwright.execution import (
     BackendDataBoundary,
@@ -119,6 +124,16 @@ from frontierwright.reference_tokenizer import (
 )
 from frontierwright.registry import ProjectState, Registry
 from frontierwright.resources import detect_local_resources
+from frontierwright.rl import RLExperimentSpec, rl_spec_from_config
+from frontierwright.serving_adapters import VLLMServingImport, import_vllm_bench_serve
+from frontierwright.workloads import (
+    ParetoDirection,
+    ParetoMetricInput,
+    WorkloadProfile,
+    assess_workload_fit,
+    compare_pareto_metrics,
+    workload_profile_from_payload,
+)
 
 
 @dataclass(frozen=True)
@@ -147,6 +162,7 @@ class StatusView:
     model_total_bytes: int | None = None
     candidate_count: int = 0
     stats: dict[str, float | None] = field(default_factory=dict)
+    stat_uncertainty: dict[str, dict[str, object]] = field(default_factory=dict)
     resource_profile_available: bool = False
 
     def to_dict(self) -> dict[str, object]:
@@ -212,6 +228,41 @@ class ResourceView:
     provenance: str | None = None
     detected_at: str | None = None
     snapshot: dict[str, object] = field(default_factory=dict)
+    headroom: dict[str, object] = field(default_factory=dict)
+    model_fit: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WorkloadView:
+    schema_version: int = 1
+    configured: bool = False
+    profile_id: str | None = None
+    profile_hash: str | None = None
+    profile_name: str | None = None
+    source: str | None = None
+    created_at: str | None = None
+    profile: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WorkloadFitView:
+    schema_version: int = 1
+    configured: bool = False
+    model_id: str | None = None
+    model_fingerprint: str | None = None
+    workload_profile_id: str | None = None
+    workload_profile_hash: str | None = None
+    overall_status: str = "NOT_CONFIGURED"
+    counts: dict[str, int] = field(default_factory=dict)
+    constraints: list[dict[str, object]] = field(default_factory=list)
+    synthetic_utility_score: None = None
+    note: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -560,6 +611,8 @@ class CompareView:
     promotion_blockers: list[dict[str, object]] = field(default_factory=list)
     build_scale_hash: str | None = None
     raw_evaluation_comparisons: list[dict[str, object]] = field(default_factory=list)
+    workload_comparison: dict[str, object] = field(default_factory=dict)
+    pareto: dict[str, object] = field(default_factory=dict)
     run: dict[str, object] | None = None
     calibration: dict[str, object] | None = None
 
@@ -583,6 +636,42 @@ def _empty_stats() -> dict[str, float | None]:
         "math": None,
         "coding": None,
     }
+
+
+def _capability_uncertainty_from_profile(
+    profile: dict[str, object] | None,
+) -> dict[str, dict[str, object]]:
+    if profile is None:
+        return {}
+    conditions = profile.get("conditions")
+    if not isinstance(conditions, dict):
+        return {}
+    raw_axis_results = conditions.get("axis_results")
+    if not isinstance(raw_axis_results, list):
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    for raw in raw_axis_results:
+        if not isinstance(raw, dict):
+            continue
+        axis = raw.get("axis")
+        correct = raw.get("correct")
+        total = raw.get("total")
+        if not isinstance(axis, str):
+            continue
+        uncertainty = raw.get("uncertainty")
+        if isinstance(uncertainty, dict):
+            result[axis] = dict(uncertainty)
+            continue
+        if (
+            isinstance(correct, int)
+            and not isinstance(correct, bool)
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and total > 0
+            and 0 <= correct <= total
+        ):
+            result[axis] = capability_v1_uncertainty(correct, total)
+    return result
 
 
 def get_status(root: Path) -> StatusView:
@@ -642,6 +731,7 @@ def get_status(root: Path) -> StatusView:
         model_total_bytes=artifact.get("total_bytes"),
         candidate_count=len(state.candidates),
         stats=stats,
+        stat_uncertainty=_capability_uncertainty_from_profile(state.capability_profile),
         resource_profile_available=state.resource_profile is not None,
     )
 
@@ -674,7 +764,6 @@ def set_project_edition(root: Path, edition: EditionProfile) -> StatusView:
         )
     registry.set_edition_profile(edition)
     return get_status(root)
-
 
 
 def get_lab_adapters(root: Path) -> LabAdaptersView:
@@ -967,9 +1056,7 @@ def preflight_project_tokenizer(
             "requested_vocab_size": vocab_size,
             "max_training_bytes": max_training_bytes,
             "training_bytes": len(corpus),
-            "existing_artifact_id": (
-                existing.get("artifact_id") if existing is not None else None
-            ),
+            "existing_artifact_id": (existing.get("artifact_id") if existing is not None else None),
         },
     )
 
@@ -1255,12 +1342,8 @@ def birth_zero_model(
     selected_tokenizer_fingerprint = (
         selected_tokenizer.fingerprint if selected_tokenizer is not None else None
     )
-    selected_tokenizer_path = (
-        selected_tokenizer.path if selected_tokenizer is not None else None
-    )
-    selected_vocab_size = (
-        selected_tokenizer.vocab_size if selected_tokenizer is not None else None
-    )
+    selected_tokenizer_path = selected_tokenizer.path if selected_tokenizer is not None else None
+    selected_vocab_size = selected_tokenizer.vocab_size if selected_tokenizer is not None else None
 
     if state.champion is not None:
         existing = registry.get_model_birth(state.champion.model.model_id)
@@ -1269,8 +1352,7 @@ def birth_zero_model(
             and existing.get("preset") == preset
             and existing.get("seed") == seed
             and existing.get("tokenizer_artifact_id") == tokenizer_artifact_id
-            and existing.get("tokenizer_fingerprint")
-            == selected_tokenizer_fingerprint
+            and existing.get("tokenizer_fingerprint") == selected_tokenizer_fingerprint
         ):
             return get_birth_view(root)
         raise FrontierwrightError(
@@ -1362,11 +1444,9 @@ def birth_zero_model(
 
         staged_descriptor = inspect_local_model(backend_model_path)
         digest = hashlib.sha256(
-            (
-                str(state.project["project_id"])
-                + "\0"
-                + staged_descriptor.fingerprint
-            ).encode("utf-8")
+            (str(state.project["project_id"]) + "\0" + staged_descriptor.fingerprint).encode(
+                "utf-8"
+            )
         ).hexdigest()
         model_id = f"model-birth-{digest[:32]}"
         final_root = births_root / model_id
@@ -1753,11 +1833,7 @@ def merge_reference_models(
             replayed=True,
         )
 
-    staging_root = (
-        transforms_root
-        / ".staging"
-        / f"{transform_id}-{uuid4().hex}"
-    )
+    staging_root = transforms_root / ".staging" / f"{transform_id}-{uuid4().hex}"
     staging_root.mkdir(parents=True, exist_ok=False)
     request: dict[str, object] = {
         "schema_version": 1,
@@ -2740,9 +2816,7 @@ def generate_reference_text(
         or generated_text != prompt + continuation
         or not isinstance(token_ids, list)
         or not all(
-            isinstance(item, int)
-            and not isinstance(item, bool)
-            and 0 <= item < 256
+            isinstance(item, int) and not isinstance(item, bool) and 0 <= item < 256
             for item in token_ids
         )
         or len(token_ids) != max_new_tokens
@@ -2770,6 +2844,7 @@ def profile_reference_inference(
     root: Path,
     *,
     python_executable: str,
+    model_id: str | None = None,
     max_new_tokens: int = 16,
     warmup_runs: int = 1,
     measured_runs: int = 3,
@@ -2814,13 +2889,16 @@ def profile_reference_inference(
         )
 
     state = registry.read()
-    if state.champion is None:
-        raise FrontierwrightError(
-            "NO_CHAMPION_MODEL",
-            "A current champion is required before inference profiling.",
-            12,
-        )
-    model = state.champion.model
+    if model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "A current champion is required before inference profiling.",
+                12,
+            )
+        model = state.champion.model
+    else:
+        model = registry.get_model(model_id)
     _verify_model_artifact_integrity(registry, model.model_id)
     preset = _reference_model_preset(model)
 
@@ -3075,6 +3153,42 @@ def _verify_model_artifact_integrity(registry: Registry, model_id: str) -> None:
         )
 
 
+def import_lm_eval_evidence(
+    root: Path,
+    *,
+    result_path: Path,
+    model_id: str | None,
+    harness_version: str,
+) -> ExternalEvaluationImport:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before importing evaluation evidence.",
+            10,
+        )
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "Specify --model or establish a Champion before importing lm-eval evidence.",
+                12,
+            )
+        target_model_id = state.champion.model.model_id
+    model = registry.get_model(target_model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+    imported = import_lm_eval_results(
+        result_path,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        harness_version=harness_version,
+    )
+    registry.store_evaluation_receipt(imported.receipt, provenance="IMPORTED")
+    return imported
+
+
 def ingest_stats(
     root: Path,
     *,
@@ -3119,6 +3233,20 @@ def _capability_v1_run_view(
         if isinstance(raw_axis_results, list)
         else []
     )
+    for item in axis_results:
+        if isinstance(item.get("uncertainty"), dict):
+            continue
+        correct = item.get("correct")
+        total = item.get("total")
+        if (
+            isinstance(correct, int)
+            and not isinstance(correct, bool)
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and total > 0
+            and 0 <= correct <= total
+        ):
+            item["uncertainty"] = capability_v1_uncertainty(correct, total)
     return CapabilityV1RunView(
         bundle_hash=capability_v1_bundle_hash(),
         scale_id=CAPABILITY_V1_SCALE.scale_id,
@@ -3372,12 +3500,7 @@ def run_capability_v1(
             registry.activate_capability_profile(receipt, CAPABILITY_V1_SCALE, stats)
         return _capability_v1_run_view(root, receipt, replayed=True)
 
-    request_path = (
-        registry.state_dir
-        / "evaluations"
-        / "requests"
-        / f"{receipt_id}.json"
-    )
+    request_path = registry.state_dir / "evaluations" / "requests" / f"{receipt_id}.json"
     request: dict[str, object] = {
         "schema_version": 1,
         "backend_id": REFERENCE_BACKEND_ID,
@@ -3483,6 +3606,7 @@ def run_capability_v1(
             "correct": correct,
             "total": total,
             "mean_correct_margin_nats": float(margin),
+            "uncertainty": capability_v1_uncertainty(correct, total),
         }
         axis_results.append(normalized)
         measurements.extend(
@@ -3552,6 +3676,7 @@ def run_capability_v1(
     stats = apply_scale(receipt, CAPABILITY_V1_SCALE)
     registry.activate_capability_profile(receipt, CAPABILITY_V1_SCALE, stats)
     return _capability_v1_run_view(root, receipt, replayed=False)
+
 
 def get_evaluation_packs() -> list[dict[str, object]]:
     return [descriptor.to_dict() for descriptor in BUILTIN_EVALUATION_PACKS]
@@ -3797,8 +3922,7 @@ def preflight_reference_evaluation(
             and receipt.evaluator_id == REFERENCE_LM_PACK.evaluator_id
             and receipt.evaluator_version == REFERENCE_LM_PACK.evaluator_version
             and all(
-                receipt.conditions.get(key) == value
-                for key, value in expected_conditions.items()
+                receipt.conditions.get(key) == value for key, value in expected_conditions.items()
             )
         ):
             raise FrontierwrightError(
@@ -3927,11 +4051,7 @@ def run_reference_evaluation(
     _verify_model_artifact_integrity(registry, model.model_id)
 
     dataset = next(
-        (
-            item
-            for item in state.datasets
-            if item.get("dataset_id") == dataset_id
-        ),
+        (item for item in state.datasets if item.get("dataset_id") == dataset_id),
         None,
     )
     if dataset is None:
@@ -3999,8 +4119,7 @@ def run_reference_evaluation(
             and receipt.evaluator_id == REFERENCE_LM_PACK.evaluator_id
             and receipt.evaluator_version == REFERENCE_LM_PACK.evaluator_version
             and all(
-                receipt.conditions.get(key) == value
-                for key, value in expected_conditions.items()
+                receipt.conditions.get(key) == value for key, value in expected_conditions.items()
             )
         )
         if not replay_identity_matches:
@@ -4019,12 +4138,7 @@ def run_reference_evaluation(
             replayed=True,
         )
 
-    request_path = (
-        registry.state_dir
-        / "evaluations"
-        / "requests"
-        / f"{receipt_id}.json"
-    )
+    request_path = registry.state_dir / "evaluations" / "requests" / f"{receipt_id}.json"
     request: dict[str, object] = {
         "schema_version": 1,
         "backend_id": REFERENCE_BACKEND_ID,
@@ -4157,12 +4271,7 @@ def run_reference_evaluation(
     )
     registry.store_evaluation_receipt(receipt, provenance="GENERATED")
 
-    receipt_path = (
-        registry.state_dir
-        / "evaluations"
-        / "receipts"
-        / f"{receipt.receipt_id}.json"
-    )
+    receipt_path = registry.state_dir / "evaluations" / "receipts" / f"{receipt.receipt_id}.json"
     _write_state_json(
         receipt_path,
         {
@@ -4356,49 +4465,91 @@ def _stored_raw_evaluation_comparisons(
     champion_model_id: str,
     candidate_model_id: str,
 ) -> list[dict[str, object]]:
+    def evidence_identity(
+        receipt: EvaluationReceipt,
+    ) -> tuple[str, dict[str, object]] | None:
+        conditions = receipt.conditions
+        pack_id = conditions.get("pack_id")
+        pack_version = conditions.get("pack_version")
+        dataset_id = conditions.get("dataset_id")
+        dataset_fingerprint = conditions.get("dataset_fingerprint")
+        config = conditions.get("config")
+        if (
+            isinstance(pack_id, str)
+            and isinstance(pack_version, str)
+            and isinstance(dataset_id, str)
+            and isinstance(dataset_fingerprint, str)
+            and isinstance(config, dict)
+        ):
+            identity_payload: dict[str, object] = {
+                "kind": "FRONTIERWRIGHT_PACK",
+                "pack_id": pack_id,
+                "pack_version": pack_version,
+                "evaluator_id": receipt.evaluator_id,
+                "evaluator_version": receipt.evaluator_version,
+                "dataset_id": dataset_id,
+                "dataset_fingerprint": dataset_fingerprint,
+                "config": config,
+            }
+            metadata = dict(identity_payload)
+        elif conditions.get("adapter_id") == "frontierwright.evaluator.lm-eval-import":
+            task_versions = conditions.get("task_versions")
+            configs = conditions.get("configs")
+            n_samples = conditions.get("n_samples")
+            n_shot = conditions.get("n_shot")
+            if not isinstance(task_versions, dict):
+                return None
+            if not isinstance(configs, dict):
+                return None
+            if not isinstance(n_samples, dict):
+                return None
+            if not isinstance(n_shot, dict):
+                return None
+            identity_payload = {
+                "kind": "EXTERNAL_LM_EVAL",
+                "adapter_id": conditions.get("adapter_id"),
+                "adapter_version": conditions.get("adapter_version"),
+                "source_format": conditions.get("source_format"),
+                "evaluator_id": receipt.evaluator_id,
+                "evaluator_version": receipt.evaluator_version,
+                "task_versions": task_versions,
+                "configs": configs,
+                "n_samples": n_samples,
+                "n_shot": n_shot,
+            }
+            metadata = {
+                "kind": "EXTERNAL_LM_EVAL",
+                "adapter_id": conditions.get("adapter_id"),
+                "adapter_version": conditions.get("adapter_version"),
+                "evaluator_id": receipt.evaluator_id,
+                "evaluator_version": receipt.evaluator_version,
+                "task_count": len(task_versions),
+            }
+        else:
+            return None
+        try:
+            identity_json = json.dumps(
+                identity_payload,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return None
+        return identity_json, metadata
+
     def keyed_receipts(
         model_id: str,
-    ) -> dict[tuple[str, str, str, str, str, str, str], EvaluationReceipt]:
-        result: dict[
-            tuple[str, str, str, str, str, str, str],
-            EvaluationReceipt,
-        ] = {}
+    ) -> dict[str, tuple[EvaluationReceipt, dict[str, object]]]:
+        result: dict[str, tuple[EvaluationReceipt, dict[str, object]]] = {}
         for row in registry.list_evaluation_receipts(model_id):
             receipt = _receipt_from_registry_row(row)
-            conditions = receipt.conditions
-            pack_id = conditions.get("pack_id")
-            pack_version = conditions.get("pack_version")
-            dataset_id = conditions.get("dataset_id")
-            dataset_fingerprint = conditions.get("dataset_fingerprint")
-            config = conditions.get("config")
-            if (
-                not isinstance(pack_id, str)
-                or not isinstance(pack_version, str)
-                or not isinstance(dataset_id, str)
-                or not isinstance(dataset_fingerprint, str)
-                or not isinstance(config, dict)
-            ):
+            identity = evidence_identity(receipt)
+            if identity is None:
                 continue
-            try:
-                config_json = json.dumps(
-                    config,
-                    sort_keys=True,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    separators=(",", ":"),
-                )
-            except (TypeError, ValueError):
-                continue
-            key = (
-                pack_id,
-                pack_version,
-                receipt.evaluator_id,
-                receipt.evaluator_version,
-                dataset_id,
-                dataset_fingerprint,
-                config_json,
-            )
-            result.setdefault(key, receipt)
+            identity_json, metadata = identity
+            result.setdefault(identity_json, (receipt, metadata))
         return result
 
     champion_receipts = keyed_receipts(champion_model_id)
@@ -4406,8 +4557,8 @@ def _stored_raw_evaluation_comparisons(
     comparisons: list[dict[str, object]] = []
 
     for evidence_key in sorted(champion_receipts.keys() & candidate_receipts.keys()):
-        champion_receipt = champion_receipts[evidence_key]
-        candidate_receipt = candidate_receipts[evidence_key]
+        champion_receipt, metadata = champion_receipts[evidence_key]
+        candidate_receipt, _ = candidate_receipts[evidence_key]
         champion_map = _raw_measurement_map(
             [asdict(item) for item in champion_receipt.measurements]
         )
@@ -4435,29 +4586,210 @@ def _stored_raw_evaluation_comparisons(
                     "champion_value": champion_value,
                     "candidate_value": candidate_value,
                     "raw_delta": raw_delta,
-                    "improvement_delta": (
-                        raw_delta if champion_direction else -raw_delta
-                    ),
+                    "improvement_delta": (raw_delta if champion_direction else -raw_delta),
                 }
             )
         if direction_mismatch:
             continue
 
-        comparisons.append(
-            {
-                "pack_id": evidence_key[0],
-                "pack_version": evidence_key[1],
-                "evaluator_id": evidence_key[2],
-                "evaluator_version": evidence_key[3],
-                "dataset_id": evidence_key[4],
-                "dataset_fingerprint": evidence_key[5],
-                "config": json.loads(evidence_key[6]),
-                "champion_receipt_id": champion_receipt.receipt_id,
-                "candidate_receipt_id": candidate_receipt.receipt_id,
-                "measurements": measurements,
-            }
-        )
+        comparison: dict[str, object] = {
+            **metadata,
+            "champion_receipt_id": champion_receipt.receipt_id,
+            "candidate_receipt_id": candidate_receipt.receipt_id,
+            "measurements": measurements,
+        }
+        comparisons.append(comparison)
     return comparisons
+
+
+def _resource_headroom_from_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
+    """Summarize point-in-time system availability without claiming model fit.
+
+    These values describe what the OS/driver reported when resources were detected.
+    They are not a model-specific peak-memory receipt. Frontierwright must combine a
+    future/current model runtime profile with this evidence before claiming how much
+    headroom remains *after loading a model*.
+    """
+
+    def amount(value: object) -> int | None:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
+
+    def fraction(free: int | None, total: int | None) -> float | None:
+        if free is None or total is None or total <= 0:
+            return None
+        return min(1.0, max(0.0, free / total))
+
+    ram_total = amount(snapshot.get("ram_total_bytes"))
+    ram_available = amount(snapshot.get("ram_available_bytes"))
+    disk_total = amount(snapshot.get("disk_total_bytes"))
+    disk_free = amount(snapshot.get("disk_free_bytes"))
+
+    gpus: list[dict[str, object]] = []
+    raw_gpus = snapshot.get("gpus")
+    if isinstance(raw_gpus, list):
+        for index, raw in enumerate(raw_gpus):
+            if not isinstance(raw, dict):
+                continue
+            total = amount(raw.get("memory_total_bytes"))
+            free = amount(raw.get("memory_free_bytes"))
+            gpus.append(
+                {
+                    "index": index,
+                    "vendor": raw.get("vendor"),
+                    "name": raw.get("name"),
+                    "memory_total_bytes": total,
+                    "memory_available_bytes": free,
+                    "available_fraction": fraction(free, total),
+                }
+            )
+
+    return {
+        "semantics": "SYSTEM_AVAILABLE_NOW",
+        "model_specific": False,
+        "note": (
+            "Point-in-time OS/driver availability. Run a model/inference profile "
+            "before treating this as post-load model headroom."
+        ),
+        "ram_available_bytes": ram_available,
+        "ram_total_bytes": ram_total,
+        "ram_available_fraction": fraction(ram_available, ram_total),
+        "disk_available_bytes": disk_free,
+        "disk_total_bytes": disk_total,
+        "disk_available_fraction": fraction(disk_free, disk_total),
+        "gpus": gpus,
+    }
+
+
+def _latest_model_fit_from_state(
+    state: ProjectState, model_id: str | None = None
+) -> dict[str, object]:
+    if model_id is None:
+        if state.champion is None:
+            return {}
+        model_id = state.champion.model.model_id
+    for event in reversed(state.history):
+        if event.get("kind") != "INFERENCE_PROFILE_MEASURED":
+            continue
+        details = event.get("details")
+        if not isinstance(details, dict) or details.get("model_id") != model_id:
+            continue
+        metrics = details.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+
+        total = metrics.get("cuda_memory_total_bytes")
+        free_min = metrics.get("cuda_memory_free_min_sampled_bytes")
+        free_fraction: float | None = None
+        if (
+            isinstance(total, int)
+            and not isinstance(total, bool)
+            and total > 0
+            and isinstance(free_min, int)
+            and not isinstance(free_min, bool)
+            and free_min >= 0
+        ):
+            free_fraction = min(1.0, max(0.0, free_min / total))
+
+        return {
+            "semantics": "MEASURED_INFERENCE_PROFILE",
+            "model_id": model_id,
+            "model_fingerprint": details.get("model_fingerprint"),
+            "measured_at": event.get("created_at"),
+            "measurement_scope": metrics.get("measurement_scope"),
+            "execution_boundary": metrics.get("execution_boundary", "LOCAL_MACHINE"),
+            "device": metrics.get("device"),
+            "source_adapter": metrics.get("source_adapter"),
+            "source_adapter_version": metrics.get("source_adapter_version"),
+            "source_sha256": metrics.get("source_sha256"),
+            "profile_condition_hash": metrics.get("profile_condition_hash"),
+            "latency_seconds_p50": metrics.get("latency_seconds_p50"),
+            "tokens_per_second_p50": metrics.get("tokens_per_second_p50"),
+            "ttft_seconds_p50": metrics.get("ttft_seconds_p50"),
+            "tpot_seconds_p50": metrics.get("tpot_seconds_p50"),
+            "itl_seconds_p50": metrics.get("itl_seconds_p50"),
+            "request_throughput_per_second": metrics.get("request_throughput_per_second"),
+            "output_tokens_per_second_aggregate": metrics.get("output_tokens_per_second_aggregate"),
+            "total_tokens_per_second_aggregate": metrics.get("total_tokens_per_second_aggregate"),
+            "max_sampled_process_rss_bytes": metrics.get("max_sampled_process_rss_bytes"),
+            "peak_vram_bytes": metrics.get("peak_vram_bytes"),
+            "cuda_memory_total_bytes": total,
+            "cuda_memory_free_min_sampled_bytes": free_min,
+            "cuda_memory_free_after_profile_bytes": metrics.get(
+                "cuda_memory_free_after_profile_bytes"
+            ),
+            "cuda_memory_free_fraction_min_sampled": free_fraction,
+            "max_new_tokens": metrics.get("max_new_tokens"),
+            "measured_runs": metrics.get("measured_runs"),
+            "context_length": metrics.get("context_length"),
+            "note": (
+                "Measured during the recorded local inference profile for this exact model. "
+                "CUDA free-memory values are device-level samples; PyTorch peak allocation "
+                "is reported separately."
+            ),
+        }
+    return {}
+
+
+def import_vllm_serving_evidence(
+    root: Path,
+    *,
+    result_path: Path,
+    model_id: str | None,
+    vllm_version: str,
+    execution_boundary: BackendDataBoundary,
+) -> VLLMServingImport:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before importing serving evidence.",
+            10,
+        )
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "Specify --model or establish a Champion before importing serving evidence.",
+                12,
+            )
+        target_model_id = state.champion.model.model_id
+    model = registry.get_model(target_model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+    imported = import_vllm_bench_serve(
+        result_path,
+        vllm_version=vllm_version,
+        execution_boundary=execution_boundary,
+    )
+    for event in reversed(state.history):
+        if event.get("kind") != "INFERENCE_PROFILE_MEASURED":
+            continue
+        details = event.get("details")
+        if not isinstance(details, dict) or details.get("model_id") != model.model_id:
+            continue
+        metrics = details.get("metrics")
+        if not isinstance(metrics, dict):
+            continue
+        if (
+            metrics.get("source_adapter") == imported.metrics.get("source_adapter")
+            and metrics.get("source_sha256") == imported.source_sha256
+            and metrics.get("vllm_version") == imported.vllm_version
+            and metrics.get("execution_boundary") == execution_boundary.value
+        ):
+            return imported
+    registry.record_event(
+        "INFERENCE_PROFILE_MEASURED",
+        {
+            "model_id": model.model_id,
+            "model_fingerprint": model.fingerprint,
+            "metrics": imported.metrics,
+            "provenance": "IMPORTED_VLLM_BENCH_SERVE",
+        },
+    )
+    return imported
 
 
 def get_resource_view(root: Path) -> ResourceView:
@@ -4475,6 +4807,8 @@ def get_resource_view(root: Path) -> ResourceView:
         provenance=profile["provenance"],
         detected_at=profile["created_at"],
         snapshot=profile["snapshot"],
+        headroom=_resource_headroom_from_snapshot(profile["snapshot"]),
+        model_fit=_latest_model_fit_from_state(state),
     )
 
 
@@ -4489,6 +4823,125 @@ def detect_resources(root: Path) -> ResourceView:
     snapshot = detect_local_resources(root)
     registry.save_resource_snapshot(snapshot, profile_name="local")
     return get_resource_view(root)
+
+
+def get_workload_view(root: Path) -> WorkloadView:
+    registry = Registry(root)
+    if not registry.exists:
+        return WorkloadView()
+    stored = registry.get_active_workload_profile()
+    if stored is None:
+        return WorkloadView()
+    raw_profile = stored.get("profile")
+    profile = dict(raw_profile) if isinstance(raw_profile, dict) else {}
+    return WorkloadView(
+        configured=True,
+        profile_id=(
+            str(stored["profile_id"]) if isinstance(stored.get("profile_id"), str) else None
+        ),
+        profile_hash=(
+            str(stored["profile_hash"]) if isinstance(stored.get("profile_hash"), str) else None
+        ),
+        profile_name=(
+            str(stored["profile_name"]) if isinstance(stored.get("profile_name"), str) else None
+        ),
+        source=(str(stored["source"]) if isinstance(stored.get("source"), str) else None),
+        created_at=(
+            str(stored["created_at"]) if isinstance(stored.get("created_at"), str) else None
+        ),
+        profile=profile,
+    )
+
+
+def set_workload_profile(root: Path, profile: WorkloadProfile) -> WorkloadView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before setting its workload.",
+            10,
+        )
+    registry.save_workload_profile(profile)
+    return get_workload_view(root)
+
+
+def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView:
+    registry = Registry(root)
+    if not registry.exists:
+        return WorkloadFitView(note="Project is not initialized.")
+
+    stored = registry.get_active_workload_profile()
+    if stored is None:
+        return WorkloadFitView(
+            note="Define a workload profile before judging user-specific model fit."
+        )
+    raw_profile = stored.get("profile")
+    if not isinstance(raw_profile, dict):
+        raise FrontierwrightError(
+            "REGISTRY_ERROR",
+            "Active workload profile payload is invalid.",
+            4,
+        )
+    profile = workload_profile_from_payload(dict(raw_profile))
+
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None and state.champion is not None:
+        target_model_id = state.champion.model.model_id
+    if target_model_id is None:
+        return WorkloadFitView(
+            configured=True,
+            workload_profile_id=str(stored.get("profile_id")),
+            workload_profile_hash=str(stored.get("profile_hash")),
+            overall_status="UNKNOWN",
+            note="No model exists yet, so workload fit cannot be measured.",
+        )
+
+    model = registry.get_model(target_model_id)
+    stats = get_stats_view(root, target_model_id).stats
+    model_fit = _latest_model_fit_from_state(state, target_model_id)
+    raw_context_length = model_fit.get("context_length")
+    supported_context_tokens = (
+        raw_context_length
+        if isinstance(raw_context_length, int)
+        and not isinstance(raw_context_length, bool)
+        and raw_context_length > 0
+        else None
+    )
+    assessment = assess_workload_fit(
+        profile,
+        capability_stats=stats,
+        inference_metrics=model_fit,
+        supported_context_tokens=supported_context_tokens,
+        workload_eval_coverage=None,
+        serving_boundary=(
+            str(model_fit["execution_boundary"])
+            if isinstance(model_fit.get("execution_boundary"), str)
+            else None
+        ),
+    )
+    payload = assessment.to_payload()
+    counts = payload.get("counts")
+    constraints = payload.get("constraints")
+    return WorkloadFitView(
+        configured=True,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        workload_profile_id=str(stored.get("profile_id")),
+        workload_profile_hash=str(stored.get("profile_hash")),
+        overall_status=assessment.overall_status.value,
+        counts=(
+            {str(key): int(value) for key, value in counts.items()}
+            if isinstance(counts, dict)
+            else {}
+        ),
+        constraints=(
+            [dict(item) for item in constraints if isinstance(item, dict)]
+            if isinstance(constraints, list)
+            else []
+        ),
+        note=str(payload.get("note")) if payload.get("note") else None,
+    )
 
 
 def import_local_model(
@@ -4575,8 +5028,7 @@ def get_build_view(root: Path) -> BuildView:
 
     state = registry.read()
     profile_measured = bool(
-        state.capability_profile is not None
-        and state.capability_profile.get("stats")
+        state.capability_profile is not None and state.capability_profile.get("stats")
     )
     if profile_measured:
         mode = BuildMode.TARGETS_FLOORS
@@ -4621,9 +5073,7 @@ def get_build_view(root: Path) -> BuildView:
             scale_bound=bound,
             scale_hash=scale_hash if isinstance(scale_hash, str) else None,
             scale_id=scale_id if isinstance(scale_id, str) else None,
-            scale_version=(
-                scale_version if isinstance(scale_version, str) else None
-            ),
+            scale_version=(scale_version if isinstance(scale_version, str) else None),
             reason=(
                 None
                 if bound
@@ -4778,7 +5228,6 @@ def get_data_preparation_plugins() -> list[dict[str, object]]:
     ]
 
 
-
 def _resolve_preparation_sources(
     state: ProjectState,
     plugin: DataPreparationPlugin,
@@ -4816,10 +5265,7 @@ def _resolve_preparation_sources(
         if descriptor.fingerprint != binding.fingerprint:
             raise FrontierwrightError(
                 "DATASET_CONTENT_DRIFT",
-                (
-                    "Preparation source content changed after registration: "
-                    f"{binding.dataset_id}"
-                ),
+                (f"Preparation source content changed after registration: {binding.dataset_id}"),
                 13,
             )
         resolved[binding.dataset_id] = descriptor
@@ -4859,10 +5305,10 @@ def preflight_prepare_dataset(
             "preference-jsonl requires a PREFERENCE dataset.",
             12,
         )
-    if (
-        source_role == DatasetRole.PREFERENCE.value
-        and plugin_id not in {SNAPSHOT_COPY_PLUGIN_ID, PREFERENCE_JSONL_PLUGIN_ID}
-    ):
+    if source_role == DatasetRole.PREFERENCE.value and plugin_id not in {
+        SNAPSHOT_COPY_PLUGIN_ID,
+        PREFERENCE_JSONL_PLUGIN_ID,
+    }:
         raise FrontierwrightError(
             "DATA_RECIPE_ROLE_INCOMPATIBLE",
             "PREFERENCE datasets may only use snapshot-copy or preference-jsonl preparation.",
@@ -4951,11 +5397,7 @@ def prepare_dataset(
 
     state = registry.read()
     source = next(
-        (
-            item
-            for item in state.datasets
-            if item.get("dataset_id") == dataset_id
-        ),
+        (item for item in state.datasets if item.get("dataset_id") == dataset_id),
         None,
     )
     if source is None:
@@ -4972,16 +5414,13 @@ def prepare_dataset(
             "preference-jsonl requires a PREFERENCE dataset.",
             12,
         )
-    if (
-        source_role == DatasetRole.PREFERENCE.value
-        and plugin_id not in {SNAPSHOT_COPY_PLUGIN_ID, PREFERENCE_JSONL_PLUGIN_ID}
-    ):
+    if source_role == DatasetRole.PREFERENCE.value and plugin_id not in {
+        SNAPSHOT_COPY_PLUGIN_ID,
+        PREFERENCE_JSONL_PLUGIN_ID,
+    }:
         raise FrontierwrightError(
             "DATA_RECIPE_ROLE_INCOMPATIBLE",
-            (
-                "PREFERENCE datasets may only use snapshot-copy or "
-                "preference-jsonl preparation."
-            ),
+            ("PREFERENCE datasets may only use snapshot-copy or preference-jsonl preparation."),
             12,
         )
 
@@ -5047,7 +5486,6 @@ def prepare_dataset_snapshot(
         config=None,
         name=name,
     )
-
 
 
 def preflight_prepare_dataset_mixture(
@@ -5129,9 +5567,7 @@ def preflight_prepare_dataset_mixture(
                 13,
             )
         selected.append(row)
-        source_specs.append(
-            {"dataset_id": dataset_id, "fingerprint": fingerprint, "parts": parts}
-        )
+        source_specs.append({"dataset_id": dataset_id, "fingerprint": fingerprint, "parts": parts})
 
     roles = {str(item["role"]) for item in selected}
     provenances = {str(item["provenance"]) for item in selected}
@@ -5294,9 +5730,7 @@ def prepare_dataset_mixture(
         DatasetClassification.CONFIDENTIAL: 2,
         DatasetClassification.PRIVATE: 3,
     }
-    classifications = [
-        DatasetClassification(str(item["classification"])) for item in selected
-    ]
+    classifications = [DatasetClassification(str(item["classification"])) for item in selected]
     effective_classification = max(
         classifications,
         key=lambda item: classification_rank[item],
@@ -5350,6 +5784,8 @@ def _required_dataset_role(path_id: TrainingPathId) -> DatasetRole:
         return DatasetRole.PRETRAIN
     if path_id is TrainingPathId.DPO:
         return DatasetRole.PREFERENCE
+    if path_id is TrainingPathId.RL_POLICY_OPTIMIZATION:
+        return DatasetRole.ROLLOUT
     return DatasetRole.SFT
 
 
@@ -5388,9 +5824,7 @@ def _find_dataset(
         )
     if len(matching) > 1:
         prepared = [
-            item
-            for item in matching
-            if isinstance(item.get("preparation_recipe_hash"), str)
+            item for item in matching if isinstance(item.get("preparation_recipe_hash"), str)
         ]
         if len(prepared) == 1:
             return prepared[0]
@@ -5436,11 +5870,7 @@ def _plan_input_blockers(
                             blockers.append("pinned model content fingerprint drifted")
 
     dataset = next(
-        (
-            item
-            for item in project_state.datasets
-            if item.get("dataset_id") == plan.dataset_id
-        ),
+        (item for item in project_state.datasets if item.get("dataset_id") == plan.dataset_id),
         None,
     )
     if dataset is None:
@@ -5491,11 +5921,7 @@ def _accounted_gpu_count(
     backend_result = calibration.get("backend_result")
     backend_map = backend_result if isinstance(backend_result, dict) else {}
     reported = backend_map.get("gpu_count")
-    if (
-        isinstance(reported, int)
-        and not isinstance(reported, bool)
-        and reported > 0
-    ):
+    if isinstance(reported, int) and not isinstance(reported, bool) and reported > 0:
         return reported, "CALIBRATION_REPORTED"
 
     if resource_profile is not None:
@@ -5524,10 +5950,7 @@ def _calibration_budget_blockers(
         blockers.append("calibration did not project total wall time")
     if calibration.get("projected_storage_bytes") is None:
         blockers.append("calibration did not project new storage")
-    if (
-        calibration.get("peak_vram_bytes") is None
-        and calibration.get("peak_ram_bytes") is None
-    ):
+    if calibration.get("peak_vram_bytes") is None and calibration.get("peak_ram_bytes") is None:
         blockers.append("calibration did not measure peak memory")
 
     budgets = plan.budgets
@@ -5566,16 +5989,12 @@ def _calibration_budget_blockers(
 
     if budgets.max_money is not None:
         projected_money = backend_map.get("projected_money")
-        if not isinstance(projected_money, (int, float)) or isinstance(
-            projected_money, bool
-        ):
+        if not isinstance(projected_money, (int, float)) or isinstance(projected_money, bool):
             blockers.append("money budget cannot be evaluated without projected_money")
         elif float(projected_money) > budgets.max_money:
             blockers.append("projected money exceeds max_money budget")
         else:
-            blockers.append(
-                "max_money cannot be hard-enforced by the local executor yet"
-            )
+            blockers.append("max_money cannot be hard-enforced by the local executor yet")
 
     return blockers
 
@@ -5601,9 +6020,7 @@ def _budget_enforcement_modes(
             if gpu_count is None or provenance is None:
                 modes["max_gpu_hours"] = "UNAVAILABLE_WITHOUT_GPU_COUNT"
             else:
-                modes["max_gpu_hours"] = (
-                    f"HARD_ACCOUNTED_TIMEOUT:{provenance}"
-                )
+                modes["max_gpu_hours"] = f"HARD_ACCOUNTED_TIMEOUT:{provenance}"
     if plan.budgets.max_storage_bytes is not None:
         modes["max_storage_bytes"] = "RUNTIME_WATCHDOG_AND_FINALIZATION_GATE"
     if plan.budgets.max_money is not None:
@@ -5644,6 +6061,7 @@ def _resolve_backend_adapter(
     if not {
         LabAdapterKind.TRAINER.value,
         LabAdapterKind.EXECUTOR.value,
+        LabAdapterKind.CLUSTER_EXECUTOR.value,
     }.intersection(kinds):
         raise FrontierwrightError(
             "LAB_ADAPTER_KIND_UNSUPPORTED",
@@ -5666,6 +6084,46 @@ def _resolve_backend_adapter(
     return adapter_ref, manifest_hash
 
 
+def _validate_rl_backend_adapter(
+    registry: Registry,
+    adapter_ref: str,
+    spec: RLExperimentSpec,
+) -> None:
+    adapter = registry.get_lab_adapter(adapter_ref)
+    if adapter is None:
+        raise FrontierwrightError(
+            "LAB_ADAPTER_NOT_CONNECTED",
+            f"RL backend references an unconnected Lab adapter: {adapter_ref}",
+            12,
+        )
+    kinds = set(adapter.get("kinds", []))
+    required_kinds = {
+        LabAdapterKind.TRAINER.value,
+        LabAdapterKind.ROLLOUT_ENGINE.value,
+        LabAdapterKind.REWARD_PROVIDER.value,
+    }
+    missing_kinds = sorted(required_kinds - kinds)
+    if missing_kinds:
+        raise FrontierwrightError(
+            "LAB_RL_ADAPTER_INCOMPLETE",
+            "Lab RL adapter is missing required roles: " + ", ".join(missing_kinds),
+            12,
+        )
+    capabilities = set(adapter.get("capabilities", []))
+    required_capabilities = {
+        f"rl.algorithm.{spec.algorithm_id}",
+        f"environment.kind.{spec.environment.kind}",
+        f"reward.kind.{spec.reward.kind}",
+    }
+    missing_capabilities = sorted(required_capabilities - capabilities)
+    if missing_capabilities:
+        raise FrontierwrightError(
+            "LAB_RL_CAPABILITY_UNSUPPORTED",
+            "Lab RL adapter does not declare: " + ", ".join(missing_capabilities),
+            12,
+        )
+
+
 def _lab_adapter_blockers(registry: Registry, plan: TrainingPlan) -> list[str]:
     if plan.backend_adapter_ref is None:
         if plan.backend_data_boundary == BackendDataBoundary.CONTROLLED_PRIVATE.value:
@@ -5685,6 +6143,7 @@ def _lab_adapter_blockers(registry: Registry, plan: TrainingPlan) -> list[str]:
     if not {
         LabAdapterKind.TRAINER.value,
         LabAdapterKind.EXECUTOR.value,
+        LabAdapterKind.CLUSTER_EXECUTOR.value,
     }.intersection(kinds):
         return ["pinned Lab adapter no longer provides trainer/executor capability"]
     return []
@@ -5696,9 +6155,7 @@ def get_plan_view(root: Path, plan_id: str) -> PlanView:
     state = registry.read()
     calibration = registry.latest_calibration_for_plan(plan.plan_id)
     blockers = _plan_input_blockers(registry, state, plan)
-    blockers.extend(
-        _calibration_budget_blockers(plan, calibration, state.resource_profile)
-    )
+    blockers.extend(_calibration_budget_blockers(plan, calibration, state.resource_profile))
     return PlanView(
         plan_id=plan.plan_id,
         path_id=plan.path_id.value,
@@ -5778,6 +6235,11 @@ def create_training_plan(
         role=_required_dataset_role(path_id),
     )
     intervention = intervention_for_training_path(path_id)
+    rl_spec: RLExperimentSpec | None = None
+    if path_id is TrainingPathId.RL_POLICY_OPTIMIZATION:
+        # Parsing here makes environment/reward/algorithm identity mandatory before
+        # plan hashing. The exact nested RL spec therefore participates in idempotency.
+        rl_spec = rl_spec_from_config(config)
     try:
         dataset_classification = DatasetClassification(str(dataset["classification"]))
     except (KeyError, ValueError) as exc:
@@ -5801,6 +6263,8 @@ def create_training_plan(
         state,
         backend,
     )
+    if rl_spec is not None and backend_adapter_ref is not None:
+        _validate_rl_backend_adapter(registry, backend_adapter_ref, rl_spec)
 
     try:
         key = compute_plan_idempotency_key(
@@ -5855,11 +6319,7 @@ def create_training_plan(
             if state.champion is not None
             and state.champion_artifact is not None
             and isinstance(state.champion_artifact.get("source_path"), str)
-            else (
-                state.champion.model.checkpoint
-                if state.champion is not None
-                else None
-            )
+            else (state.champion.model.checkpoint if state.champion is not None else None)
         ),
         dataset_id=str(dataset["dataset_id"]),
         dataset_fingerprint=str(dataset["fingerprint"]),
@@ -6014,10 +6474,7 @@ def calibrate_training_plan(
 
     calibration_id = f"calibration-{uuid4().hex}"
     request_path = (
-        registry.state_dir
-        / "profiles"
-        / "calibrations"
-        / f"{calibration_id}-request.json"
+        registry.state_dir / "profiles" / "calibrations" / f"{calibration_id}-request.json"
     )
     receipt = run_calibration_backend(
         backend,
@@ -6095,11 +6552,7 @@ def _run_usage_from_result(result: dict[str, object]) -> RunUsage | None:
                 if raw.get("output_storage_bytes") is not None
                 else None
             ),
-            gpu_count=(
-                int(raw["gpu_count"])
-                if raw.get("gpu_count") is not None
-                else None
-            ),
+            gpu_count=(int(raw["gpu_count"]) if raw.get("gpu_count") is not None else None),
             gpu_count_provenance=(
                 str(raw["gpu_count_provenance"])
                 if raw.get("gpu_count_provenance") is not None
@@ -6110,14 +6563,8 @@ def _run_usage_from_result(result: dict[str, object]) -> RunUsage | None:
                 if raw.get("accounted_gpu_hours") is not None
                 else None
             ),
-            money_spent=(
-                float(raw["money_spent"])
-                if raw.get("money_spent") is not None
-                else None
-            ),
-            measured_by=str(
-                raw.get("measured_by") or "frontierwright-local-executor-v1"
-            ),
+            money_spent=(float(raw["money_spent"]) if raw.get("money_spent") is not None else None),
+            measured_by=str(raw.get("measured_by") or "frontierwright-local-executor-v1"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise FrontierwrightError(
@@ -6181,9 +6628,7 @@ def reconcile_training_run(root: Path, run_id: str) -> RunView:
     result = attempt.get("result")
     result_path_raw = attempt.get("result_path")
     result_path = (
-        Path(result_path_raw)
-        if isinstance(result_path_raw, str) and result_path_raw
-        else None
+        Path(result_path_raw) if isinstance(result_path_raw, str) and result_path_raw else None
     )
 
     if result is None and result_path is not None and result_path.is_file():
@@ -6268,9 +6713,7 @@ def reconcile_training_run(root: Path, run_id: str) -> RunView:
                 run_id,
                 status=RunStatus.INCOMPLETE,
                 error_code="STORAGE_BUDGET_REACHED",
-                error_message=(
-                    "Measured executor output exceeds max_storage_bytes budget."
-                ),
+                error_message=("Measured executor output exceeds max_storage_bytes budget."),
             )
             return get_run_view(root, run_id)
 
@@ -6405,9 +6848,7 @@ def execute_training_plan(
                         13,
                     )
 
-    required_permission = (
-        PermissionLevel.DRY_RUN if dry_run else PermissionLevel.EXECUTE_SINGLE
-    )
+    required_permission = PermissionLevel.DRY_RUN if dry_run else PermissionLevel.EXECUTE_SINGLE
     if plan.permission < required_permission:
         raise FrontierwrightError(
             "PERMISSION_DENIED",
@@ -6672,9 +7113,7 @@ def _promotion_blockers(
         blockers.append(
             {
                 "code": "CAPABILITY_SCALE_MISMATCH",
-                "message": (
-                    "Champion and candidate do not use the same frozen capability scale."
-                ),
+                "message": ("Champion and candidate do not use the same frozen capability scale."),
                 "override": "--allow-unmeasured",
             }
         )
@@ -6738,6 +7177,189 @@ def _promotion_blockers(
     return blockers
 
 
+def _candidate_pareto_evidence(
+    registry: Registry,
+    *,
+    champion_model_id: str,
+    candidate_model_id: str,
+    champion_stats: StatsView,
+    candidate_stats: StatsView,
+    scale_comparable: bool,
+) -> dict[str, object]:
+    state = registry.read()
+    champion_profile = _latest_model_fit_from_state(state, champion_model_id)
+    candidate_profile = _latest_model_fit_from_state(state, candidate_model_id)
+
+    inference_comparable = bool(champion_profile and candidate_profile)
+    mismatch: list[str] = []
+    if inference_comparable:
+        champion_contract = champion_profile.get("profile_condition_hash")
+        candidate_contract = candidate_profile.get("profile_condition_hash")
+        if isinstance(champion_contract, str) or isinstance(candidate_contract, str):
+            if not (
+                isinstance(champion_contract, str)
+                and isinstance(candidate_contract, str)
+                and champion_contract == candidate_contract
+            ):
+                mismatch.append("profile_condition_hash")
+            for key in ("measurement_scope", "execution_boundary"):
+                if champion_profile.get(key) != candidate_profile.get(key):
+                    mismatch.append(key)
+        else:
+            for key in (
+                "measurement_scope",
+                "execution_boundary",
+                "device",
+                "max_new_tokens",
+            ):
+                if champion_profile.get(key) != candidate_profile.get(key):
+                    mismatch.append(key)
+        inference_comparable = not mismatch
+
+    metrics: list[ParetoMetricInput] = []
+    capability_source = (
+        f"CAPABILITY_SCALE:{champion_stats.scale_hash}"
+        if scale_comparable and champion_stats.scale_hash is not None
+        else None
+    )
+    for axis in ("general", "reasoning", "math", "coding"):
+        metrics.append(
+            ParetoMetricInput(
+                key=f"capability.{axis}",
+                category="CAPABILITY",
+                direction=ParetoDirection.HIGHER_BETTER,
+                champion_value=(champion_stats.stats.get(axis) if scale_comparable else None),
+                candidate_value=(candidate_stats.stats.get(axis) if scale_comparable else None),
+                unit="frontierwright-capability-v1",
+                evidence_source=capability_source,
+            )
+        )
+
+    def measured(profile: dict[str, object], key: str) -> float | int | None:
+        if not inference_comparable:
+            return None
+        value = profile.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return value
+
+    inference_source = "INFERENCE_PROFILE_COMPARABLE" if inference_comparable else None
+    metrics.extend(
+        [
+            ParetoMetricInput(
+                key="serving.latency_p50",
+                category="SERVING",
+                direction=ParetoDirection.LOWER_BETTER,
+                champion_value=measured(champion_profile, "latency_seconds_p50"),
+                candidate_value=measured(candidate_profile, "latency_seconds_p50"),
+                unit="seconds",
+                evidence_source=inference_source,
+            ),
+            ParetoMetricInput(
+                key="serving.throughput_p50",
+                category="SERVING",
+                direction=ParetoDirection.HIGHER_BETTER,
+                champion_value=measured(champion_profile, "tokens_per_second_p50"),
+                candidate_value=measured(candidate_profile, "tokens_per_second_p50"),
+                unit="tokens/second",
+                evidence_source=inference_source,
+            ),
+            ParetoMetricInput(
+                key="serving.ttft_p50",
+                category="SERVING",
+                direction=ParetoDirection.LOWER_BETTER,
+                champion_value=measured(champion_profile, "ttft_seconds_p50"),
+                candidate_value=measured(candidate_profile, "ttft_seconds_p50"),
+                unit="seconds",
+                evidence_source=inference_source,
+            ),
+            ParetoMetricInput(
+                key="serving.tpot_p50",
+                category="SERVING",
+                direction=ParetoDirection.LOWER_BETTER,
+                champion_value=measured(champion_profile, "tpot_seconds_p50"),
+                candidate_value=measured(candidate_profile, "tpot_seconds_p50"),
+                unit="seconds/token",
+                evidence_source=inference_source,
+            ),
+            ParetoMetricInput(
+                key="serving.itl_p50",
+                category="SERVING",
+                direction=ParetoDirection.LOWER_BETTER,
+                champion_value=measured(champion_profile, "itl_seconds_p50"),
+                candidate_value=measured(candidate_profile, "itl_seconds_p50"),
+                unit="seconds",
+                evidence_source=inference_source,
+            ),
+            ParetoMetricInput(
+                key="serving.output_throughput_aggregate",
+                category="SERVING",
+                direction=ParetoDirection.HIGHER_BETTER,
+                champion_value=measured(champion_profile, "output_tokens_per_second_aggregate"),
+                candidate_value=measured(candidate_profile, "output_tokens_per_second_aggregate"),
+                unit="tokens/second",
+                evidence_source=inference_source,
+            ),
+            ParetoMetricInput(
+                key="resource.peak_vram",
+                category="RESOURCE",
+                direction=ParetoDirection.LOWER_BETTER,
+                champion_value=measured(champion_profile, "peak_vram_bytes"),
+                candidate_value=measured(candidate_profile, "peak_vram_bytes"),
+                unit="bytes",
+                evidence_source=inference_source,
+            ),
+            ParetoMetricInput(
+                key="resource.process_rss",
+                category="RESOURCE",
+                direction=ParetoDirection.LOWER_BETTER,
+                champion_value=measured(champion_profile, "max_sampled_process_rss_bytes"),
+                candidate_value=measured(candidate_profile, "max_sampled_process_rss_bytes"),
+                unit="bytes",
+                evidence_source=inference_source,
+            ),
+        ]
+    )
+
+    champion_artifact = registry.get_model_artifact(champion_model_id) or {}
+    candidate_artifact = registry.get_model_artifact(candidate_model_id) or {}
+    metrics.append(
+        ParetoMetricInput(
+            key="storage.model_artifact",
+            category="RESOURCE",
+            direction=ParetoDirection.LOWER_BETTER,
+            champion_value=(
+                champion_artifact.get("total_bytes")
+                if isinstance(champion_artifact.get("total_bytes"), int)
+                else None
+            ),
+            candidate_value=(
+                candidate_artifact.get("total_bytes")
+                if isinstance(candidate_artifact.get("total_bytes"), int)
+                else None
+            ),
+            unit="bytes",
+            evidence_source="MODEL_ARTIFACT_MANIFEST",
+        )
+    )
+
+    payload = compare_pareto_metrics(metrics).to_payload()
+    payload["inference_profile_comparable"] = inference_comparable
+    if not champion_profile or not candidate_profile:
+        payload["inference_profile_reason"] = (
+            "Profile both Champion and Candidate before comparing runtime/resource dimensions."
+        )
+    elif mismatch:
+        payload["inference_profile_reason"] = (
+            "Inference profiles use different conditions: " + ", ".join(mismatch)
+        )
+    else:
+        payload["inference_profile_reason"] = (
+            "Champion and Candidate inference profiles use comparable measured conditions."
+        )
+    return payload
+
+
 def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
     registry = Registry(root)
     state = registry.read()
@@ -6788,6 +7410,57 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
         constraints=constraints,
     )
 
+    champion_workload = get_workload_fit(root, state.champion.model.model_id)
+    candidate_workload = get_workload_fit(root, candidate.model.model_id)
+    champion_constraints = {
+        str(item.get("key")): item
+        for item in champion_workload.constraints
+        if isinstance(item.get("key"), str)
+    }
+    candidate_constraints = {
+        str(item.get("key")): item
+        for item in candidate_workload.constraints
+        if isinstance(item.get("key"), str)
+    }
+    workload_regressions: list[dict[str, object]] = []
+    for key, champion_constraint in champion_constraints.items():
+        candidate_constraint = candidate_constraints.get(key)
+        if candidate_constraint is None:
+            continue
+        champion_status = champion_constraint.get("status")
+        candidate_status = candidate_constraint.get("status")
+        if champion_status == "PASS" and candidate_status != "PASS":
+            workload_regressions.append(
+                {
+                    "key": key,
+                    "champion_status": champion_status,
+                    "candidate_status": candidate_status,
+                    "champion_observed": champion_constraint.get("observed"),
+                    "candidate_observed": candidate_constraint.get("observed"),
+                    "requirement": candidate_constraint.get("requirement"),
+                }
+            )
+    workload_comparison: dict[str, object] = {
+        "configured": champion_workload.configured or candidate_workload.configured,
+        "profile_id": candidate_workload.workload_profile_id,
+        "profile_hash": candidate_workload.workload_profile_hash,
+        "champion": champion_workload.to_dict(),
+        "candidate": candidate_workload.to_dict(),
+        "regressions": workload_regressions,
+        "note": (
+            "Workload fit remains constraint-by-constraint evidence; no synthetic utility "
+            "score is used for promotion decisions."
+        ),
+    }
+    pareto = _candidate_pareto_evidence(
+        registry,
+        champion_model_id=state.champion.model.model_id,
+        candidate_model_id=candidate.model.model_id,
+        champion_stats=champion_stats,
+        candidate_stats=candidate_stats,
+        scale_comparable=comparable,
+    )
+
     run = next(
         (
             item
@@ -6800,11 +7473,7 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
     if run is not None:
         run_plan_id = run.get("plan_id")
         calibration = next(
-            (
-                item
-                for item in reversed(state.calibrations)
-                if item.get("plan_id") == run_plan_id
-            ),
+            (item for item in reversed(state.calibrations) if item.get("plan_id") == run_plan_id),
             None,
         )
 
@@ -6830,6 +7499,8 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
             champion_model_id=state.champion.model.model_id,
             candidate_model_id=candidate.model.model_id,
         ),
+        workload_comparison=workload_comparison,
+        pareto=pareto,
         run=dict(run) if run is not None else None,
         calibration=dict(calibration) if calibration is not None else None,
     )
@@ -6887,8 +7558,7 @@ def promote_candidate(
 
     build_updated_at = (
         str(state.build_state["updated_at"])
-        if state.build_state is not None
-        and isinstance(state.build_state.get("updated_at"), str)
+        if state.build_state is not None and isinstance(state.build_state.get("updated_at"), str)
         else None
     )
     expected_state = {
@@ -6913,9 +7583,7 @@ def promote_candidate(
         "champion_scale_hash": champion_stats.scale_hash,
         "candidate_scale_hash": candidate_stats.scale_hash,
         "build_scale_hash": (
-            state.build_state.get("scale_hash")
-            if state.build_state is not None
-            else None
+            state.build_state.get("scale_hash") if state.build_state is not None else None
         ),
         "build_updated_at": build_updated_at,
     }
@@ -6952,10 +7620,7 @@ def get_history_view(root: Path) -> HistoryView:
 
 def get_interventions_view() -> InterventionsView:
     return InterventionsView(
-        interventions=[
-            plugin.descriptor.machine_payload()
-            for plugin in intervention_plugins()
-        ]
+        interventions=[plugin.descriptor.machine_payload() for plugin in intervention_plugins()]
     )
 
 
@@ -6977,9 +7642,7 @@ def get_paths_view(root: Path) -> PathsView:
     context = PathContext(
         origin=origin,
         champion_present=state.champion is not None,
-        champion_trainable=(
-            state.champion.model.trainable if state.champion is not None else None
-        ),
+        champion_trainable=(state.champion.model.trainable if state.champion is not None else None),
         history_confidence=confidence,
         resource_profile_available=state.resource_profile is not None,
         dataset_roles=roles,

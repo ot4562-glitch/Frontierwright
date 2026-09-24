@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from frontierwright import __version__
+
 
 @dataclass(frozen=True)
 class GateCriterion:
@@ -286,7 +288,7 @@ def main() -> int:
             {
                 "ok": True,
                 "gate": "Frontierwright canonical v1 candidate",
-                "candidate_version": "1.0.0rc1",
+                "candidate_version": __version__,
                 "criteria_passed": len(CANONICAL_CRITERIA),
                 "criteria_total": len(CANONICAL_CRITERIA),
                 "criteria": [criterion.to_dict() for criterion in CANONICAL_CRITERIA],

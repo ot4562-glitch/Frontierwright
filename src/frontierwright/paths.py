@@ -23,6 +23,7 @@ class TrainingPathId(StrEnum):
     LORA_SFT = "LORA_SFT"
     QLORA_SFT = "QLORA_SFT"
     DPO = "DPO"
+    RL_POLICY_OPTIMIZATION = "RL_POLICY_OPTIMIZATION"
     DISTILL = "DISTILL"
 
 
@@ -241,6 +242,43 @@ class DirectPreferenceOptimizationPath:
         )
 
 
+@dataclass(frozen=True)
+class ReinforcementLearningPath:
+    path_id: TrainingPathId = TrainingPathId.RL_POLICY_OPTIMIZATION
+    title: str = "Reinforcement learning policy optimization"
+
+    def assess(self, context: PathContext) -> PathAssessment:
+        blockers: list[str] = []
+        next_checks: list[str] = []
+        if not context.champion_present:
+            blockers.append("current model required")
+        elif context.champion_is_birth_root:
+            blockers.append(
+                "born root has not completed initial pretraining; "
+                "reinforcement learning requires a trained policy"
+            )
+        elif context.champion_trainable is not True:
+            blockers.append("trainable model representation required")
+        if DatasetRole.ROLLOUT not in context.dataset_roles:
+            blockers.append("ROLLOUT environment/task dataset required")
+        if not context.resource_profile_available:
+            next_checks.append("run frontierwright resources detect")
+        next_checks.extend(
+            [
+                "pin reward source identity and version",
+                "pin rollout environment identity and version",
+                "calibrate rollout + policy-update workload",
+            ]
+        )
+        return _finish(
+            path_id=self.path_id,
+            title=self.title,
+            context=context,
+            blockers=blockers,
+            next_checks=next_checks,
+        )
+
+
 DEFAULT_PATHS: tuple[TrainingPathPlugin, ...] = (
     FromScratchPretrainingPath(),
     ContinuedPretrainingPath(),
@@ -248,6 +286,7 @@ DEFAULT_PATHS: tuple[TrainingPathPlugin, ...] = (
     _SFTPath(TrainingPathId.LORA_SFT, "LoRA SFT"),
     _SFTPath(TrainingPathId.QLORA_SFT, "QLoRA SFT"),
     DirectPreferenceOptimizationPath(),
+    ReinforcementLearningPath(),
     KnowledgeDistillationPath(),
 )
 

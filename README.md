@@ -1,68 +1,188 @@
 # Frontierwright
 
-Frontierwright is a keyboard-first, game-like LLM development environment for models the user actually controls.
+[![CI](https://github.com/ot4562-glitch/Frontierwright/actions/workflows/ci.yml/badge.svg)](https://github.com/ot4562-glitch/Frontierwright/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> **Build your LLM like a character: inspect its real stats, choose the build you want, see which development paths are feasible, train real candidates, compare them with the current champion, and keep the model's actual development history.**
+> **Don't fit yourself to a model. Fit the model to you.**
 
-The local workspace/folder name and public product name are both **Frontierwright**.
+Frontierwright is a local/private model-development environment for turning open or
+user-controlled language models into models that fit a specific **workload, machine,
+budget, and set of goals**.
 
-## Product principles
+A stock checkpoint is a starting point, not the finished product. Frontierwright
+measures the model and the machine, applies real training or optimization
+interventions, creates descendants, evaluates the trade-offs, and keeps exact lineage
+so the model can keep evolving as the user's needs change.
 
-- The model is the character.
-- Stats come from real evaluation.
-- The visible state describes the current accepted model, not a historical peak.
-- Builds express what the user wants the model to become.
-- Training paths are real pretraining/fine-tuning interventions.
-- Resources are real compute, data, memory, time, and storage.
-- Training creates candidates; the user accepts or rejects them.
-- History is real lineage and intervention history.
-- Human UX is a keyboard-only roguelike-style terminal UI.
-- AI/automation uses a separate stable CLI/JSON interface.
-- User/lab-owned data is preferred before public data discovery.
-- Strong path recommendations require sufficiently trustworthy model history.
-- API-only hosted models without user-controlled trainable state are not trainable Frontierwright characters.
-- Frontierwright is an independent product. It has no dependency on a separate research project.
+**Fixed open models are starting points, not finished products.**
 
-## Official editions
+---
 
-Frontierwright is one shared core with three official product profiles:
+## Why Frontierwright?
 
-- **Frontierwright Studio** — develop existing user-controlled models.
-- **Frontierwright Academy** — build a real model from birth with education-oriented guidance.
-- **Frontierwright Lab** — develop private/internal models inside controlled infrastructure.
+Open models ship in discrete sizes and configurations. Real users do not.
 
-Edition is a UX/policy profile, not model identity. Projects can move between edition profiles without rewriting lineage.
+Your machine may have spare VRAM but a latency limit. Your work may need Korean,
+economics, code, long context, or private domain knowledge in a mixture no public
+leaderboard was designed for. A larger stock model may be wasteful; a smaller,
+specialized descendant may be better for *your* work.
 
-## Canonical product documents
+Frontierwright changes the question from:
 
-Read these in this order:
+> Which downloadable model is best?
 
-1. `product/PRODUCT_DECISIONS_OVERRIDE_20260922.md` — **highest-precedence product decisions**
-2. `product/EDITION_ARCHITECTURE_DECISION_20260923.md` — **frozen Studio / Academy / Lab edition architecture and lifecycle boundary**
-3. `product/V1_IMPLEMENTATION_BLUEPRINT_20260922.md` — v1 implementation contract
-4. `product/CAPABILITY_V1_SPEC_20260924.md` — frozen Capability v1 task/scoring/scale contract
+to:
 
-If an older planning document conflicts with any canonical document above, the canonical documents win within their stated scope.
+> **Which reachable model gives me the most useful capability inside my actual
+> resource and privacy constraints?**
 
-A supporting engineering note, `product/MODEL_DEVELOPMENT_AS_RECIPE_20260923.md`, explains why Frontierwright treats a checkpoint as the current result of a reproducible training recipe rather than as a set of cleanly swappable capability modules.
+The optimization target is user utility, not parameter count and not 100% hardware
+utilization.
 
-Superseded brainstorming documents are kept only in the local development archive and are intentionally excluded from the public repository so they cannot be mistaken for the current product contract.
+---
 
-## Primary human UX
+## The loop
 
-```bash
-frontierwright play
+```text
+measure model + machine + workload
+              ↓
+        choose a real goal
+              ↓
+ plan / calibrate / dry-run
+              ↓
+ train · align · distill · merge · optimize
+              ↓
+           Candidate
+              ↓
+ comparable eval + resource evidence
+              ↓
+       promote or reject
+              ↓
+           Champion
+              ↓
+       use → observe → repeat
 ```
 
-This launches the keyboard-first full-screen TUI.
+A successful training run is **not** automatically an improvement. Frontierwright
+keeps the current Champion unchanged until a Candidate is measured and explicitly
+accepted.
 
-The interaction must be usable without a mouse and should feel closer to a clean roguelike character/status interface than a sequence of shell prompts.
+---
 
-## AI / automation UX
+## One core, three different experiences
 
-AI agents must not operate the TUI.
+| Edition | Built for | Default experience |
+| --- | --- | --- |
+| **Frontierwright Studio** | People who already control an open/local model | Fit the model to **your machine and workload**: headroom, goals, specialist branches, compression, candidate trade-offs, continual improvement |
+| **Frontierwright Academy** | People learning how models are actually built | **Understand by doing**: guided data → tokenizer → birth → training → evaluation, progressive disclosure, explanations tied to real state |
+| **Frontierwright Lab** | Teams developing large private/internal models | **Controlled frontier development**: exact evidence, private infrastructure, experiment matrices, large-scale training/RL adapters, regression and budget gates |
 
-They use stable non-interactive commands and schemas:
+The editions share the same model lineage and raw evidence. Switching editions never
+rewrites history or invents different stats; it changes the **workflow, information
+density, defaults, explanations, and policies**.
+
+---
+
+## Real evidence, not game stats
+
+Frontierwright never awards fake XP.
+
+A visible stat must trace back to a versioned evaluation receipt. A resource number
+must come from detection, calibration, or runtime measurement. A Candidate is an
+actual model artifact.
+
+Capability v1 is deliberately a small frozen local microbenchmark, not a claim of
+general intelligence. Frontierwright exposes the **sample count and 95% Wilson
+uncertainty interval** with each axis so a 16-item estimate is not presented with
+fake precision.
+
+Resource evidence similarly distinguishes:
+
+- **system availability now** — RAM, disk, and GPU VRAM reported free at detection;
+- **model-specific headroom** — requires an actual model/runtime profile before it can
+  be claimed.
+
+Unknown stays **UNKNOWN** until measured.
+
+---
+
+## What a real trade-off looks like
+
+A direct RC self-play with the tiny built-in reference model produced this comparison:
+
+| Axis | Champion | Candidate | Delta |
+| --- | ---: | ---: | ---: |
+| General | 50.0 | 75.0 | +25.0 |
+| Reasoning | 50.0 | 62.5 | +12.5 |
+| Math | 50.0 | 37.5 | -12.5 |
+| Coding | 50.0 | 50.0 | 0.0 |
+
+The Build target was **General ≥ 60**, so the target was reached — but Math visibly
+regressed. Promotion remained an explicit decision.
+
+This is an integration example from Frontierwright's tiny local benchmark/model, **not
+a claim that Frontierwright universally improves models by these amounts**. The point
+is that gains, regressions, and resource trade-offs stay visible.
+
+---
+
+## What Frontierwright can do today
+
+The current core supports real, reproducible lifecycle operations including:
+
+- model import, fingerprinting, lineage, Candidate/Champion state;
+- Academy tokenizer training and deterministic `zero-8m` / `zero-25m` Birth;
+- pretraining, continued pretraining, full SFT, LoRA, NF4 QLoRA, and DPO;
+- knowledge distillation, deterministic linear merge, and symmetric int8 optimization;
+- frozen Capability v1 evaluation plus held-out LM evaluation;
+- raw comparable Candidate-vs-Champion evidence and promotion gates;
+- local generation, inference profiling, portable export and verification;
+- private-data boundaries and Lab adapter contracts;
+- hard run/storage/time budgets, durable execution receipts, recovery and idempotency;
+- keyboard-first TUI for humans and stable CLI/JSON surfaces for automation.
+
+The long engineering inventory and known gaps live in
+[docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
+
+---
+
+## Quick start
+
+Requires Python 3.11+.
+
+```bash
+git clone https://github.com/ot4562-glitch/Frontierwright.git
+cd Frontierwright
+
+python -m venv .venv
+python -m pip install -e ".[dev]"
+```
+
+For real reference-model training/evaluation, install the training extra in a Python
+environment with a PyTorch build appropriate for your machine:
+
+```bash
+python -m pip install -e ".[train]"
+```
+
+Create an Academy project and launch the human interface:
+
+```bash
+frontierwright project init . --name NOVA --origin ZERO --edition ACADEMY
+frontierwright play --path .
+```
+
+Or start from an existing trainable model in Studio:
+
+```bash
+frontierwright project init . --name MYMODEL --origin IMPORTED_LOCAL --edition STUDIO
+frontierwright model import /path/to/model --path .
+frontierwright resources detect --path .
+frontierwright play --path .
+```
+
+AI agents and automation should use the non-interactive CLI/JSON contract instead of
+driving the TUI:
 
 ```text
 --json
@@ -73,144 +193,66 @@ versioned schemas
 idempotency for expensive actions
 ```
 
-## Current development state
+---
 
-**Current release candidate: `1.0.0rc1`.** The canonical v1 candidate gate is defined by `tools/v1_release_gate.py` and contains 20 explicit release criteria.
+## Development directions
 
-The first executable v1 vertical slice is implemented.
+The next major layers are centered on **user-fit optimization**, not cosmetic game
+mechanics:
 
-Implemented now:
+1. **Workload Profiles** — versioned task/language/context/latency/privacy mixtures
+   built from explicit user input or permitted local observations.
+2. **Measured model fit** — combine inference profiles with resource snapshots to show
+   actual post-load VRAM/RAM/latency/throughput headroom.
+3. **Broader evaluation adapters** — ingest mature suites while preserving exact task,
+   evaluator, runtime, and raw evidence identity.
+4. **Pareto candidate selection** — capability, reliability, latency, throughput,
+   VRAM/RAM/storage and cost without hiding trade-offs in one magic score.
+5. **Real RL adapters** — real rollout/reward/policy-optimization workflows for Lab;
+   preference optimization is not mislabeled as RL.
+6. **Hardware-fit descendants** — measured pruning, distillation, quantization and
+   architecture transforms instead of forcing users to choose only stock released
+   sizes.
 
-- installable Python package and `frontierwright` entrypoint;
-- Apache-2.0 `LICENSE` and `NOTICE`;
-- immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
-- authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v20, including persisted edition profiles, zero-model birth provenance, trainable tokenizer artifacts, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, Lab adapter manifests, durable run-usage receipts, preference-dataset role support, and multi-parent model lineage edges;
-- current-champion semantics: historical model states never inflate the current displayed stats;
-- local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
-- GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
-- history evidence states `UNKNOWN / PARTIAL / VERIFIED / COMPLETE`;
-- hash-checked `frontierwright-lineage.json` verification for imported model history;
-- native multi-parent lineage graph with `DERIVED_FROM / MERGED_FROM / DISTILLED_FROM / TRANSFORMED_FROM` relations while retaining the primary-parent compatibility field;
-- recommendation gating: only `COMPLETE / VERIFIED` history is eligible for a strong history-aware recommendation;
-- actual local CPU/RAM/disk/NVIDIA GPU detection with `DETECTED` provenance;
-- detected resource profiles persisted in SQLite and shown through CLI/JSON/TUI;
-- bf16/fp16 kept `UNKNOWN` until backend-specific capability calibration instead of hardware-name guessing;
-- raw benchmark `EvaluationReceipt` ingestion with exact model-id/fingerprint matching;
-- immutable frozen capability-scale manifests with content hash and explicit task/version/weight/anchor mapping;
-- capability profiles persisted separately from model weights and backed by exact raw measurements;
-- missing frozen tasks leave an axis unmeasured rather than inventing a number;
-- current profile replacement semantics: a newer lower current score is displayed lower instead of preserving a historical peak;
-- origin-aware Build persistence:
-  - unmeasured Frontierwright zero model -> `INTENT`;
-  - unmeasured inserted model -> `NOT_READY`;
-  - measured model -> `TARGETS_FLOORS`;
-- persisted build archetypes/relative priorities plus numeric targets/floors with validation;
-- user/lab-first local dataset inventory with content fingerprints, `PRETRAIN / SFT / PREFERENCE` roles, license/domain/language metadata, optional token count, and explicit `PUBLIC / INTERNAL / CONFIDENTIAL / PRIVATE` classification;
-- local user data defaults to `PRIVATE`; prepared datasets inherit the source classification instead of silently weakening policy;
-- backend specs declare a pinned data boundary: `LOCAL_MACHINE / CONTROLLED_PRIVATE / EXTERNAL / UNKNOWN`; non-public data is hard-blocked from `EXTERNAL` and `UNKNOWN` boundaries;
-- plan identity pins both dataset classification and backend boundary, and re-checks classification drift before calibration/execution;
-- legacy backend specs without a boundary remain hash-compatible and are interpreted as `LOCAL_MACHINE`; new explicit boundary declarations participate in the backend-spec hash;
-- Lab adapter manifests declare adapter ID/version, trainer/executor/data/evaluator/artifact-store kinds, network scope, capabilities, and data boundary without storing credentials;
-- `frontierwright lab adapters connect/list/disconnect` provides a stable machine/human surface for private adapter registration;
-- `CONTROLLED_PRIVATE` backends must bind a connected Lab adapter; plans pin both adapter ref and immutable manifest hash, and disconnect/drift makes an existing plan stale before calibration or execution;
-- adapter ref/hash evidence is propagated into plan identity, durable execution requests, and sealed candidate manifests;
-- reproducible DataPreparationPlugin contract with discoverable recipe registry;
-- built-in byte-preserving managed snapshot recipe via `frontierwright data prepare`, preserving source provenance while freezing exact training-input bytes under Frontierwright state;
-- built-in `text-lines-v1` preparation normalizes UTF-8 text, canonicalizes line endings/Unicode, removes empty lines, and performs deterministic stable exact dedupe while recording transformation counts;
-- built-in `preference-jsonl-v1` preparation validates PREFERENCE JSONL records, canonicalizes JSON/Unicode, preserves semantically meaningful field whitespace, stable-dedupes exact prompt/chosen/rejected triples, and emits managed `pairs.jsonl` with transformation evidence;
-- built-in weighted text-mixture preparation composes multiple managed text corpora with exact source fingerprints/parts, conservative metadata/classification propagation, deterministic output, and a hard materialization-size limit;
-- built-in `byte-shards-v1` chained preparation converts managed `corpus.txt` into deterministic uint8 byte-ID shards, records the exact training-unit count, and lets the reference backend reconstruct shard streams without inserting synthetic separators;
-- prepared-source chaining is explicit per plugin: immutable prepared data is never silently reprocessed by a recipe that did not declare support;
-- prepared datasets retain source-dataset ID plus recipe ID/hash, and training plans pin the recipe hash in addition to dataset bytes; `data prepare --dry-run` and `data mix --dry-run` validate recipe identity/replay without materializing output;
-- extensible intervention taxonomy spanning `BIRTH / LEARN / SPECIALIZE / ALIGN / EVOLVE / OPTIMIZE / EVALUATE / OPERATE`;
-- discoverable InterventionPlugin registry with explicit execution surfaces; built-in training interventions wrap their real path-assessment plugins rather than acting as display-only labels;
-- `frontierwright interventions --json` exposes stable intervention ID/provider/version/family/surface metadata to automation;
-- the five v1 training paths remain registered built-in interventions; post-v1 built-ins now include `frontierwright.align.dpo`, `frontierwright.evolve.distill`, the EVOLVE artifact transform `frontierwright.evolve.linear-merge`, the OPTIMIZE artifact transform `frontierwright.optimize.symmetric-int8`, and OPERATE operations for portable export and reference-model generation; the list is not the permanent top-level ontology;
-- factual path prerequisite evaluation using current model trainability, local data inventory, resources, birth state, and history confidence;
-- Academy tokenizer birth via `frontierwright birth tokenizer DATASET_ID`, training deterministic byte-level BPE merge rules from an exact registered PRETRAIN dataset fingerprint, publishing an immutable managed tokenizer artifact with replay semantics, and blocking dataset drift or tokenizer changes after model birth;
-- Academy zero-model birth via `frontierwright birth zero`, with deterministic `zero-8m` / `zero-25m` root checkpoint materialization, exact fingerprinting, runtime provenance, idempotent repeated birth requests, and optional `--tokenizer-artifact` binding that changes the real embedding/lm-head vocabulary size while pinning tokenizer identity into birth provenance;
-- from-scratch pretraining now requires and pins a materialized zero-model birth root instead of silently reinitializing weights;
-- hard-missing prerequisites show `LOCKED`; calibrated accepted plans can project `READY` only after pinned model/data/backend/resource checks;
-- immutable `TrainingPlan` identity with pinned intervention ID/version/family, model fingerprint, dataset/recipe fingerprint, dataset classification, backend spec hash/data boundary, resource profile, config, permission, and hard budgets;
-- representative calibration receipts with step time, throughput, peak memory, projected storage, and projected wall time;
-- idempotent durable local run attempts with worker/process identity, liveness reconciliation, durable executor results, explicit rerun semantics, and repairable run-receipt export;
-- durable run-usage receipts record measured wall time and output bytes, plus provenance-labelled accounted GPU-hours when GPU count is available; unknown cost dimensions remain unknown instead of being fabricated;
-- budget enforcement modes are explicit in plan views: run-count registry admission, wall-time timeout, accounted GPU-hour timeout, storage calibration admission plus a 100 ms local output-tree watchdog and finalization gate, and currently unavailable runtime money enforcement;
-- max_storage_bytes is enforced during local command execution by a 100 ms output-tree watchdog that terminates the backend process group after an observed overrun, then rechecked from durable usage evidence and candidate bytes at finalization; this is not an OS/filesystem quota, so writes between polls may temporarily overshoot the configured byte limit;
-- `max_money` keeps a plan non-ready until an executor with real runtime cost enforcement exists; a projected price alone is not treated as a hard budget;
-- built-in PyTorch reference backend with real decoder-only `zero-8m` and `zero-25m` birth, tokenizer-aware from-scratch pretraining, continued pretraining, full-parameter causal SFT, merged-output LoRA SFT, merged-output QLoRA SFT, Direct Preference Optimization (DPO), and teacher-to-smaller-student knowledge distillation for Frontierwright reference-model lineages; trained descendants inherit the exact parent tokenizer artifact;
-- reference QLoRA freezes the base model, packs targeted transformer projection matrices as blockwise NF4 4-bit values with float32 absmax scales, trains only LoRA parameters, records quantized-vs-full target storage evidence, and materializes a normal merged reference checkpoint after training; it does not claim bitsandbytes double quantization or paged optimizers;
-- reference DPO consumes UTF-8 JSONL `{prompt, chosen, rejected}` preference pairs, keeps an exact frozen reference copy of the current checkpoint, optimizes the policy with the pairwise log-ratio objective and pinned `dpo_beta`, and runs the same objective during calibration so readiness reflects the real alignment workload;
-- reference distillation freezes the current Champion as teacher, initializes a separately pinned smaller student preset, minimizes a temperature-scaled teacher-logit KL term mixed with hard-token cross-entropy, requires the student to have fewer parameters than the teacher, calibrates the same teacher+student workload, and records `DISTILLED_FROM` lineage on the resulting PENDING candidate;
-- `frontierwright evolve merge` performs deterministic linear weight merging for two compatible Frontierwright reference models, requires identical preset/tokenizer/state structure, fingerprints transform provenance into the model artifact, creates a PENDING candidate, and records both parents as weighted `MERGED_FROM` lineage edges; identical transform requests replay the existing candidate instead of recomputing;
-- `frontierwright optimize quantize` performs deterministic per-tensor symmetric int8 post-training quantization of a trained Frontierwright reference Champion, preserves the full model as its parent, creates a non-trainable PENDING optimized-model candidate with `TRANSFORMED_FROM` lineage, and records exact source/quantized tensor-storage evidence; the reference evaluator can reload the quantized artifact for before/after raw evaluation, while an untrained birth root is explicitly rejected; the current reference loader dequantizes to float32 for execution, so Frontierwright claims the measured storage reduction only—not runtime RAM, latency, or throughput gains;
-- `frontierwright operate export DEST` atomically creates a portable model bundle containing exact model bytes plus a path-free Frontierwright manifest with model identity/fingerprint, edition/project identity, immediate lineage, history-confidence evidence, and active capability receipt/scale identifiers; identical exports replay, conflicting destinations are never overwritten, and exported-model tampering is detected on replay; `frontierwright operate verify BUNDLE` independently rechecks manifest identity, exact file hashes/shape, model fingerprint, format, and trainability without requiring the original project, while reporting authenticity as `NOT_SIGNED` until a future signature/trust layer exists;
-- `frontierwright operate generate PROMPT` runs the current Champion locally through the reference backend for both full and Frontierwright-int8 artifacts, encodes/decodes through the model-bound tokenizer, supports deterministic greedy decoding or seeded temperature sampling, returns exact generated token IDs and runtime evidence, and does not append the prompt to registry/history; the plaintext local request file exists only for the duration of the backend call and is unlinked afterward (not a secure-erasure claim);
-- `frontierwright operate profile` measures steady-state reference generation after warmup, returning per-run/p50 latency, token throughput, process RSS and CUDA memory evidence; the project history stores model/config/runtime summaries but deliberately omits sampled continuation text/token IDs;
-- successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
-- sealed artifact manifests bind the run, plan, intervention ID/version/family, dataset, dataset-preparation recipe, backend, effective config, model fingerprint, and exact file hashes;
-- built-in evaluation-pack registry exposed through `frontierwright eval packs`; the first pack runs deterministic held-out causal-LM evaluation for Frontierwright reference models;
-- `frontierwright eval run` produces raw cross-entropy/perplexity receipts pinned to exact model and dataset fingerprints, preparation-recipe evidence, evaluation config, and Python/PyTorch runtime versions;
-- identical model/data/config evaluation requests replay the existing durable receipt without rerunning the evaluator, while dataset/model drift is rejected before execution;
-- generated raw evaluation evidence remains separate from capability stats: Frontierwright does not invent a player-facing stat until an explicit frozen capability scale maps the evidence;
-- official Frontierwright Capability v1 ships as a frozen local 64-task four-choice bundle with 16 General, 16 Reasoning, 16 Math, and 16 Coding probes; the exact task bundle and scale are hash-locked and versioned rather than silently changing under the same stat name;
-- Capability v1 scores each choice by mean conditional token log-probability using the exact tokenizer bound to the model, stores raw accuracy/count/margin evidence, and maps each axis with the frozen anchors 0% -> 0, 25% chance -> 50, 50% -> 100, and 100% -> 200, so 100 remains a reference anchor rather than a cap;
-- `frontierwright eval capability-v1` generates/replays the durable Capability v1 receipt and activates the frozen-scale character stats; the keyboard TUI Action Center exposes the same operation through the shared service layer;
-- `frontierwright eval compare` evaluates champion and candidate under the same pack/data/config and reports raw deltas plus direction-normalized `improvement_delta` without choosing or promoting a winner; stored comparable raw receipts are also surfaced automatically in the normal Candidate compare view/TUI;
-- deterministic evaluation replay revalidates model/data/config/evaluator identity, so a conflicting receipt cannot silently occupy a generated receipt ID;
-- evaluation, comparison, and promotion revalidate managed candidate bytes; artifact tampering blocks promotion even with an unmeasured override;
-- training creates a `PENDING` candidate and never silently changes the champion;
-- candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
-- promotion re-checks current champion/build/evaluation state transactionally, enforces frozen-scale build floors by default, and records explicit override evidence when a user intentionally accepts an unmeasured or build-violating candidate;
-- stable JSON/non-interactive machine surfaces for project/model/birth/evolve/optimize/operate/export/generation/resource/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter operations;
-- mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;
-- English/Korean human-string structure;
-- automated domain, migration, evaluation, execution recovery/idempotency, artifact integrity, candidate, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.
+---
 
-Not implemented yet:
+## Product contracts
 
-- broad arbitrary-Hugging-Face production adapters; the built-in QLoRA path is intentionally a narrow Frontierwright-reference implementation rather than a claim of arbitrary-architecture compatibility;
-- OS/filesystem-enforced storage quotas with zero polling overshoot, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
-- public dataset discovery/download adapters and richer prepared tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
-- remote/server/Slurm executor implementations and concrete private Lab adapters;
-- stronger executor-boundary attestation beyond the current adapter-declared trust contract.
+Canonical direction, in precedence order:
 
-Those surfaces remain explicitly `NOT_READY` / `UNKNOWN` rather than using fake data.
+1. [Product decisions](product/PRODUCT_DECISIONS_OVERRIDE_20260922.md)
+2. [User-fit optimization & edition experience](product/USER_FIT_OPTIMIZATION_AND_EDITION_EXPERIENCE_20260924.md)
+3. [Edition architecture](product/EDITION_ARCHITECTURE_DECISION_20260923.md)
+4. [v1 implementation blueprint](product/V1_IMPLEMENTATION_BLUEPRINT_20260922.md)
+5. [Capability v1 spec](product/CAPABILITY_V1_SPEC_20260924.md)
 
-### Development quick start
+External projects and papers being evaluated for interoperability are tracked in
+[External technical references](product/EXTERNAL_TECHNICAL_REFERENCES_20260924.md).
+
+---
+
+## Current status
+
+The previously certified v1 candidate is `1.0.0rc1`. The current development version
+is **`1.0.0rc2.dev0`**, which starts the user-fit optimization and edition-experience
+pass described above.
+
+Run the verification suite:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[dev]'
-
-.venv/bin/frontierwright project init . --name NOVA --origin ZERO --edition ACADEMY
-.venv/bin/frontierwright birth zero --path . --preset zero-8m --seed 42 --python /path/to/training-python
-.venv/bin/frontierwright project edition --path . --set STUDIO --json --non-interactive --yes
-.venv/bin/frontierwright status --json --non-interactive --yes
-.venv/bin/frontierwright play
+python -m ruff check .
+python -m mypy src/frontierwright
+python -m pytest
+python -m build
 ```
 
-Verification:
+The canonical candidate gate lives in `tools/v1_release_gate.py` and includes package
+installation smoke plus a real local PyTorch Birth → train → Capability v1 → compare
+→ promote lifecycle.
 
-```bash
-.venv/bin/python -m pytest
-.venv/bin/python -m ruff check .
-.venv/bin/python -m mypy src/frontierwright
-.venv/bin/python -m build
-```
-
-Canonical v1 candidate gate (requires a separate Python with the `train` extra):
-
-```bash
-.venv/bin/python tools/v1_release_gate.py \
-  --training-python /path/to/training-python
-```
-
-The gate runs static checks, the full automated suite, package build, clean-wheel install smoke, and a real local PyTorch Birth -> train -> Capability v1 -> compare -> promote lifecycle.
+---
 
 ## License
 
-Frontierwright is released under the **Apache License 2.0**.
-
-The repository includes the standard Apache-2.0 `LICENSE`, `NOTICE`, and `THIRD_PARTY_NOTICES.md`. Frontierwright does not currently vendor runtime/training dependency payloads; bundled third-party assets must be reviewed again if release packaging changes.
+Apache License 2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

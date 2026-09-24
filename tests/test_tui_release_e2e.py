@@ -392,10 +392,11 @@ async def test_keyboard_tui_studio_import_immediately_exposes_real_character_she
         sheet = app._character_text()
         assert "STUDIO-NOVA" in sheet
         assert "Frontierwright Studio" in sheet
-        assert f"Model: {app.view.champion_model_id}" in sheet
-        assert "Format: HUGGINGFACE" in sheet
-        assert "Trainable: YES" in sheet
-        assert f"Fingerprint: {app.view.model_fingerprint}" in sheet
+        assert "YOUR MODEL / YOUR MACHINE / YOUR WORKLOAD" in sheet
+        assert "Champion: " in sheet
+        assert app.view.champion_model_id[:20] in sheet
+        assert "Measured machine fit: UNKNOWN" in sheet
+        assert "Workload fit: NOT DEFINED" in sheet
         assert "General    ?" in sheet
         assert "Reasoning  ?" in sheet
         assert "Math       ?" in sheet

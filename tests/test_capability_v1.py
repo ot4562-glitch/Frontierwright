@@ -17,6 +17,7 @@ from frontierwright.capability_v1 import (
     CAPABILITY_V1_TASKS,
     capability_v1_bundle_hash,
     capability_v1_task_counts,
+    capability_v1_uncertainty,
 )
 from frontierwright.cli import app
 from frontierwright.domain import Axis, ModelOrigin
@@ -26,6 +27,7 @@ from frontierwright.registry import Registry
 from frontierwright.service import (
     get_build_view,
     get_stats_view,
+    get_status,
     import_local_model,
     preflight_capability_v1,
     run_capability_v1,
@@ -120,6 +122,20 @@ def fake_capability_result(
     }
 
 
+
+
+def test_capability_v1_exposes_uncertainty_instead_of_fake_precision() -> None:
+    uncertainty = capability_v1_uncertainty(8, 16)
+
+    assert uncertainty["method"] == "wilson-score-95-v1"
+    assert uncertainty["confidence_level"] == 0.95
+    assert uncertainty["sample_size"] == 16
+    assert uncertainty["correct_count"] == 8
+    assert float(uncertainty["accuracy_lower"]) < 0.5
+    assert float(uncertainty["accuracy_upper"]) > 0.5
+    assert float(uncertainty["stat_lower"]) < 100.0
+    assert float(uncertainty["stat_upper"]) > 100.0
+
 def test_capability_v1_bundle_is_frozen_and_balanced() -> None:
     assert len(CAPABILITY_V1_TASKS) == 64
     assert capability_v1_task_counts() == {
@@ -212,6 +228,11 @@ def test_capability_v1_generates_receipt_activates_stats_and_replays(
         "math": 150.0,
         "coding": 200.0,
     }
+    assert all(isinstance(item.get("uncertainty"), dict) for item in first.axis_results)
+
+    status = get_status(project)
+    assert status.stat_uncertainty["general"]["sample_size"] == 16
+    assert status.stat_uncertainty["coding"]["correct_count"] == 16
 
     stats = get_stats_view(project)
     assert stats.measured is True

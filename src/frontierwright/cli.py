@@ -17,7 +17,7 @@ from frontierwright.domain import ModelOrigin
 from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
 from frontierwright.evaluations import REFERENCE_LM_PACK
-from frontierwright.execution import HardBudgets, PermissionLevel
+from frontierwright.execution import BackendDataBoundary, HardBudgets, PermissionLevel
 from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import (
     BYTE_SHARDS_PLUGIN_ID,
@@ -53,6 +53,8 @@ from frontierwright.service import (
     StatusView,
     TokenizersView,
     TokenizerView,
+    WorkloadFitView,
+    WorkloadView,
     add_local_dataset,
     birth_zero_model,
     calibrate_training_plan,
@@ -81,7 +83,11 @@ from frontierwright.service import (
     get_stats_view,
     get_status,
     get_tokenizers_view,
+    get_workload_fit,
+    get_workload_view,
+    import_lm_eval_evidence,
     import_local_model,
+    import_vllm_serving_evidence,
     ingest_stats,
     initialize_project,
     merge_reference_models,
@@ -108,17 +114,20 @@ from frontierwright.service import (
     set_build_intent,
     set_build_targets,
     set_project_edition,
+    set_workload_profile,
     train_project_tokenizer,
     verify_export_bundle,
 )
+from frontierwright.workloads import WorkloadProfile
 
 app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
-    help="Build your LLM like a character.",
+    help="Fit a model to your workload, machine, and goals.",
 )
 project_app = typer.Typer(help="Create and inspect Frontierwright project state.")
 resources_app = typer.Typer(help="Detect and inspect project compute resources.")
+workload_app = typer.Typer(help="Describe the user workload the model should fit.")
 build_app = typer.Typer(help="Inspect and edit the desired model build.")
 stats_app = typer.Typer(help="Inspect or ingest capability evaluation evidence.")
 evaluation_app = typer.Typer(help="Run and inspect raw evaluation packs.")
@@ -134,6 +143,7 @@ lab_adapters_app = typer.Typer(help="Manage Lab adapter manifests.")
 lab_app.add_typer(lab_adapters_app, name="adapters")
 app.add_typer(project_app, name="project")
 app.add_typer(resources_app, name="resources")
+app.add_typer(workload_app, name="workload")
 app.add_typer(build_app, name="build")
 app.add_typer(stats_app, name="stats")
 app.add_typer(evaluation_app, name="eval")
@@ -213,6 +223,14 @@ def _tokenizers_payload(view: TokenizersView) -> dict[str, object]:
 
 
 def _resource_payload(view: ResourceView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _workload_payload(view: WorkloadView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _workload_fit_payload(view: WorkloadFitView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -360,6 +378,104 @@ def _parse_assignments(items: list[str], label: str) -> dict[str, int]:
     return parsed
 
 
+def _parse_float_assignments(items: list[str], label: str) -> dict[str, float]:
+    parsed: dict[str, float] = {}
+    for item in items:
+        if "=" not in item:
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_ARGUMENT",
+                f"{label} must use name=value syntax: {item}",
+                2,
+            )
+        key, raw_value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_ARGUMENT",
+                f"{label} name cannot be empty.",
+                2,
+            )
+        if key in parsed:
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_ARGUMENT",
+                f"{label} repeats name: {key}",
+                2,
+            )
+        try:
+            parsed[key] = float(raw_value)
+        except ValueError as exc:
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_ARGUMENT",
+                f"{label} value must be numeric: {item}",
+                2,
+            ) from exc
+    return parsed
+
+
+def _print_workload(view: WorkloadView) -> None:
+    console.print("[bold]WORKLOAD[/bold]")
+    if not view.configured:
+        console.print("No workload profile configured.")
+        return
+    profile = view.profile
+    console.print(f"Name: {view.profile_name or profile.get('name') or 'UNKNOWN'}")
+    console.print(f"Profile: {view.profile_id}")
+    console.print(f"Hash: {view.profile_hash}")
+    languages = profile.get("languages")
+    domains = profile.get("domains")
+    console.print(
+        "Languages: "
+        + (
+            ", ".join(str(x) for x in languages)
+            if isinstance(languages, list) and languages
+            else "UNSPECIFIED"
+        )
+    )
+    console.print(
+        "Domains: "
+        + (
+            ", ".join(str(x) for x in domains)
+            if isinstance(domains, list) and domains
+            else "UNSPECIFIED"
+        )
+    )
+    task_weights = profile.get("task_weights")
+    if isinstance(task_weights, dict) and task_weights:
+        console.print("Task weights:")
+        for key, value in sorted(task_weights.items()):
+            console.print(f"  {key}: {value}")
+    console.print(
+        f"Context p50/p95: {profile.get('context_tokens_p50') or 'UNKNOWN'} / "
+        f"{profile.get('context_tokens_p95') or 'UNKNOWN'} tokens"
+    )
+    console.print(f"Max latency: {profile.get('max_latency_seconds') or 'UNSPECIFIED'} s")
+    console.print(f"Min throughput: {profile.get('min_tokens_per_second') or 'UNSPECIFIED'} tok/s")
+    console.print(f"Privacy: {profile.get('privacy') or 'UNKNOWN'}")
+    floors = profile.get("critical_floors")
+    if isinstance(floors, dict) and floors:
+        console.print("Critical capability floors:")
+        for axis, value in sorted(floors.items()):
+            console.print(f"  {axis.title()}: {value}")
+
+
+def _print_workload_fit(view: WorkloadFitView) -> None:
+    console.print(f"[bold]WORKLOAD FIT: {view.overall_status}[/bold]")
+    if not view.configured:
+        console.print(view.note or "No workload profile configured.")
+        return
+    if view.model_id:
+        console.print(f"Model: {view.model_id}")
+    for item in view.constraints:
+        console.print(
+            f"[{item.get('status', 'UNKNOWN')}] {item.get('key')} · "
+            f"required={item.get('requirement')} · observed={item.get('observed')}"
+        )
+        if item.get("reason"):
+            console.print(f"  {item['reason']}")
+    if view.note:
+        console.print(view.note)
+
+
 def _print_build(view: BuildView) -> None:
     console.print(f"[bold]BUILD[/bold] · {view.mode or 'NOT_READY'}")
     if view.archetype:
@@ -439,9 +555,7 @@ def _print_evaluation_compare(view: EvaluationCompareView) -> None:
     console.print(f"Pack: {view.pack_id}@{view.pack_version}")
     console.print(f"Dataset: {view.dataset_id}")
     console.print(f"Champion: {view.champion_model_id}")
-    console.print(
-        f"Candidate: {view.candidate_model_id} [{view.candidate_status or 'UNKNOWN'}]"
-    )
+    console.print(f"Candidate: {view.candidate_model_id} [{view.candidate_status or 'UNKNOWN'}]")
     console.print(f"Comparable: {'YES' if view.comparable else 'NO'}")
     if view.reason:
         console.print(view.reason)
@@ -463,8 +577,7 @@ def _print_data(view: DataView) -> None:
         return
     for item in view.datasets:
         console.print(
-            f"{item.get('name')} · {item.get('role')} · "
-            f"{_human_bytes(item.get('total_bytes'))}"
+            f"{item.get('name')} · {item.get('role')} · {_human_bytes(item.get('total_bytes'))}"
         )
         console.print(f"  Fingerprint: {item.get('fingerprint')}")
         console.print(f"  Provenance: {item.get('provenance')}")
@@ -479,18 +592,13 @@ def _print_data(view: DataView) -> None:
                 f"({item.get('preparation_recipe_hash')})"
             )
         token_count = item.get("token_count")
-        console.print(
-            f"  Tokens: {token_count if isinstance(token_count, int) else 'UNKNOWN'}"
-        )
+        console.print(f"  Tokens: {token_count if isinstance(token_count, int) else 'UNKNOWN'}")
 
 
 def _print_paths(view: PathsView) -> None:
     console.print("[bold]TRAINING PATHS[/bold]")
     for item in view.paths:
-        console.print(
-            f"[{item.get('availability')}] {item.get('title')} "
-            f"({item.get('path_id')})"
-        )
+        console.print(f"[{item.get('availability')}] {item.get('title')} ({item.get('path_id')})")
         blockers = item.get("blockers")
         if isinstance(blockers, list):
             for blocker in blockers:
@@ -546,8 +654,7 @@ def _print_plan(view: PlanView) -> None:
     )
     if view.backend_adapter_ref:
         console.print(
-            f"Lab adapter: {view.backend_adapter_ref} · "
-            f"{view.backend_adapter_hash or 'UNPINNED'}"
+            f"Lab adapter: {view.backend_adapter_ref} · {view.backend_adapter_hash or 'UNPINNED'}"
         )
     console.print(f"Resource profile: {view.resource_profile_id or 'UNPINNED'}")
     if view.budget_enforcement:
@@ -619,9 +726,7 @@ def _print_candidates(view: CandidateView) -> None:
 def _print_merge(view: MergeView) -> None:
     console.print("[bold]MODEL MERGE[/bold]")
     console.print(f"Transform: {view.transform_id}")
-    console.print(
-        f"Primary: {view.primary_model_id} · weight={view.primary_weight}"
-    )
+    console.print(f"Primary: {view.primary_model_id} · weight={view.primary_weight}")
     console.print(f"Other: {view.other_model_id} · weight={view.other_weight}")
     console.print(f"Candidate: {view.candidate_model_id}")
     console.print(f"Fingerprint: {view.model_fingerprint}")
@@ -693,6 +798,11 @@ def _print_inference_profile(view: InferenceProfileView) -> None:
     if isinstance(throughput, (int, float)) and not isinstance(throughput, bool):
         console.print(f"Throughput p50: {float(throughput):.3f} tokens/s")
     console.print(f"Peak VRAM: {metrics.get('peak_vram_bytes')}")
+    console.print(
+        "Minimum sampled free VRAM: "
+        f"{metrics.get('cuda_memory_free_min_sampled_bytes')} / "
+        f"{metrics.get('cuda_memory_total_bytes')}"
+    )
     console.print(f"Process RSS: {metrics.get('max_sampled_process_rss_bytes')}")
 
 
@@ -716,6 +826,32 @@ def _print_compare(view: CompareView) -> None:
             f"{candidate if candidate is not None else '?':>9}   "
             f"{delta_text:>5}"
         )
+    if view.raw_evaluation_comparisons:
+        console.print("")
+        console.print("RAW EVALUATION")
+        for evidence in view.raw_evaluation_comparisons:
+            if evidence.get("kind") == "EXTERNAL_LM_EVAL":
+                console.print(
+                    f"lm-eval {evidence.get('evaluator_version')} · "
+                    f"tasks={evidence.get('task_count')} · external raw evidence"
+                )
+            else:
+                console.print(
+                    f"{evidence.get('pack_id')}@{evidence.get('pack_version')} · "
+                    f"dataset={evidence.get('dataset_id')}"
+                )
+            measurements = evidence.get("measurements")
+            if isinstance(measurements, list):
+                for item in measurements:
+                    if not isinstance(item, dict):
+                        continue
+                    improvement = item.get("improvement_delta")
+                    console.print(
+                        f"  {item.get('task_id')} / {item.get('metric')}: "
+                        f"{item.get('champion_value')} -> {item.get('candidate_value')} "
+                        f"(improvement {improvement})"
+                    )
+
     if view.build_constraints:
         console.print("")
         console.print("BUILD CONSTRAINTS")
@@ -725,16 +861,47 @@ def _print_compare(view: CompareView) -> None:
                 f"{item.get('threshold')} -> {item.get('status')}"
             )
 
+    if view.workload_comparison.get("configured"):
+        champion_fit = view.workload_comparison.get("champion")
+        candidate_fit = view.workload_comparison.get("candidate")
+        console.print("")
+        console.print("WORKLOAD FIT")
+        if isinstance(champion_fit, dict) and isinstance(candidate_fit, dict):
+            console.print(
+                f"Champion {champion_fit.get('overall_status')} -> "
+                f"Candidate {candidate_fit.get('overall_status')}"
+            )
+        regressions = view.workload_comparison.get("regressions")
+        if isinstance(regressions, list):
+            for item in regressions:
+                if isinstance(item, dict):
+                    console.print(
+                        f"  Regression: {item.get('key')} "
+                        f"{item.get('champion_status')} -> {item.get('candidate_status')}"
+                    )
+
+    if view.pareto:
+        console.print("")
+        console.print(f"EVIDENCE PARETO: {view.pareto.get('relation')}")
+        metrics = view.pareto.get("metrics")
+        if isinstance(metrics, list):
+            for item in metrics:
+                if not isinstance(item, dict) or item.get("relation") == "UNKNOWN":
+                    continue
+                console.print(
+                    f"  {item.get('key')}: {item.get('champion_value')} -> "
+                    f"{item.get('candidate_value')} · {item.get('relation')}"
+                )
+        reason = view.pareto.get("inference_profile_reason")
+        if reason:
+            console.print(f"  Runtime evidence: {reason}")
+
     console.print("")
-    console.print(
-        f"Promotion eligible: {'YES' if view.promotion_eligible else 'NO'}"
-    )
+    console.print(f"Promotion eligible: {'YES' if view.promotion_eligible else 'NO'}")
     for blocker in view.promotion_blockers:
         override = blocker.get("override")
         suffix = f" · override {override}" if override else ""
-        console.print(
-            f"  Blocked: {blocker.get('code')} · {blocker.get('message')}{suffix}"
-        )
+        console.print(f"  Blocked: {blocker.get('code')} · {blocker.get('message')}{suffix}")
 
 
 def _print_history(view: HistoryView) -> None:
@@ -744,8 +911,7 @@ def _print_history(view: HistoryView) -> None:
         return
     for event in view.events:
         console.print(
-            f"{event.get('sequence'):>4}  {event.get('kind')}  "
-            f"{event.get('recorded_at')}"
+            f"{event.get('sequence'):>4}  {event.get('kind')}  {event.get('recorded_at')}"
         )
         details = event.get("details")
         if isinstance(details, dict) and details:
@@ -1181,8 +1347,7 @@ def birth_zero(
         typer.Option(
             "--dry-run",
             help=(
-                "Validate zero-model birth and show replay identity "
-                "without materializing weights."
+                "Validate zero-model birth and show replay identity without materializing weights."
             ),
         ),
     ] = False,
@@ -1291,9 +1456,7 @@ def evolve_merge(
         _emit_json(_merge_payload(view))
         return
     _print_merge(view)
-    console.print(
-        "\nMerge created a PENDING candidate. Evaluate and compare it before promotion."
-    )
+    console.print("\nMerge created a PENDING candidate. Evaluate and compare it before promotion.")
 
 
 @optimize_app.command("quantize")
@@ -1353,8 +1516,6 @@ def optimize_quantize(
         "\nQuantization created a PENDING optimized-model candidate. "
         "Evaluate and compare it before promotion."
     )
-
-
 
 
 @operate_app.command("export")
@@ -1474,6 +1635,84 @@ def operate_generate(
     _print_generation(view)
 
 
+@operate_app.command("import-vllm-benchmark")
+def operate_import_vllm_benchmark(
+    result: Annotated[
+        Path,
+        typer.Argument(help="vLLM bench serve result JSON produced with --save-result."),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    vllm_version: Annotated[
+        str,
+        typer.Option(
+            "--vllm-version",
+            help="Exact vLLM version or immutable revision used for the benchmark.",
+        ),
+    ] = "",
+    execution_boundary: Annotated[
+        str,
+        typer.Option(
+            "--execution-boundary",
+            help="LOCAL_MACHINE, CONTROLLED_PRIVATE, or EXTERNAL.",
+        ),
+    ] = BackendDataBoundary.LOCAL_MACHINE.value,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        try:
+            boundary = BackendDataBoundary(execution_boundary.upper())
+        except ValueError as exc:
+            raise FrontierwrightError(
+                "SERVING_BOUNDARY_INVALID",
+                "execution boundary must be LOCAL_MACHINE, CONTROLLED_PRIVATE, or EXTERNAL.",
+                2,
+            ) from exc
+        if boundary is BackendDataBoundary.UNKNOWN:
+            raise FrontierwrightError(
+                "SERVING_BOUNDARY_INVALID",
+                "UNKNOWN is not allowed for imported serving evidence.",
+                2,
+            )
+        view = import_vllm_serving_evidence(
+            path,
+            result_path=result,
+            model_id=model,
+            vllm_version=vllm_version,
+            execution_boundary=boundary,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    payload = {"ok": True, **view.to_dict()}
+    if json_output:
+        _emit_json(payload)
+        return
+    metrics = payload["metrics"]
+    assert isinstance(metrics, dict)
+    console.print("[bold]VLLM SERVING EVIDENCE IMPORTED[/bold]")
+    console.print(f"vLLM: {payload['vllm_version']}")
+    console.print(f"Condition hash: {payload['profile_condition_hash']}")
+    console.print(
+        f"E2E p50: {metrics.get('latency_seconds_p50')}s · "
+        f"TTFT p50: {metrics.get('ttft_seconds_p50')}s · "
+        f"TPOT p50: {metrics.get('tpot_seconds_p50')}s/token"
+    )
+    console.print(
+        "VRAM/RSS: UNKNOWN from client benchmark; import or run separate resource "
+        "measurement before making memory-fit claims."
+    )
+
+
 @operate_app.command("profile")
 def operate_profile(
     path: Annotated[
@@ -1487,6 +1726,13 @@ def operate_profile(
             help="Python executable for the isolated PyTorch inference environment.",
         ),
     ] = sys.executable,
+    model_id: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Exact model ID to profile; defaults to the current Champion.",
+        ),
+    ] = None,
     max_new_tokens: Annotated[
         int,
         typer.Option("--max-new-tokens", min=1, help="Generated tokens per measured run."),
@@ -1515,6 +1761,7 @@ def operate_profile(
         view = profile_reference_inference(
             path,
             python_executable=python_executable,
+            model_id=model_id,
             max_new_tokens=max_new_tokens,
             warmup_runs=warmup_runs,
             measured_runs=measured_runs,
@@ -1670,6 +1917,105 @@ def resources_show(
     _print_resources(view)
 
 
+@workload_app.command("show")
+def workload_show(
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = get_workload_view(path)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json(_workload_payload(view))
+        return
+    _print_workload(view)
+
+
+@workload_app.command("fit")
+def workload_fit(
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Model ID; defaults to current Champion."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = get_workload_fit(path, model)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json(_workload_fit_payload(view))
+        return
+    _print_workload_fit(view)
+
+
+@workload_app.command("set")
+def workload_set(
+    name: Annotated[str, typer.Option("--name", help="Workload profile name.")],
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    language: Annotated[
+        list[str] | None,
+        typer.Option("--language", help="Repeat for workload languages."),
+    ] = None,
+    domain: Annotated[
+        list[str] | None,
+        typer.Option("--domain", help="Repeat for workload domains."),
+    ] = None,
+    task: Annotated[
+        list[str] | None,
+        typer.Option("--task", help="Repeat task=weight, e.g. --task coding=2."),
+    ] = None,
+    context_p50: Annotated[int | None, typer.Option("--context-p50")] = None,
+    context_p95: Annotated[int | None, typer.Option("--context-p95")] = None,
+    max_latency: Annotated[float | None, typer.Option("--max-latency")] = None,
+    min_tokens_per_second: Annotated[float | None, typer.Option("--min-tokens-per-second")] = None,
+    privacy: Annotated[str, typer.Option("--privacy")] = "PRIVATE",
+    floor: Annotated[
+        list[str] | None,
+        typer.Option("--floor", help="Repeat capability-axis=value hard floor."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        try:
+            privacy_value = DatasetClassification(privacy.strip().upper())
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in DatasetClassification)
+            raise FrontierwrightError(
+                "INVALID_WORKLOAD_ARGUMENT",
+                f"privacy must be one of: {allowed}",
+                2,
+            ) from exc
+        profile = WorkloadProfile(
+            name=name,
+            languages=tuple(language or ()),
+            domains=tuple(domain or ()),
+            task_weights=_parse_float_assignments(task or [], "task"),
+            context_tokens_p50=context_p50,
+            context_tokens_p95=context_p95,
+            max_latency_seconds=max_latency,
+            min_tokens_per_second=min_tokens_per_second,
+            privacy=privacy_value,
+            critical_floors=_parse_float_assignments(floor or [], "floor"),
+        )
+        view = set_workload_profile(path, profile)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json(_workload_payload(view))
+        return
+    _print_workload(view)
+
+
 @build_app.command("show")
 def build_show(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
@@ -1797,6 +2143,55 @@ def stats_ingest(
     _print_stats(view)
 
 
+@evaluation_app.command("import-lm-eval")
+def evaluation_import_lm_eval(
+    result: Annotated[
+        Path,
+        typer.Argument(help="lm-evaluation-harness results JSON."),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    harness_version: Annotated[
+        str,
+        typer.Option(
+            "--harness-version",
+            help="Exact lm-evaluation-harness version or immutable revision.",
+        ),
+    ] = "",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = import_lm_eval_evidence(
+            path,
+            result_path=result,
+            model_id=model,
+            harness_version=harness_version,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    payload = {"ok": True, **view.to_dict()}
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print("[bold]LM-EVAL EVIDENCE IMPORTED[/bold]")
+    console.print(f"Model: {payload['model_id']}")
+    console.print(f"Evaluator: {payload['evaluator_id']}@{payload['evaluator_version']}")
+    console.print(f"Receipt: {payload['receipt_id']}")
+    console.print(f"Tasks: {payload['task_count']} · metrics: {payload['measurement_count']}")
+    console.print("Capability stats activated: NO")
+    console.print(str(payload["note"]))
+
+
 @evaluation_app.command("capability-v1")
 def evaluation_capability_v1(
     path: Annotated[
@@ -1894,10 +2289,7 @@ def evaluation_packs(
 
     console.print("[bold]EVALUATION PACKS[/bold]")
     for item in packs:
-        console.print(
-            f"{item.get('pack_id')}@{item.get('pack_version')} · "
-            f"{item.get('title')}"
-        )
+        console.print(f"{item.get('pack_id')}@{item.get('pack_version')} · {item.get('title')}")
         metrics = item.get("metrics")
         if isinstance(metrics, list):
             console.print("  Metrics: " + ", ".join(str(value) for value in metrics))
@@ -2168,9 +2560,7 @@ def data_recipes(
         return
     console.print("[bold]DATA PREPARATION RECIPES[/bold]")
     for plugin in plugins:
-        console.print(
-            f"{plugin['plugin_id']}@{plugin['plugin_version']} · {plugin['title']}"
-        )
+        console.print(f"{plugin['plugin_id']}@{plugin['plugin_version']} · {plugin['title']}")
 
 
 @data_app.command("prepare")
@@ -2229,9 +2619,7 @@ def data_prepare(
             json_output=json_output,
         )
     config: dict[str, object] | None = (
-        {"bytes_per_shard": bytes_per_shard}
-        if bytes_per_shard is not None
-        else None
+        {"bytes_per_shard": bytes_per_shard} if bytes_per_shard is not None else None
     )
     try:
         if dry_run:
@@ -2261,7 +2649,6 @@ def data_prepare(
         _emit_json(_data_payload(view))
         return
     _print_data(view)
-
 
 
 @data_app.command("mix")
@@ -2457,7 +2844,7 @@ def backend_doctor(
         "p['cuda_available']=torch.cuda.is_available()\\n "
         "p['cuda_device_count']=torch.cuda.device_count()\\n "
         "p['cuda_device_name']=(torch.cuda.get_device_name(0) "
-        "if torch.cuda.is_available() else None)\");"
+        'if torch.cuda.is_available() else None)");'
         "print(json.dumps(p,sort_keys=True))"
     )
     try:
@@ -2769,8 +3156,7 @@ def train_command(
         ready = [
             item
             for item in paths.paths
-            if item.get("availability") == "READY"
-            and isinstance(item.get("ready_plan_id"), str)
+            if item.get("availability") == "READY" and isinstance(item.get("ready_plan_id"), str)
         ]
         if plan_id is None:
             if not ready:
@@ -2791,9 +3177,7 @@ def train_command(
                 )
             console.print("[bold]READY TRAINING PATHS[/bold]")
             for index, item in enumerate(ready, start=1):
-                console.print(
-                    f"[{index}] {item.get('title')} · {item.get('ready_plan_id')}"
-                )
+                console.print(f"[{index}] {item.get('title')} · {item.get('ready_plan_id')}")
             selected = typer.prompt(
                 "Select path",
                 type=int,
@@ -2855,9 +3239,7 @@ def train_command(
 
     _print_run(result)
     if not execute:
-        console.print(
-            "\nDry-run passed. Re-run with --execute to create a candidate."
-        )
+        console.print("\nDry-run passed. Re-run with --execute to create a candidate.")
 
 
 @app.command("candidates")
@@ -2982,6 +3364,8 @@ def play(
     resources = get_resource_view(path)
     build = get_build_view(path)
     data = get_data_view(path)
+    workload = get_workload_view(path)
+    workload_fit = get_workload_fit(path)
     paths = get_paths_view(path)
     candidates = get_candidates_view(path)
     history = get_history_view(path)
@@ -2993,6 +3377,8 @@ def play(
         resources=resources,
         build=build,
         data=data,
+        workload=workload,
+        workload_fit=workload_fit,
         paths=paths,
         candidates=candidates,
         history=history,

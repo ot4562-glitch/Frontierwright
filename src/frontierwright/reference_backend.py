@@ -3,7 +3,8 @@
 This backend intentionally stays narrow: real causal language-model training for
 Frontierwright reference-model lineages, including initial/continued pretraining,
 full-parameter causal SFT, merged-output LoRA/QLoRA SFT, Direct Preference
-Optimization, and teacher-to-smaller-student knowledge distillation. It is not a
+Optimization, verifiable-reward REINFORCE policy optimization, and
+teacher-to-smaller-student knowledge distillation. It is not a
 compatibility layer for arbitrary Hugging Face architectures.
 
 The module is executed by a dedicated training Python environment:
@@ -41,6 +42,11 @@ from frontierwright.reference_tokenizer import (
     tokenizer_fingerprint,
     tokenizer_vocab_size,
 )
+from frontierwright.rl import (
+    RLExperimentSpec,
+    rl_spec_from_config,
+    validate_reference_rl_spec,
+)
 
 REFERENCE_BACKEND_ID = "frontierwright-reference-pytorch-v1"
 SUPPORTED_PATHS = (
@@ -50,6 +56,7 @@ SUPPORTED_PATHS = (
     "LORA_SFT",
     "QLORA_SFT",
     "DPO",
+    "RL_POLICY_OPTIMIZATION",
     "DISTILL",
 )
 VOCAB_SIZE = 256
@@ -183,6 +190,7 @@ class ReferenceConfig:
     lora_rank: int
     lora_alpha: float
     dpo_beta: float = 0.1
+    rl_spec: RLExperimentSpec | None = None
     student_preset: ModelPreset | None = None
     distill_temperature: float = 2.0
     distill_alpha: float = 0.5
@@ -201,10 +209,9 @@ class ReferenceConfig:
             "lora_rank": self.lora_rank,
             "lora_alpha": self.lora_alpha,
             "dpo_beta": self.dpo_beta,
+            "rl": self.rl_spec.to_payload() if self.rl_spec is not None else None,
             "student_preset": (
-                asdict(self.student_preset)
-                if self.student_preset is not None
-                else None
+                asdict(self.student_preset) if self.student_preset is not None else None
             ),
             "distill_temperature": self.distill_temperature,
             "distill_alpha": self.distill_alpha,
@@ -296,9 +303,7 @@ def _preset_name_for_request(
     explicit = raw_config.get("preset")
     if explicit is not None:
         if not isinstance(explicit, str) or explicit not in PRESETS:
-            raise ValueError(
-                "preset must be one of: " + ", ".join(sorted(PRESETS))
-            )
+            raise ValueError("preset must be one of: " + ", ".join(sorted(PRESETS)))
         return explicit
 
     model_source = request.get("model_source_path")
@@ -342,11 +347,16 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
     if path_id not in {"LORA_SFT", "QLORA_SFT"} and any(
         key in raw for key in ("lora_rank", "lora_alpha")
     ):
-        raise ValueError(
-            "lora_rank/lora_alpha are only valid for LORA_SFT or QLORA_SFT"
-        )
+        raise ValueError("lora_rank/lora_alpha are only valid for LORA_SFT or QLORA_SFT")
     if path_id != "DPO" and "dpo_beta" in raw:
         raise ValueError("dpo_beta is only valid for DPO")
+
+    rl_spec: RLExperimentSpec | None = None
+    if path_id == "RL_POLICY_OPTIMIZATION":
+        rl_spec = rl_spec_from_config(raw)
+        validate_reference_rl_spec(rl_spec)
+    elif "rl" in raw:
+        raise ValueError("rl is only valid for RL_POLICY_OPTIMIZATION")
 
     distill_keys = {"student_preset", "distill_temperature", "distill_alpha"}
     if path_id != "DISTILL" and any(key in raw for key in distill_keys):
@@ -358,8 +368,7 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
         student_raw = raw.get("student_preset")
         if not isinstance(student_raw, str) or student_raw not in PRESETS:
             raise ValueError(
-                "DISTILL requires student_preset to be one of: "
-                + ", ".join(sorted(PRESETS))
+                "DISTILL requires student_preset to be one of: " + ", ".join(sorted(PRESETS))
             )
         student_preset = PRESETS[student_raw]
 
@@ -392,13 +401,12 @@ def _load_config(request: dict[str, Any]) -> ReferenceConfig:
         lora_rank=_positive_int(raw.get("lora_rank"), 8, "lora_rank"),
         lora_alpha=_positive_float(raw.get("lora_alpha"), 16.0, "lora_alpha"),
         dpo_beta=_positive_float(raw.get("dpo_beta"), 0.1, "dpo_beta"),
+        rl_spec=rl_spec,
         student_preset=student_preset,
         distill_temperature=_positive_float(
             raw.get("distill_temperature"), 2.0, "distill_temperature"
         ),
-        distill_alpha=_unit_interval_float(
-            raw.get("distill_alpha"), 0.5, "distill_alpha"
-        ),
+        distill_alpha=_unit_interval_float(raw.get("distill_alpha"), 0.5, "distill_alpha"),
     )
 
 
@@ -413,9 +421,7 @@ def _load_evaluation_config(
         set(raw) - {"preset", "batch_size", "max_batches", "device", "max_dataset_bytes"}
     )
     if unknown:
-        raise ValueError(
-            "evaluation config does not support keys: " + ", ".join(unknown)
-        )
+        raise ValueError("evaluation config does not support keys: " + ", ".join(unknown))
 
     preset_name = _preset_name_for_request(request, raw)
     preset = PRESETS[preset_name]
@@ -447,9 +453,7 @@ def _load_generation_config(
     allowed = {"preset", "max_new_tokens", "temperature", "seed", "device"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
-        raise ValueError(
-            "generation config does not support keys: " + ", ".join(unknown)
-        )
+        raise ValueError("generation config does not support keys: " + ", ".join(unknown))
 
     preset_name = _preset_name_for_request(request, raw)
     preset = PRESETS[preset_name]
@@ -487,9 +491,7 @@ def _load_inference_profile_config(
     allowed = {"preset", "max_new_tokens", "warmup_runs", "measured_runs", "device"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
-        raise ValueError(
-            "inference profile config does not support keys: " + ", ".join(unknown)
-        )
+        raise ValueError("inference profile config does not support keys: " + ", ".join(unknown))
     preset_name = _preset_name_for_request(request, raw)
     device = raw.get("device", "auto")
     if not isinstance(device, str) or device not in {"auto", "cpu", "cuda"}:
@@ -538,10 +540,7 @@ def _dataset_files(source: Path) -> list[Path]:
 
 def _read_corpus(source: Path, *, max_bytes: int) -> bytes:
     files = _dataset_files(source)
-    shard_mode = all(
-        path.suffix == ".bin" and path.name.startswith("shard-")
-        for path in files
-    )
+    shard_mode = all(path.suffix == ".bin" and path.name.startswith("shard-") for path in files)
     separator = b"" if shard_mode else b"\n"
 
     chunks: list[bytes] = []
@@ -572,6 +571,106 @@ def _read_corpus(source: Path, *, max_bytes: int) -> bytes:
 
 
 @dataclass(frozen=True)
+class VerifiableChoiceEpisode:
+    prompt: bytes
+    choices: tuple[bytes, ...]
+    correct_index: int
+
+
+def _read_rl_episodes(
+    source: Path,
+    *,
+    max_bytes: int,
+) -> tuple[VerifiableChoiceEpisode, ...]:
+    """Load deterministic JSONL contextual-bandit episodes for reference RL."""
+
+    files = [path for path in _dataset_files(source) if path.suffix.lower() == ".jsonl"]
+    if not files:
+        raise ValueError("RL rollout dataset must contain at least one .jsonl file")
+
+    episodes: list[VerifiableChoiceEpisode] = []
+    consumed = 0
+    limit_reached = False
+    for path in files:
+        with path.open("rb") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                if not raw_line.strip():
+                    continue
+                if consumed + len(raw_line) > max_bytes:
+                    if not episodes:
+                        raise ValueError("first RL rollout record exceeds max_dataset_bytes")
+                    limit_reached = True
+                    break
+                consumed += len(raw_line)
+                try:
+                    raw = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        f"invalid UTF-8 JSONL RL record: {path.name}:{line_number}"
+                    ) from exc
+                if not isinstance(raw, dict):
+                    raise ValueError(f"RL record must be an object: {path.name}:{line_number}")
+                prompt = raw.get("prompt")
+                choices_raw = raw.get("choices")
+                correct_index = raw.get("correct_index")
+                if not isinstance(prompt, str) or not prompt:
+                    raise ValueError(
+                        f"RL prompt must be a nonempty string: {path.name}:{line_number}"
+                    )
+                if (
+                    not isinstance(choices_raw, list)
+                    or not 2 <= len(choices_raw) <= 8
+                    or not all(isinstance(choice, str) and choice for choice in choices_raw)
+                ):
+                    raise ValueError(
+                        f"RL choices must contain 2..8 nonempty strings: {path.name}:{line_number}"
+                    )
+                if len(set(choices_raw)) != len(choices_raw):
+                    raise ValueError(f"RL choices must be distinct: {path.name}:{line_number}")
+                if (
+                    isinstance(correct_index, bool)
+                    or not isinstance(correct_index, int)
+                    or not 0 <= correct_index < len(choices_raw)
+                ):
+                    raise ValueError(f"RL correct_index is out of range: {path.name}:{line_number}")
+                episodes.append(
+                    VerifiableChoiceEpisode(
+                        prompt=prompt.encode("utf-8"),
+                        choices=tuple(str(choice).encode("utf-8") for choice in choices_raw),
+                        correct_index=correct_index,
+                    )
+                )
+        if limit_reached:
+            break
+
+    if not episodes:
+        raise ValueError("RL rollout dataset contains no usable episodes")
+    return tuple(episodes)
+
+
+def _validate_rl_episodes(
+    episodes: tuple[VerifiableChoiceEpisode, ...],
+    preset: ModelPreset,
+    tokenizer_payload: dict[str, Any],
+) -> None:
+    maximum = preset.context_length + 1
+    for episode_index, episode in enumerate(episodes):
+        prompt_ids = encode_with_tokenizer(episode.prompt, tokenizer_payload)
+        if not prompt_ids:
+            raise ValueError(f"RL episode {episode_index} prompt tokenized to empty")
+        for choice_index, choice in enumerate(episode.choices):
+            choice_ids = encode_with_tokenizer(choice, tokenizer_payload)
+            combined = len(prompt_ids) + len(choice_ids)
+            if not choice_ids or combined < 2:
+                raise ValueError(f"RL episode {episode_index} choice {choice_index} is unscorable")
+            if combined > maximum:
+                raise ValueError(
+                    f"RL episode {episode_index} choice {choice_index} exceeds context "
+                    f"capacity ({combined} tokens > {maximum})"
+                )
+
+
+@dataclass(frozen=True)
 class PreferencePair:
     prompt: bytes
     chosen: bytes
@@ -585,15 +684,9 @@ def _read_preference_pairs(
 ) -> tuple[PreferencePair, ...]:
     """Load deterministic UTF-8 JSONL preference pairs."""
 
-    files = [
-        path
-        for path in _dataset_files(source)
-        if path.suffix.lower() == ".jsonl"
-    ]
+    files = [path for path in _dataset_files(source) if path.suffix.lower() == ".jsonl"]
     if not files:
-        raise ValueError(
-            "DPO preference dataset must contain at least one .jsonl file"
-        )
+        raise ValueError("DPO preference dataset must contain at least one .jsonl file")
 
     pairs: list[PreferencePair] = []
     consumed = 0
@@ -605,9 +698,7 @@ def _read_preference_pairs(
                     continue
                 if consumed + len(raw_line) > max_bytes:
                     if not pairs:
-                        raise ValueError(
-                            "first DPO preference record exceeds max_dataset_bytes"
-                        )
+                        raise ValueError("first DPO preference record exceeds max_dataset_bytes")
                     limit_reached = True
                     break
                 consumed += len(raw_line)
@@ -615,13 +706,11 @@ def _read_preference_pairs(
                     raw = json.loads(raw_line.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise ValueError(
-                        f"invalid UTF-8 JSONL preference record: "
-                        f"{path.name}:{line_number}"
+                        f"invalid UTF-8 JSONL preference record: {path.name}:{line_number}"
                     ) from exc
                 if not isinstance(raw, dict):
                     raise ValueError(
-                        f"preference record must be an object: "
-                        f"{path.name}:{line_number}"
+                        f"preference record must be an object: {path.name}:{line_number}"
                     )
 
                 values: dict[str, bytes] = {}
@@ -634,10 +723,7 @@ def _read_preference_pairs(
                         )
                     values[key] = value.encode("utf-8")
                 if values["chosen"] == values["rejected"]:
-                    raise ValueError(
-                        f"chosen and rejected must differ: "
-                        f"{path.name}:{line_number}"
-                    )
+                    raise ValueError(f"chosen and rejected must differ: {path.name}:{line_number}")
                 pairs.append(
                     PreferencePair(
                         prompt=values["prompt"],
@@ -668,14 +754,13 @@ def _validate_preference_pairs(
             response_ids = encode_with_tokenizer(response, tokenizer_payload)
             combined = len(prompt_ids) + len(response_ids)
             if combined < 2:
-                raise ValueError(
-                    f"DPO pair {index} {label} sequence is too short to score"
-                )
+                raise ValueError(f"DPO pair {index} {label} sequence is too short to score")
             if combined > maximum:
                 raise ValueError(
                     f"DPO pair {index} {label} exceeds context capacity "
                     f"({combined} tokens > {maximum})"
                 )
+
 
 def _response_logprob(
     torch: Any,
@@ -707,6 +792,7 @@ def _response_logprob(
         response_targets.unsqueeze(1),
     ).squeeze(1)
     return selected.sum()
+
 
 def _dpo_training_objects(
     torch: Any,
@@ -835,22 +921,166 @@ def _dpo_train_step(
 
         policy_logratio = policy_chosen - policy_rejected
         reference_logratio = reference_chosen - reference_rejected
-        preference_logit = config.dpo_beta * (
-            policy_logratio - reference_logratio
-        )
+        preference_logit = config.dpo_beta * (policy_logratio - reference_logratio)
         losses.append(-torch.nn.functional.logsigmoid(preference_logit))
         prompt_ids = encode_with_tokenizer(pair.prompt, tokenizer_payload)
         chosen_ids = encode_with_tokenizer(pair.chosen, tokenizer_payload)
         rejected_ids = encode_with_tokenizer(pair.rejected, tokenizer_payload)
         processed_tokens += (
-            len(prompt_ids) + len(chosen_ids) - 1
-            + len(prompt_ids) + len(rejected_ids) - 1
+            len(prompt_ids) + len(chosen_ids) - 1 + len(prompt_ids) + len(rejected_ids) - 1
         )
 
     loss = torch.stack(losses).mean()
     loss.backward()
     optimizer.step()
     return float(loss.detach().cpu().item()), processed_tokens
+
+
+def _reference_rl_baseline(spec: RLExperimentSpec) -> float:
+    raw = (spec.algorithm_config or {}).get("reward_baseline", 0.5)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("reference RL reward_baseline must be numeric")
+    return float(raw)
+
+
+def _rl_training_objects(
+    torch: Any,
+    config: ReferenceConfig,
+    episodes: tuple[VerifiableChoiceEpisode, ...],
+    *,
+    model_source_path: str,
+) -> tuple[Any, Any, Any, dict[str, Any], str, dict[str, object]]:
+    spec = config.rl_spec
+    if spec is None:
+        raise ValueError("RL_POLICY_OPTIMIZATION requires a parsed RL spec")
+    validate_reference_rl_spec(spec)
+
+    torch.manual_seed(config.seed)
+    device = _select_device(torch, config.device)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(config.seed)
+
+    policy = _load_reference_model(
+        torch,
+        config.preset,
+        model_source_path=model_source_path,
+        device=device,
+    )
+    tokenizer_payload, vocab_size = _reference_tokenizer_for_model(model_source_path)
+    _validate_rl_episodes(episodes, config.preset, tokenizer_payload)
+    trainable_parameters = [
+        parameter for parameter in policy.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("RL policy produced no trainable parameters")
+    optimizer = torch.optim.AdamW(
+        trainable_parameters,
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(config.seed)
+    baseline = _reference_rl_baseline(spec)
+    base_parameter_count = _parameter_count(policy)
+    training_details: dict[str, object] = {
+        "method": "reinforcement_learning",
+        "algorithm": spec.algorithm_id,
+        "rl_spec_hash": spec.spec_hash,
+        "environment": spec.environment.to_payload(),
+        "reward": spec.reward.to_payload(),
+        "rollout_temperature": spec.rollout_temperature,
+        "entropy_coefficient": spec.entropy_coefficient,
+        "reward_baseline": baseline,
+        "episode_count": len(episodes),
+        "reward_range": [0.0, 1.0],
+        "contextual_bandit_episode": True,
+        "base_parameter_count": base_parameter_count,
+        "trainable_parameter_count": _trainable_parameter_count(policy),
+        "vocab_size": vocab_size,
+        "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer_payload),
+    }
+    return (
+        policy,
+        optimizer,
+        generator,
+        tokenizer_payload,
+        device,
+        training_details,
+    )
+
+
+def _reinforce_train_step(
+    torch: Any,
+    policy: Any,
+    optimizer: Any,
+    episodes: tuple[VerifiableChoiceEpisode, ...],
+    generator: Any,
+    tokenizer_payload: dict[str, Any],
+    *,
+    config: ReferenceConfig,
+    device: str,
+) -> tuple[float, int, float, int]:
+    spec = config.rl_spec
+    if spec is None:
+        raise ValueError("RL_POLICY_OPTIMIZATION requires a parsed RL spec")
+    policy.train()
+    optimizer.zero_grad(set_to_none=True)
+    indexes = torch.randint(
+        0,
+        len(episodes),
+        (config.batch_size,),
+        generator=generator,
+    )
+    baseline = _reference_rl_baseline(spec)
+
+    losses: list[Any] = []
+    reward_total = 0.0
+    successful = 0
+    scored_tokens = 0
+    for raw_index in indexes.tolist():
+        episode = episodes[int(raw_index)]
+        choice_scores: list[Any] = []
+        for choice in episode.choices:
+            choice_ids = encode_with_tokenizer(choice, tokenizer_payload)
+            logprob = _response_logprob(
+                torch,
+                policy,
+                prompt=episode.prompt,
+                response=choice,
+                tokenizer_payload=tokenizer_payload,
+                device=device,
+            )
+            choice_scores.append(logprob / max(len(choice_ids), 1))
+            prompt_ids = encode_with_tokenizer(episode.prompt, tokenizer_payload)
+            scored_tokens += max(len(prompt_ids) + len(choice_ids) - 1, 1)
+
+        logits = torch.stack(choice_scores) / spec.rollout_temperature
+        action_log_probs = torch.nn.functional.log_softmax(logits, dim=0)
+        probabilities = torch.exp(action_log_probs)
+        sampled = torch.multinomial(
+            probabilities.detach().cpu(),
+            num_samples=1,
+            generator=generator,
+        )
+        action = int(sampled.item())
+        reward = 1.0 if action == episode.correct_index else 0.0
+        reward_total += reward
+        successful += int(reward > 0.0)
+        selected_log_prob = action_log_probs[action]
+        entropy = -(probabilities * action_log_probs).sum()
+        advantage = reward - baseline
+        losses.append(-(advantage * selected_log_prob) - spec.entropy_coefficient * entropy)
+
+    loss = torch.stack(losses).mean()
+    loss.backward()
+    optimizer.step()
+    batch_count = int(indexes.numel())
+    return (
+        float(loss.detach().cpu().item()),
+        scored_tokens,
+        reward_total / max(batch_count, 1),
+        successful,
+    )
 
 
 def _distillation_training_objects(
@@ -891,9 +1121,7 @@ def _distillation_training_objects(
     teacher_parameter_count = _parameter_count(teacher)
     student_parameter_count = _parameter_count(student)
     if student_parameter_count >= teacher_parameter_count:
-        raise ValueError(
-            "DISTILL student must have fewer parameters than the teacher model"
-        )
+        raise ValueError("DISTILL student must have fewer parameters than the teacher model")
 
     optimizer = torch.optim.AdamW(
         [parameter for parameter in student.parameters() if parameter.requires_grad],
@@ -980,10 +1208,7 @@ def _kd_step(
         student_logits.reshape(-1, int(student_logits.shape[-1])),
         y.reshape(-1),
     )
-    loss = (
-        config.distill_alpha * soft_loss
-        + (1.0 - config.distill_alpha) * hard_loss
-    )
+    loss = config.distill_alpha * soft_loss + (1.0 - config.distill_alpha) * hard_loss
     loss.backward()
     optimizer.step()
     return float(loss.detach().cpu().item()), int(y.numel())
@@ -1002,6 +1227,8 @@ def _objective_for_path(path_id: object) -> str:
         return "qlora_nf4_causal_sft"
     if path_id == "DPO":
         return "direct_preference_optimization"
+    if path_id == "RL_POLICY_OPTIMIZATION":
+        return "reinforce_verifiable_choice"
     if path_id == "DISTILL":
         return "knowledge_distillation"
     raise ValueError(f"unsupported reference training path: {path_id!r}")
@@ -1090,8 +1317,6 @@ def _parameter_count(model: Any) -> int:
     return int(sum(parameter.numel() for parameter in model.parameters()))
 
 
-
-
 def _training_detail_int(details: dict[str, object], key: str) -> int:
     value = details.get(key)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1101,11 +1326,7 @@ def _training_detail_int(details: dict[str, object], key: str) -> int:
 
 def _trainable_parameter_count(model: Any) -> int:
     return int(
-        sum(
-            parameter.numel()
-            for parameter in model.parameters()
-            if parameter.requires_grad
-        )
+        sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     )
 
 
@@ -1125,9 +1346,7 @@ def _apply_lora_parametrizations(
         def __init__(self, out_features: int, in_features: int) -> None:
             super().__init__()
             if rank > min(out_features, in_features):
-                raise ValueError(
-                    "lora_rank exceeds the smallest targeted projection dimension"
-                )
+                raise ValueError("lora_rank exceeds the smallest targeted projection dimension")
             self.a = nn.Parameter(torch.empty(rank, in_features))
             self.b = nn.Parameter(torch.zeros(out_features, rank))
             self.scale = alpha / rank
@@ -1272,9 +1491,7 @@ def _apply_qlora_parametrizations(
         ) -> None:
             super().__init__()
             if rank > min(out_features, in_features):
-                raise ValueError(
-                    "lora_rank exceeds the smallest targeted projection dimension"
-                )
+                raise ValueError("lora_rank exceeds the smallest targeted projection dimension")
             self.out_features = out_features
             self.in_features = in_features
             self.value_count = out_features * in_features
@@ -1302,11 +1519,14 @@ def _apply_qlora_parametrizations(
             indices[1::2] = high.to(dtype=torch.long)
             indices = indices[: self.value_count]
             values = self.nf4_codebook[indices]
-            block_ids = torch.arange(
-                self.value_count,
-                dtype=torch.long,
-                device=packed.device,
-            ) // self.block_size
+            block_ids = (
+                torch.arange(
+                    self.value_count,
+                    dtype=torch.long,
+                    device=packed.device,
+                )
+                // self.block_size
+            )
             base = values * self.nf4_scales[block_ids]
             return base.reshape(self.out_features, self.in_features)
 
@@ -1386,9 +1606,7 @@ def _apply_qlora_parametrizations(
         quantized_storage_bytes += int(packed.numel() * packed.element_size())
         quantized_storage_bytes += int(scales.numel() * scales.element_size())
         quantized_storage_bytes += len(codebook_values) * 4
-        full_precision_target_bytes += int(
-            int(out_features) * int(in_features) * 4
-        )
+        full_precision_target_bytes += int(int(out_features) * int(in_features) * 4)
         target_names.append(target_name)
 
     trainable = _trainable_parameter_count(model)
@@ -1515,9 +1733,7 @@ def _reference_tokenizer_for_model(model_source_path: str) -> tuple[dict[str, An
         or not isinstance(config_vocab_size, int)
         or config_vocab_size != vocab_size
     ):
-        raise ValueError(
-            "reference model config/tokenizer vocab_size mismatch"
-        )
+        raise ValueError("reference model config/tokenizer vocab_size mismatch")
     return tokenizer_payload, vocab_size
 
 
@@ -1616,9 +1832,7 @@ def _training_objects(
         "trainable_parameter_count": base_parameter_count,
         "vocab_size": vocab_size,
         "tokenizer_fingerprint": (
-            tokenizer_fingerprint(tokenizer_payload)
-            if tokenizer_payload is not None
-            else None
+            tokenizer_fingerprint(tokenizer_payload) if tokenizer_payload is not None else None
         ),
     }
     if path_id == "LORA_SFT":
@@ -1677,7 +1891,6 @@ def _train_step(
     loss.backward()
     optimizer.step()
     return float(loss.detach().cpu().item()), int(y.numel())
-
 
 
 def _evaluation_batches(
@@ -1807,7 +2020,6 @@ def _evaluate(
     }
 
 
-
 def _capability_choice_score(
     torch: Any,
     model: Any,
@@ -1855,9 +2067,7 @@ def _capability_v1(request: dict[str, Any]) -> dict[str, object]:
         raise ValueError("config must be an object")
     unknown = sorted(set(raw_config) - {"device"})
     if unknown:
-        raise ValueError(
-            "capability_v1 config does not support keys: " + ", ".join(unknown)
-        )
+        raise ValueError("capability_v1 config does not support keys: " + ", ".join(unknown))
     requested_device = raw_config.get("device", "auto")
     if not isinstance(requested_device, str) or requested_device not in {
         "auto",
@@ -1879,8 +2089,7 @@ def _capability_v1(request: dict[str, Any]) -> dict[str, object]:
     tokenizer_payload, _ = _reference_tokenizer_for_model(model_source_path)
 
     per_axis: dict[str, _CapabilityAxisAccumulator] = {
-        axis: _CapabilityAxisAccumulator()
-        for axis in capability_v1_task_counts()
+        axis: _CapabilityAxisAccumulator() for axis in capability_v1_task_counts()
     }
     start = time.perf_counter()
     with torch.no_grad():
@@ -1905,9 +2114,7 @@ def _capability_v1(request: dict[str, Any]) -> dict[str, object]:
             prediction = max(range(4), key=lambda index: (scores[index], -index))
             correct_score = scores[task.correct_index]
             best_wrong = max(
-                score
-                for index, score in enumerate(scores)
-                if index != task.correct_index
+                score for index, score in enumerate(scores) if index != task.correct_index
             )
             axis_key = task.axis.value.lower()
             bucket = per_axis[axis_key]
@@ -1936,9 +2143,7 @@ def _capability_v1(request: dict[str, Any]) -> dict[str, object]:
                 "accuracy": correct / total,
                 "correct": correct,
                 "total": total,
-                "mean_correct_margin_nats": (
-                    sum(float(value) for value in margins) / total
-                ),
+                "mean_correct_margin_nats": (sum(float(value) for value in margins) / total),
             }
         )
 
@@ -2119,6 +2324,21 @@ def _profile_inference(
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
+    def cuda_mem_info() -> tuple[int, int] | None:
+        if device != "cuda":
+            return None
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+        except (RuntimeError, AttributeError):
+            return None
+        return int(free_bytes), int(total_bytes)
+
+    cuda_before = cuda_mem_info()
+    cuda_free_samples: list[int] = []
+    cuda_total_bytes: int | None = cuda_before[1] if cuda_before else None
+    if cuda_before is not None:
+        cuda_free_samples.append(cuda_before[0])
+
     latencies: list[float] = []
     throughputs: list[float] = []
     rss_samples: list[int] = []
@@ -2130,20 +2350,24 @@ def _profile_inference(
         rss = _process_rss_bytes()
         if rss is not None:
             rss_samples.append(rss)
+        mem_info = cuda_mem_info()
+        if mem_info is not None:
+            cuda_free_samples.append(mem_info[0])
+            cuda_total_bytes = mem_info[1]
         if not sample_ids:
             sample_ids = generated_ids
 
     mean_latency = sum(latencies) / len(latencies)
     mean_throughput = sum(throughputs) / len(throughputs)
-    sample_text = decode_with_tokenizer(
-        sample_ids, tokenizer_payload
-    ).decode("utf-8", errors="replace")
-    current_vram = (
-        int(torch.cuda.memory_allocated()) if device == "cuda" else None
+    sample_text = decode_with_tokenizer(sample_ids, tokenizer_payload).decode(
+        "utf-8", errors="replace"
     )
-    peak_vram = (
-        int(torch.cuda.max_memory_allocated()) if device == "cuda" else None
-    )
+    current_vram = int(torch.cuda.memory_allocated()) if device == "cuda" else None
+    peak_vram = int(torch.cuda.max_memory_allocated()) if device == "cuda" else None
+    cuda_after = cuda_mem_info()
+    if cuda_after is not None:
+        cuda_free_samples.append(cuda_after[0])
+        cuda_total_bytes = cuda_after[1]
 
     return {
         "schema_version": 1,
@@ -2160,17 +2384,26 @@ def _profile_inference(
             "max_new_tokens": getattr(config, "max_" + "new_tokens"),
             "warmup_runs": config.warmup_runs,
             "measured_runs": config.measured_runs,
+            "context_length": config.preset.context_length,
             "latency_seconds_runs": latencies,
             "latency_seconds_mean": mean_latency,
             "latency_seconds_p50": _median(latencies),
             "tokens_per_second_runs": throughputs,
             "tokens_per_second_mean": mean_throughput,
             "tokens_per_second_p50": _median(throughputs),
-            "max_sampled_process_rss_bytes": (
-                max(rss_samples) if rss_samples else None
-            ),
+            "max_sampled_process_rss_bytes": (max(rss_samples) if rss_samples else None),
             "cuda_memory_allocated_bytes": current_vram,
             "peak_vram_bytes": peak_vram,
+            "cuda_memory_total_bytes": cuda_total_bytes,
+            "cuda_memory_free_before_measured_bytes": (
+                cuda_before[0] if cuda_before is not None else None
+            ),
+            "cuda_memory_free_min_sampled_bytes": (
+                min(cuda_free_samples) if cuda_free_samples else None
+            ),
+            "cuda_memory_free_after_profile_bytes": (
+                cuda_after[0] if cuda_after is not None else None
+            ),
             "parameter_count": _parameter_count(model),
             "sample_generated_token_ids": sample_ids,
             "sample_continuation_text": sample_text,
@@ -2276,6 +2509,8 @@ def _birth(request: dict[str, Any]) -> dict[str, object]:
         "output_model_path": _reported_child_path(output_root, "model"),
         "metrics": birth_metadata,
     }
+
+
 def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, object]:
     torch = _import_torch()
     path_id = request.get("path_id")
@@ -2318,6 +2553,36 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
             preference_pairs,
             generator,
             dpo_tokenizer_payload,
+            config=config,
+            device=device,
+        )
+    elif path_id == "RL_POLICY_OPTIMIZATION":
+        if not isinstance(model_source_path, str) or not model_source_path:
+            raise ValueError("RL_POLICY_OPTIMIZATION requires a materialized current model")
+        rl_episodes = _read_rl_episodes(
+            _native_path(dataset_source),
+            max_bytes=config.max_dataset_bytes,
+        )
+        (
+            model,
+            optimizer,
+            generator,
+            rl_tokenizer_payload,
+            device,
+            training_details,
+        ) = _rl_training_objects(
+            torch,
+            config,
+            rl_episodes,
+            model_source_path=model_source_path,
+        )
+        _reinforce_train_step(
+            torch,
+            model,
+            optimizer,
+            rl_episodes,
+            generator,
+            rl_tokenizer_payload,
             config=config,
             device=device,
         )
@@ -2379,6 +2644,9 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
 
     rss_peak = _process_rss_bytes()
     token_count = 0
+    rl_reward_sum = 0.0
+    rl_successful = 0
+    rl_rollout_count = 0
     start = time.perf_counter()
     for _ in range(config.calibration_steps):
         if path_id == "DPO":
@@ -2393,6 +2661,20 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
                 config=config,
                 device=device,
             )
+        elif path_id == "RL_POLICY_OPTIMIZATION":
+            _, tokens, reward_mean, successful = _reinforce_train_step(
+                torch,
+                model,
+                optimizer,
+                rl_episodes,
+                generator,
+                rl_tokenizer_payload,
+                config=config,
+                device=device,
+            )
+            rl_reward_sum += reward_mean * config.batch_size
+            rl_successful += successful
+            rl_rollout_count += config.batch_size
         elif path_id == "DISTILL":
             _, tokens = _kd_step(
                 torch,
@@ -2423,9 +2705,7 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
     elapsed = max(time.perf_counter() - start, 1e-9)
     step_time = elapsed / config.calibration_steps
     tokens_per_second = token_count / elapsed
-    peak_vram = (
-        int(torch.cuda.max_memory_allocated()) if device == "cuda" else None
-    )
+    peak_vram = int(torch.cuda.max_memory_allocated()) if device == "cuda" else None
     parameter_count = _training_detail_int(training_details, "base_parameter_count")
     projected_storage = int(parameter_count * 4 * 1.05) + 16 * 1024
     calibration_preset = (
@@ -2451,6 +2731,13 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
         "preset": calibration_preset.name,
         "objective": objective,
         "training": training_details,
+        "rollout_episodes": (rl_rollout_count if path_id == "RL_POLICY_OPTIMIZATION" else None),
+        "reward_mean": (
+            rl_reward_sum / rl_rollout_count
+            if path_id == "RL_POLICY_OPTIMIZATION" and rl_rollout_count > 0
+            else None
+        ),
+        "successful_episodes": (rl_successful if path_id == "RL_POLICY_OPTIMIZATION" else None),
     }
 
 
@@ -2495,6 +2782,26 @@ def _train(
             preference_pairs,
             model_source_path=model_source_path,
         )
+    elif path_id == "RL_POLICY_OPTIMIZATION":
+        if not isinstance(model_source_path, str) or not model_source_path:
+            raise ValueError("RL_POLICY_OPTIMIZATION requires a materialized current model")
+        rl_episodes = _read_rl_episodes(
+            _native_path(dataset_source),
+            max_bytes=config.max_dataset_bytes,
+        )
+        (
+            model,
+            optimizer,
+            generator,
+            rl_tokenizer_payload,
+            device,
+            training_details,
+        ) = _rl_training_objects(
+            torch,
+            config,
+            rl_episodes,
+            model_source_path=model_source_path,
+        )
     elif path_id == "DISTILL":
         if not isinstance(model_source_path, str) or not model_source_path:
             raise ValueError("DISTILL requires a materialized teacher model")
@@ -2533,6 +2840,9 @@ def _train(
 
     losses: list[float] = []
     token_count = 0
+    rl_reward_values: list[float] = []
+    rl_successful = 0
+    rl_rollout_count = 0
     start = time.perf_counter()
     for _ in range(config.steps):
         if path_id == "DPO":
@@ -2547,6 +2857,20 @@ def _train(
                 config=config,
                 device=device,
             )
+        elif path_id == "RL_POLICY_OPTIMIZATION":
+            loss, tokens, reward_mean, successful = _reinforce_train_step(
+                torch,
+                model,
+                optimizer,
+                rl_episodes,
+                generator,
+                rl_tokenizer_payload,
+                config=config,
+                device=device,
+            )
+            rl_reward_values.append(reward_mean)
+            rl_successful += successful
+            rl_rollout_count += config.batch_size
         elif path_id == "DISTILL":
             loss, tokens = _kd_step(
                 torch,
@@ -2579,11 +2903,22 @@ def _train(
     parameter_count = _parameter_count(model)
     expected_parameter_count = _training_detail_int(training_details, "base_parameter_count")
     if parameter_count != expected_parameter_count:
-        raise ValueError(
-            "merged adapter checkpoint parameter count differs from the base model"
-        )
+        raise ValueError("merged adapter checkpoint parameter count differs from the base model")
 
-    output = (_native_path(output_root).expanduser().resolve() / "model")
+    rl_metrics: dict[str, object] = {}
+    if path_id == "RL_POLICY_OPTIMIZATION":
+        if not rl_reward_values or rl_rollout_count <= 0:
+            raise ValueError("RL training produced no rollout reward evidence")
+        rl_metrics = {
+            "rl_spec_hash": (config.rl_spec.spec_hash if config.rl_spec is not None else None),
+            "rollout_episodes": rl_rollout_count,
+            "successful_episodes": rl_successful,
+            "reward_mean": sum(rl_reward_values) / len(rl_reward_values),
+            "reward_initial": rl_reward_values[0],
+            "reward_final": rl_reward_values[-1],
+        }
+
+    output = _native_path(output_root).expanduser().resolve() / "model"
     output.mkdir(parents=True, exist_ok=True)
 
     output_preset = (
@@ -2593,9 +2928,7 @@ def _train(
     )
     if not isinstance(model_source_path, str) or not model_source_path:
         raise ValueError("trained reference output requires a source tokenizer")
-    output_tokenizer_payload, output_vocab_size = _reference_tokenizer_for_model(
-        model_source_path
-    )
+    output_tokenizer_payload, output_vocab_size = _reference_tokenizer_for_model(model_source_path)
     config_payload = {
         "architectures": ["FrontierwrightByteCausalLM"],
         "model_type": "frontierwright_byte_causal_lm",
@@ -2639,6 +2972,7 @@ def _train(
                 "initial_loss": losses[0],
                 "final_loss": losses[-1],
                 "elapsed_seconds": elapsed,
+                **rl_metrics,
             },
             sort_keys=True,
             indent=2,
@@ -2665,11 +2999,10 @@ def _train(
             "elapsed_seconds": elapsed,
             "tokens_per_second": token_count / elapsed,
             "peak_vram_bytes": (
-                int(torch.cuda.max_memory_allocated())
-                if device == "cuda"
-                else None
+                int(torch.cuda.max_memory_allocated()) if device == "cuda" else None
             ),
             "peak_ram_bytes": _process_rss_bytes(),
+            **rl_metrics,
         },
     }
 
@@ -2751,37 +3084,27 @@ def main(argv: list[str] | None = None) -> int:
         if operation == "evaluate":
             model_source_path = request.get("model_source_path")
             if not isinstance(model_source_path, str) or not model_source_path:
-                raise ValueError(
-                    "reference evaluation requires a materialized model_source_path"
-                )
+                raise ValueError("reference evaluation requires a materialized model_source_path")
             _emit(_evaluate(request, _load_evaluation_config(request)))
             return 0
         if operation == "generate":
             model_source_path = request.get("model_source_path")
             if not isinstance(model_source_path, str) or not model_source_path:
-                raise ValueError(
-                    "reference generation requires a materialized model_source_path"
-                )
+                raise ValueError("reference generation requires a materialized model_source_path")
             _emit(_generate(request, _load_generation_config(request)))
             return 0
         if operation == "profile":
             model_source_path = request.get("model_source_path")
             if not isinstance(model_source_path, str) or not model_source_path:
-                raise ValueError(
-                    "reference profiling requires a materialized model_source_path"
-                )
+                raise ValueError("reference profiling requires a materialized model_source_path")
             _emit(_profile_inference(request, _load_inference_profile_config(request)))
             return 0
         path_id = request.get("path_id")
         if path_id not in SUPPORTED_PATHS:
-            raise ValueError(
-                "reference backend supports only: " + ", ".join(SUPPORTED_PATHS)
-            )
+            raise ValueError("reference backend supports only: " + ", ".join(SUPPORTED_PATHS))
         model_source_path = request.get("model_source_path")
         if not isinstance(model_source_path, str) or not model_source_path:
-            raise ValueError(
-                "reference backend training requires a materialized model_source_path"
-            )
+            raise ValueError("reference backend training requires a materialized model_source_path")
         config = _load_config(request)
         if operation == "calibrate":
             _emit(_calibrate(request, config))

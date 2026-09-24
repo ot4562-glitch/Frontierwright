@@ -13,7 +13,7 @@ from textual.widgets import Footer, Header, Input, Static, TabbedContent, TabPan
 
 from frontierwright.data import DatasetClassification, DatasetRole
 from frontierwright.domain import ModelOrigin
-from frontierwright.editions import EditionProfile
+from frontierwright.editions import EditionProfile, policy_for
 from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.i18n import tr
@@ -28,6 +28,8 @@ from frontierwright.service import (
     PathsView,
     ResourceView,
     StatusView,
+    WorkloadFitView,
+    WorkloadView,
     add_local_dataset,
     birth_zero_model,
     calibrate_training_plan,
@@ -44,16 +46,21 @@ from frontierwright.service import (
     get_resource_view,
     get_status,
     get_tokenizers_view,
+    get_workload_fit,
+    get_workload_view,
     import_local_model,
     initialize_project,
+    profile_reference_inference,
     promote_candidate,
     reconcile_training_run,
     reject_candidate,
     run_capability_v1,
     set_build_intent,
     set_build_targets,
+    set_workload_profile,
     train_project_tokenizer,
 )
+from frontierwright.workloads import WorkloadProfile
 
 TAB_KEYS = (
     ("1", "character"),
@@ -61,9 +68,18 @@ TAB_KEYS = (
     ("3", "paths"),
     ("4", "resources"),
     ("5", "data"),
-    ("6", "history"),
-    ("7", "candidates"),
+    ("6", "workload"),
+    ("7", "history"),
+    ("8", "candidates"),
 )
+
+
+def _compact_identity(value: str | None, *, keep: int = 16) -> str:
+    if not value:
+        return "?"
+    if len(value) <= keep:
+        return value
+    return value[:keep] + "…"
 
 
 def _human_bytes(value: object) -> str:
@@ -102,10 +118,16 @@ def _compare_text(view: CompareView) -> str:
     if view.raw_evaluation_comparisons:
         lines.extend(["", "RAW EVALUATION"])
         for evidence in view.raw_evaluation_comparisons:
-            lines.append(
-                f"{evidence.get('pack_id')}@{evidence.get('pack_version')} · "
-                f"dataset={evidence.get('dataset_id')}"
-            )
+            if evidence.get("kind") == "EXTERNAL_LM_EVAL":
+                lines.append(
+                    f"lm-eval {evidence.get('evaluator_version')} · "
+                    f"tasks={evidence.get('task_count')} · external raw evidence"
+                )
+            else:
+                lines.append(
+                    f"{evidence.get('pack_id')}@{evidence.get('pack_version')} · "
+                    f"dataset={evidence.get('dataset_id')}"
+                )
             measurements = evidence.get("measurements")
             if isinstance(measurements, list):
                 for item in measurements:
@@ -130,6 +152,45 @@ def _compare_text(view: CompareView) -> str:
                 f"{str(item.get('axis')).title():10} {item.get('kind')} "
                 f"{item.get('threshold')}  {item.get('status')}"
             )
+
+    if view.workload_comparison.get("configured"):
+        champion_fit = view.workload_comparison.get("champion")
+        candidate_fit = view.workload_comparison.get("candidate")
+        lines.extend(["", "WORKLOAD FIT"])
+        if isinstance(champion_fit, dict) and isinstance(candidate_fit, dict):
+            lines.append(
+                f"Champion {champion_fit.get('overall_status')} -> "
+                f"Candidate {candidate_fit.get('overall_status')}"
+            )
+        regressions = view.workload_comparison.get("regressions")
+        if isinstance(regressions, list):
+            for item in regressions:
+                if isinstance(item, dict):
+                    lines.append(
+                        f"  ! {item.get('key')}: "
+                        f"{item.get('champion_status')} -> {item.get('candidate_status')}"
+                    )
+
+    if view.pareto:
+        lines.extend(["", f"EVIDENCE PARETO  {view.pareto.get('relation')}"])
+        metrics = view.pareto.get("metrics")
+        glyphs = {"BETTER": "▲", "WORSE": "▼", "SAME": "•"}
+        if isinstance(metrics, list):
+            for item in metrics:
+                if not isinstance(item, dict):
+                    continue
+                relation = str(item.get("relation") or "UNKNOWN")
+                if relation == "UNKNOWN":
+                    continue
+                glyph = glyphs.get(relation, "?")
+                key = str(item.get("key") or "metric")
+                lines.append(
+                    f"  {glyph} {key}: {item.get('champion_value')} -> "
+                    f"{item.get('candidate_value')}"
+                )
+        reason = view.pareto.get("inference_profile_reason")
+        if reason:
+            lines.append(f"Runtime: {reason}")
     lines.extend(
         [
             "",
@@ -140,8 +201,94 @@ def _compare_text(view: CompareView) -> str:
         override = blocker.get("override")
         suffix = f" · {override}" if override else ""
         lines.append(f"Blocked: {blocker.get('code')}{suffix}")
-    lines.extend(["", "[P] Promote   [R] Reject   [Esc] Back"])
+    lines.extend(["", "P Promote   R Reject   Esc Back"])
     return "\n".join(lines)
+
+
+def _edition_help_text(language: str, edition_profile: str | None) -> str:
+    try:
+        profile = EditionProfile(edition_profile or EditionProfile.STUDIO.value)
+    except ValueError:
+        profile = EditionProfile.STUDIO
+    keys = tr(language, "help")
+    separator = chr(10) * 2
+    if profile is EditionProfile.ACADEMY:
+        return separator.join(
+            [
+                "ACADEMY — UNDERSTAND BY DOING",
+                (
+                    "Follow the real lifecycle: data → tokenizer → birth → training → "
+                    "evaluation → candidate → champion. Unknown stats stay unknown until "
+                    "measured. Successful training can still produce a worse candidate."
+                ),
+                (
+                    "Use Actions for the next real operation. Ask yourself after each step: "
+                    "what changed in the model, what evidence was measured, and what is still "
+                    "unknown?"
+                ),
+                keys,
+            ]
+        )
+    if profile is EditionProfile.LAB:
+        return separator.join(
+            [
+                "LAB — CONTROLLED FRONTIER DEVELOPMENT",
+                (
+                    "Treat every model, dataset, evaluator, reward source, backend, resource "
+                    "profile, and candidate as versioned evidence. Prefer comparable evals, "
+                    "explicit uncertainty, hard budgets, and reproducible intervention "
+                    "recipes. Private boundaries are hard constraints."
+                ),
+                keys,
+            ]
+        )
+    return separator.join(
+        [
+            "STUDIO — FIT THE MODEL TO YOU",
+            (
+                "Start from a model you control, measure it on your machine, set the build "
+                "you actually want, and iterate through candidates. A better model is the one "
+                "that improves your workload fit under your resource envelope—not simply the "
+                "largest checkpoint."
+            ),
+            keys,
+        ]
+    )
+
+
+def _stat_line(
+    *,
+    axis: str,
+    value: float | None,
+    uncertainty: dict[str, object] | None,
+    edition_profile: str | None,
+) -> str:
+    label = f"{axis.title():10}"
+    if value is None:
+        return f"{label} ?"
+    if not isinstance(uncertainty, dict):
+        return f"{label} {value:g}"
+    lower = uncertainty.get("stat_lower")
+    upper = uncertainty.get("stat_upper")
+    sample_size = uncertainty.get("sample_size")
+    if not isinstance(lower, (int, float)) or isinstance(lower, bool):
+        return f"{label} {value:g}"
+    if not isinstance(upper, (int, float)) or isinstance(upper, bool):
+        return f"{label} {value:g}"
+    try:
+        profile = EditionProfile(edition_profile or EditionProfile.STUDIO.value)
+    except ValueError:
+        profile = EditionProfile.STUDIO
+    if profile is EditionProfile.LAB:
+        n_text = (
+            f" n={sample_size}"
+            if isinstance(sample_size, int) and not isinstance(sample_size, bool)
+            else ""
+        )
+        return f"{label} {value:g}  CI95[{float(lower):.1f}, {float(upper):.1f}]{n_text} Wilson"
+    if profile is EditionProfile.ACADEMY:
+        return f"{label} {value:g}  (95% evidence range {float(lower):.0f}–{float(upper):.0f})"
+    return f"{label} {value:g}  [{float(lower):.0f}–{float(upper):.0f}]"
 
 
 class HelpScreen(ModalScreen[None]):
@@ -151,13 +298,17 @@ class HelpScreen(ModalScreen[None]):
         Binding("?", "dismiss", "Back"),
     ]
 
-    def __init__(self, language: str) -> None:
+    def __init__(self, language: str, edition_profile: str | None) -> None:
         super().__init__()
         self.language = language
+        self.edition_profile = edition_profile
 
     def compose(self) -> ComposeResult:
         with Vertical(id="help-dialog"):
-            yield Static(tr(self.language, "help"), id="help-text")
+            yield Static(
+                _edition_help_text(self.language, self.edition_profile),
+                id="help-text",
+            )
 
 
 class CandidateScreen(ModalScreen[str | None]):
@@ -193,8 +344,6 @@ class CandidateScreen(ModalScreen[str | None]):
         self.dismiss("reject")
 
 
-
-
 @dataclass(frozen=True)
 class ActionItem:
     action_id: str
@@ -220,10 +369,18 @@ class ActionCenterScreen(ModalScreen[str | None]):
         Binding("enter", "choose", "Choose"),
     ]
 
-    def __init__(self, items: list[ActionItem]) -> None:
+    def __init__(
+        self,
+        items: list[ActionItem],
+        *,
+        title: str = "ACTION CENTER",
+        intro: str = "Every action below uses the same Frontierwright core as CLI/JSON.",
+    ) -> None:
         super().__init__()
         self.items = items
         self.index = 0
+        self.title_text = title
+        self.intro = intro
 
     def compose(self) -> ComposeResult:
         with Vertical(id="action-dialog"):
@@ -231,9 +388,9 @@ class ActionCenterScreen(ModalScreen[str | None]):
 
     def _text(self) -> str:
         lines = [
-            "ACTION CENTER",
+            self.title_text,
             "",
-            "Every action below uses the same Frontierwright core as CLI/JSON.",
+            self.intro,
             "",
         ]
         for index, item in enumerate(self.items):
@@ -352,7 +509,7 @@ class FrontierwrightApp(App[None]):
 
     CSS = """
     #character-sheet, #build-view, #paths-view, #resources-view,
-    #data-view, #history-view, #candidates-view {
+    #data-view, #workload-view, #history-view, #candidates-view {
         padding: 1 2;
     }
     #help-dialog, #candidate-dialog, #action-dialog, #form-dialog, #confirm-dialog {
@@ -396,6 +553,8 @@ class FrontierwrightApp(App[None]):
         resources: ResourceView | None = None,
         build: BuildView | None = None,
         data: DataView | None = None,
+        workload: WorkloadView | None = None,
+        workload_fit: WorkloadFitView | None = None,
         paths: PathsView | None = None,
         candidates: CandidateView | None = None,
         history: HistoryView | None = None,
@@ -408,6 +567,8 @@ class FrontierwrightApp(App[None]):
         self.resources = resources or ResourceView()
         self.build = build or BuildView(mode=view.build_mode)
         self.data = data or DataView()
+        self.workload = workload or WorkloadView()
+        self.workload_fit = workload_fit or WorkloadFitView()
         self.paths = paths or PathsView()
         self.candidates = candidates or CandidateView()
         self.history = history or HistoryView()
@@ -428,6 +589,8 @@ class FrontierwrightApp(App[None]):
                 yield Static(self._resources_text(), id="resources-view")
             with TabPane(tr(self.language, "data"), id="data"):
                 yield Static(self._data_text(), id="data-view")
+            with TabPane(tr(self.language, "workload"), id="workload"):
+                yield Static(self._workload_text(), id="workload-view")
             with TabPane(tr(self.language, "history"), id="history"):
                 yield Static(self._history_text(), id="history-view")
             with TabPane(tr(self.language, "candidates"), id="candidates"):
@@ -437,32 +600,162 @@ class FrontierwrightApp(App[None]):
     def _character_text(self) -> str:
         if not self.view.initialized:
             return tr(self.language, "no_project")
+        try:
+            edition = EditionProfile(self.view.edition_profile or EditionProfile.STUDIO.value)
+        except ValueError:
+            edition = EditionProfile.STUDIO
+
         lines = [
             self.view.nickname or "?",
             f"Edition: {self.view.edition_name or self.view.edition_profile or '?'}",
         ]
         if self.view.edition_tagline:
             lines.append(self.view.edition_tagline)
-        lines.extend(
-            [
-                f"Origin: {self.view.origin}",
-                f"History: {self.view.history_confidence}",
-                f"State: {self.view.measurement_state}",
-            ]
+        pending_count = sum(
+            1 for item in self.candidates.candidates if item.get("status") == "PENDING"
         )
-        if self.view.champion_model_id:
+
+        if edition is EditionProfile.ACADEMY:
             lines.extend(
                 [
-                    f"Model: {self.view.champion_model_id}",
-                    f"Format: {self.view.model_format}",
-                    f"Trainable: {'YES' if self.view.trainable else 'NO'}",
-                    f"Fingerprint: {self.view.model_fingerprint}",
+                    "",
+                    "LEARNING STATE",
+                    f"Origin: {self.view.origin}",
+                    f"History evidence: {self.view.history_confidence}",
+                    f"Capability: {self.view.measurement_state}",
                 ]
             )
-        lines.append("")
+            if self.view.champion_model_id is None:
+                lines.extend(
+                    [
+                        "",
+                        "NEXT CONCEPT",
+                        "Tokenizer → model birth → pretraining are different real steps.",
+                        "Use Actions to prepare data and create the first root model.",
+                    ]
+                )
+            elif self.view.measurement_state != "MEASURED":
+                lines.extend(
+                    [
+                        "",
+                        "NEXT CONCEPT",
+                        "A born/trained model has no capability stat until it is evaluated.",
+                        "Measure Capability v1, then inspect what the evidence can and cannot say.",
+                    ]
+                )
+            elif pending_count > 0:
+                lines.extend(
+                    [
+                        "",
+                        "NEXT CONCEPT",
+                        "Training created a Candidate, not an automatic improvement.",
+                        "Measure and compare it before deciding whether it becomes Champion.",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "",
+                        "NEXT CONCEPT",
+                        (
+                            "Choose one measurable goal, create a Candidate, then inspect "
+                            "gains and regressions."
+                        ),
+                    ]
+                )
+            if self.view.champion_model_id:
+                lines.append("")
+                lines.append(
+                    "Current model: " + _compact_identity(self.view.champion_model_id, keep=18)
+                )
+        elif edition is EditionProfile.LAB:
+            lines.extend(
+                [
+                    "",
+                    "CONTROLLED MODEL STATE",
+                    f"Origin: {self.view.origin}",
+                    f"History confidence: {self.view.history_confidence}",
+                    f"Measurement state: {self.view.measurement_state}",
+                ]
+            )
+            if self.view.champion_model_id:
+                lines.extend(
+                    [
+                        f"Champion: {self.view.champion_model_id}",
+                        f"Format: {self.view.model_format}",
+                        f"Trainable: {'YES' if self.view.trainable else 'NO'}",
+                        f"Fingerprint: {self.view.model_fingerprint}",
+                    ]
+                )
+            lines.extend(
+                [
+                    "",
+                    "EVIDENCE STATUS",
+                    f"Workload fit: {self.workload_fit.overall_status}",
+                    (
+                        "Inference profile: MEASURED"
+                        if self.resources.model_fit
+                        else "Inference profile: UNKNOWN"
+                    ),
+                    f"Pending candidates: {pending_count}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "YOUR MODEL / YOUR MACHINE / YOUR WORKLOAD",
+                    f"Origin: {self.view.origin}",
+                    f"Capability: {self.view.measurement_state}",
+                ]
+            )
+            if self.view.champion_model_id:
+                lines.append("Champion: " + _compact_identity(self.view.champion_model_id, keep=20))
+            lines.append(
+                "Workload fit: "
+                + (self.workload_fit.overall_status if self.workload.configured else "NOT DEFINED")
+            )
+            model_fit = self.resources.model_fit
+            if model_fit:
+                latency = model_fit.get("latency_seconds_p50")
+                throughput = model_fit.get("tokens_per_second_p50")
+                profile_parts: list[str] = []
+                if isinstance(latency, (int, float)) and not isinstance(latency, bool):
+                    profile_parts.append(f"p50 {float(latency):.3f}s")
+                if isinstance(throughput, (int, float)) and not isinstance(throughput, bool):
+                    profile_parts.append(f"{float(throughput):.1f} tok/s")
+                free_vram = model_fit.get("cuda_memory_free_min_sampled_bytes")
+                if isinstance(free_vram, int):
+                    profile_parts.append(f"{_human_bytes(free_vram)} VRAM left")
+                lines.append(
+                    "Measured machine fit: "
+                    + (" · ".join(profile_parts) if profile_parts else "PARTIAL EVIDENCE")
+                )
+            else:
+                lines.append("Measured machine fit: UNKNOWN — profile the Champion")
+            if self.workload_fit.configured and self.workload_fit.constraints:
+                gap = next(
+                    (
+                        item
+                        for item in self.workload_fit.constraints
+                        if item.get("status") in {"FAIL", "UNKNOWN"}
+                    ),
+                    None,
+                )
+                if isinstance(gap, dict):
+                    lines.append(f"Next fit gap: {gap.get('key')} · {gap.get('status')}")
+
+        lines.extend(["", "CAPABILITY"])
         for axis in ("general", "reasoning", "math", "coding"):
             value = self.view.stats.get(axis)
-            lines.append(f"{axis.title():10} {value if value is not None else '?'}")
+            lines.append(
+                _stat_line(
+                    axis=axis,
+                    value=value,
+                    uncertainty=self.view.stat_uncertainty.get(axis),
+                    edition_profile=self.view.edition_profile,
+                )
+            )
         return "\n".join(lines)
 
     def _build_text(self) -> str:
@@ -495,8 +788,7 @@ class FrontierwrightApp(App[None]):
         lines: list[str] = []
         for item in self.paths.paths:
             lines.append(
-                f"[{item.get('availability')}] {item.get('title')} "
-                f"({item.get('path_id')})"
+                f"[{item.get('availability')}] {item.get('title')} ({item.get('path_id')})"
             )
             blockers = item.get("blockers")
             if isinstance(blockers, list):
@@ -519,31 +811,104 @@ class FrontierwrightApp(App[None]):
         if not self.resources.available:
             return "NOT DETECTED\nRun: frontierwright resources detect"
         snapshot = self.resources.snapshot
-        lines = [
-            f"Provenance: {self.resources.provenance}",
-            f"CPU: {snapshot.get('cpu_model', 'UNKNOWN')}",
-            f"Logical CPUs: {snapshot.get('cpu_logical_count', 'UNKNOWN')}",
-            (
-                "RAM: "
-                f"{_human_bytes(snapshot.get('ram_total_bytes'))} total · "
-                f"{_human_bytes(snapshot.get('ram_available_bytes'))} available"
-            ),
-            (
-                "Disk: "
-                f"{_human_bytes(snapshot.get('disk_free_bytes'))} free / "
-                f"{_human_bytes(snapshot.get('disk_total_bytes'))} total"
-            ),
-        ]
-        gpus = snapshot.get("gpus")
+        headroom = self.resources.headroom
+        try:
+            profile = EditionProfile(self.view.edition_profile or EditionProfile.STUDIO.value)
+        except ValueError:
+            profile = EditionProfile.STUDIO
+
+        if profile is EditionProfile.ACADEMY:
+            lines = [
+                "AVAILABLE ON THIS MACHINE NOW",
+                "These are resources currently free. Model-specific fit needs a real profile.",
+                "",
+            ]
+        elif profile is EditionProfile.LAB:
+            lines = [
+                "SYSTEM HEADROOM — POINT-IN-TIME EVIDENCE",
+                f"Semantics: {headroom.get('semantics', 'UNKNOWN')} · model-specific=NO",
+                "",
+            ]
+        else:
+            lines = [
+                "SYSTEM HEADROOM NOW",
+                "Use a real model profile before treating this as post-load headroom.",
+                "",
+            ]
+
+        lines.extend(
+            [
+                f"Provenance: {self.resources.provenance}",
+                f"CPU: {snapshot.get('cpu_model', 'UNKNOWN')}",
+                f"Logical CPUs: {snapshot.get('cpu_logical_count', 'UNKNOWN')}",
+                (
+                    "RAM: "
+                    f"{_human_bytes(headroom.get('ram_available_bytes'))} available / "
+                    f"{_human_bytes(headroom.get('ram_total_bytes'))} total"
+                ),
+                (
+                    "Disk: "
+                    f"{_human_bytes(headroom.get('disk_available_bytes'))} available / "
+                    f"{_human_bytes(headroom.get('disk_total_bytes'))} total"
+                ),
+            ]
+        )
+        gpus = headroom.get("gpus")
         if isinstance(gpus, list) and gpus:
             for index, gpu in enumerate(gpus, start=1):
-                if isinstance(gpu, dict):
-                    lines.append(
-                        f"GPU {index}: {gpu.get('vendor', '?')} {gpu.get('name', '?')} · "
-                        f"{_human_bytes(gpu.get('memory_total_bytes'))} VRAM"
-                    )
+                if not isinstance(gpu, dict):
+                    continue
+                fraction = gpu.get("available_fraction")
+                fraction_text = (
+                    f" · {float(fraction) * 100:.0f}% free"
+                    if isinstance(fraction, (int, float)) and not isinstance(fraction, bool)
+                    else ""
+                )
+                lines.append(
+                    f"GPU {index}: {gpu.get('vendor', '?')} {gpu.get('name', '?')} · "
+                    f"{_human_bytes(gpu.get('memory_available_bytes'))} available / "
+                    f"{_human_bytes(gpu.get('memory_total_bytes'))} VRAM{fraction_text}"
+                )
         else:
             lines.append("GPU: none detected")
+
+        model_fit = self.resources.model_fit
+        if model_fit:
+            lines.append("")
+            if profile is EditionProfile.ACADEMY:
+                lines.append("WHEN THE CURRENT CHAMPION WAS ACTUALLY PROFILED")
+                lines.append(
+                    "These numbers came from running the model, not from its parameter count."
+                )
+            elif profile is EditionProfile.LAB:
+                lines.append("CHAMPION MODEL-FIT RECEIPT")
+                lines.append(
+                    f"Scope: {model_fit.get('measurement_scope') or 'UNKNOWN'} · "
+                    f"runs={model_fit.get('measured_runs') or 'UNKNOWN'}"
+                )
+            else:
+                lines.append("CURRENT CHAMPION — MEASURED FIT")
+
+            free_min = model_fit.get("cuda_memory_free_min_sampled_bytes")
+            total_vram = model_fit.get("cuda_memory_total_bytes")
+            if isinstance(free_min, int) and isinstance(total_vram, int):
+                lines.append(
+                    "VRAM left while profiled: "
+                    f"{_human_bytes(free_min)} / {_human_bytes(total_vram)}"
+                )
+            peak_vram = model_fit.get("peak_vram_bytes")
+            if isinstance(peak_vram, int):
+                lines.append(f"PyTorch peak allocation: {_human_bytes(peak_vram)}")
+            rss = model_fit.get("max_sampled_process_rss_bytes")
+            if isinstance(rss, int):
+                lines.append(f"Process RSS: {_human_bytes(rss)}")
+            latency = model_fit.get("latency_seconds_p50")
+            throughput = model_fit.get("tokens_per_second_p50")
+            if isinstance(latency, (int, float)) and not isinstance(latency, bool):
+                lines.append(f"Latency p50: {float(latency):.3f}s")
+            if isinstance(throughput, (int, float)) and not isinstance(throughput, bool):
+                lines.append(f"Throughput p50: {float(throughput):.1f} tok/s")
+
         lines.extend(
             [
                 f"Torch: {snapshot.get('torch_version') or 'not detected'}",
@@ -563,8 +928,7 @@ class FrontierwrightApp(App[None]):
         lines: list[str] = []
         for item in self.data.datasets:
             lines.append(
-                f"{item.get('name')} · {item.get('role')} · "
-                f"{_human_bytes(item.get('total_bytes'))}"
+                f"{item.get('name')} · {item.get('role')} · {_human_bytes(item.get('total_bytes'))}"
             )
             lines.append(f"  Provenance: {item.get('provenance')}")
             lines.append(f"  Classification: {item.get('classification') or 'UNKNOWN'}")
@@ -575,6 +939,178 @@ class FrontierwrightApp(App[None]):
                 lines.append(f"  Recipe: {item.get('preparation_recipe_id')}")
             lines.append("")
         return "\n".join(lines).rstrip()
+
+    def _workload_text(self) -> str:
+        if not self.view.initialized:
+            return tr(self.language, "no_project")
+        try:
+            edition = EditionProfile(self.view.edition_profile or EditionProfile.STUDIO.value)
+        except ValueError:
+            edition = EditionProfile.STUDIO
+
+        if not self.workload.configured:
+            if edition is EditionProfile.ACADEMY:
+                return chr(10).join(
+                    [
+                        "OPTIONAL LEARNING CONTEXT",
+                        (
+                            "Describe what you want the model to do. This is not a "
+                            "personality quiz; "
+                            "it is evidence about real tasks."
+                        ),
+                        "",
+                        (
+                            "You can learn the birth/training/evaluation loop without it, "
+                            "then add a "
+                            "workload when you want to study model trade-offs."
+                        ),
+                    ]
+                )
+            if edition is EditionProfile.LAB:
+                return chr(10).join(
+                    [
+                        "WORKLOAD / SERVING CONTRACT — NOT DEFINED",
+                        (
+                            "Define task mixture, serving constraints, privacy, and "
+                            "capability floors "
+                            "before claiming model utility or frontier progress."
+                        ),
+                    ]
+                )
+            return chr(10).join(
+                [
+                    "YOUR WORKLOAD — NOT DEFINED",
+                    (
+                        "Frontierwright can measure the model, but it cannot yet judge whether "
+                        "the model fits your real work."
+                    ),
+                    (
+                        "Define languages, domains, task weights, context, "
+                        "latency/throughput needs, "
+                        "privacy, and hard capability floors."
+                    ),
+                ]
+            )
+
+        profile = self.workload.profile
+        languages = profile.get("languages")
+        domains = profile.get("domains")
+        tasks = profile.get("task_weights")
+        floors = profile.get("critical_floors")
+        if edition is EditionProfile.ACADEMY:
+            lines = [
+                "WHAT SHOULD THIS MODEL LEARN TO FIT?",
+                "These are real requirements. They do not add fake capability points.",
+                "",
+                f"Workload: {self.workload.profile_name or 'Unnamed'}",
+            ]
+        elif edition is EditionProfile.LAB:
+            lines = [
+                "WORKLOAD / SERVING REQUIREMENTS",
+                f"Profile: {self.workload.profile_id}",
+                f"Hash: {self.workload.profile_hash}",
+                f"Source: {self.workload.source}",
+                "",
+            ]
+        else:
+            lines = [
+                "YOUR WORKLOAD",
+                "The Champion should be optimized for these real tasks and limits.",
+                "",
+                f"Profile: {self.workload.profile_name or 'Unnamed'}",
+            ]
+
+        if isinstance(languages, list) and languages:
+            lines.append("Languages: " + ", ".join(str(item) for item in languages))
+        if isinstance(domains, list) and domains:
+            lines.append("Domains: " + ", ".join(str(item) for item in domains))
+        if isinstance(tasks, dict) and tasks:
+            rendered_tasks = []
+            for name, weight in sorted(tasks.items()):
+                if isinstance(weight, (int, float)) and not isinstance(weight, bool):
+                    rendered_tasks.append(f"{name}×{weight:g}")
+                else:
+                    rendered_tasks.append(f"{name}×{weight}")
+            lines.append("Task mix: " + ", ".join(rendered_tasks))
+        p50 = profile.get("context_tokens_p50")
+        p95 = profile.get("context_tokens_p95")
+        if p50 is not None or p95 is not None:
+            lines.append(f"Context: p50={p50 or '?'} · p95={p95 or '?'} tokens")
+        latency = profile.get("max_latency_seconds")
+        throughput = profile.get("min_tokens_per_second")
+        if latency is not None:
+            lines.append(f"Latency ceiling: {latency}s")
+        if throughput is not None:
+            lines.append(f"Throughput floor: {throughput} tok/s")
+        lines.append(f"Privacy: {profile.get('privacy') or 'UNKNOWN'}")
+        if isinstance(floors, dict) and floors:
+            lines.append("Capability floors:")
+            for axis, value in sorted(floors.items()):
+                lines.append(f"  {str(axis).title():10} >= {value}")
+
+        fit = self.workload_fit
+        lines.extend(["", f"FIT EVIDENCE: {fit.overall_status}"])
+        if fit.configured:
+            counts = fit.counts
+            lines.append(
+                "PASS "
+                f"{counts.get('PASS', 0)} · FAIL {counts.get('FAIL', 0)} · "
+                f"UNKNOWN {counts.get('UNKNOWN', 0)}"
+            )
+            glyphs = {"PASS": "✓", "FAIL": "×", "UNKNOWN": "?"}
+            for item in fit.constraints:
+                status = str(item.get("status") or "UNKNOWN")
+                glyph = glyphs.get(status, "?")
+                key = str(item.get("key") or "constraint")
+                observed = item.get("observed")
+                required = item.get("requirement")
+                if edition is EditionProfile.ACADEMY:
+                    lines.append(f"  {glyph} {status} · {item.get('reason')}")
+                elif edition is EditionProfile.LAB:
+                    lines.append(
+                        f"  {glyph} {status} {key} · required={required} · "
+                        f"observed={observed} · evidence={item.get('evidence_source')}"
+                    )
+                else:
+                    lines.append(
+                        f"  {glyph} {status} {key} · required={required} · observed={observed}"
+                    )
+        elif fit.note:
+            lines.append(fit.note)
+
+        if edition is EditionProfile.STUDIO:
+            lines.extend(
+                [
+                    "",
+                    (
+                        "Next evidence: profile the current Champion on this machine, then compare "
+                        "measured latency/throughput and capability floors against this workload."
+                    ),
+                ]
+            )
+        elif edition is EditionProfile.LAB:
+            lines.extend(
+                [
+                    "",
+                    (
+                        "Utility claims require comparable eval receipts and measured "
+                        "serving/resource "
+                        "evidence; unknown constraints remain UNKNOWN."
+                    ),
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    (
+                        "Why this matters: a model can improve one skill while becoming slower, "
+                        "larger, or worse at another skill. Workload requirements make that "
+                        "trade-off explicit."
+                    ),
+                ]
+            )
+        return chr(10).join(lines)
 
     def _history_text(self) -> str:
         if not self.view.initialized:
@@ -588,8 +1124,7 @@ class FrontierwrightApp(App[None]):
         else:
             for event in self.history.events[-30:]:
                 lines.append(
-                    f"{event.get('sequence'):>4}  {event.get('kind')}  "
-                    f"{event.get('recorded_at')}"
+                    f"{event.get('sequence'):>4}  {event.get('kind')}  {event.get('recorded_at')}"
                 )
         return "\n".join(lines)
 
@@ -631,6 +1166,8 @@ class FrontierwrightApp(App[None]):
         self.resources = get_resource_view(self.root)
         self.build = get_build_view(self.root)
         self.data = get_data_view(self.root)
+        self.workload = get_workload_view(self.root)
+        self.workload_fit = get_workload_fit(self.root)
         self.paths = get_paths_view(self.root)
         self.candidates = get_candidates_view(self.root)
         self.history = get_history_view(self.root)
@@ -646,6 +1183,7 @@ class FrontierwrightApp(App[None]):
         self.query_one("#paths-view", Static).update(self._paths_text())
         self.query_one("#resources-view", Static).update(self._resources_text())
         self.query_one("#data-view", Static).update(self._data_text())
+        self.query_one("#workload-view", Static).update(self._workload_text())
         self.query_one("#history-view", Static).update(self._history_text())
         self.query_one("#candidates-view", Static).update(self._candidates_text())
 
@@ -670,17 +1208,13 @@ class FrontierwrightApp(App[None]):
     def action_candidate_next(self) -> None:
         if not self._on_candidates_tab() or not self.candidates.candidates:
             return
-        self.candidate_index = (self.candidate_index + 1) % len(
-            self.candidates.candidates
-        )
+        self.candidate_index = (self.candidate_index + 1) % len(self.candidates.candidates)
         self.query_one("#candidates-view", Static).update(self._candidates_text())
 
     def action_candidate_previous(self) -> None:
         if not self._on_candidates_tab() or not self.candidates.candidates:
             return
-        self.candidate_index = (self.candidate_index - 1) % len(
-            self.candidates.candidates
-        )
+        self.candidate_index = (self.candidate_index - 1) % len(self.candidates.candidates)
         self.query_one("#candidates-view", Static).update(self._candidates_text())
 
     def action_open_candidate(self) -> None:
@@ -730,7 +1264,6 @@ class FrontierwrightApp(App[None]):
             self.notify(str(exc), severity="error")
             return
         self._refresh_all()
-
 
     def _first_dataset_id(self, role: DatasetRole | None = None) -> str:
         for item in self.data.datasets:
@@ -803,12 +1336,7 @@ class FrontierwrightApp(App[None]):
             try:
                 payload = json.loads(spec_path.read_text(encoding="utf-8"))
                 argv = payload.get("train_argv") if isinstance(payload, dict) else None
-                if (
-                    isinstance(argv, list)
-                    and argv
-                    and isinstance(argv[0], str)
-                    and argv[0]
-                ):
+                if isinstance(argv, list) and argv and isinstance(argv[0], str) and argv[0]:
                     return argv[0]
             except (OSError, UnicodeError, json.JSONDecodeError):
                 pass
@@ -824,18 +1352,42 @@ class FrontierwrightApp(App[None]):
                 )
             ]
 
-        items = [
-            ActionItem(
-                "detect_resources",
-                "Detect local resources",
-                "Measure CPU/RAM/disk/GPU and refresh feasibility.",
-            ),
-            ActionItem(
-                "add_dataset",
-                "Register local dataset",
-                "Add PRETRAIN, SFT, or PREFERENCE data with an explicit classification.",
-            ),
-        ]
+        try:
+            edition = EditionProfile(self.view.edition_profile or EditionProfile.STUDIO.value)
+        except ValueError:
+            edition = EditionProfile.STUDIO
+
+        resource_action = ActionItem(
+            "detect_resources",
+            "Detect local resources",
+            "Measure CPU/RAM/disk/GPU and refresh feasibility.",
+        )
+        dataset_action = ActionItem(
+            "add_dataset",
+            "Register local dataset",
+            "Add PRETRAIN, SFT, or PREFERENCE data with an explicit classification.",
+        )
+        if edition is EditionProfile.ACADEMY:
+            workload_action = ActionItem(
+                "set_workload",
+                "Describe an optional learning workload",
+                "Connect real tasks to the model-development concepts you are learning.",
+            )
+            items = [dataset_action, resource_action, workload_action]
+        elif edition is EditionProfile.LAB:
+            workload_action = ActionItem(
+                "set_workload",
+                "Define workload / serving contract",
+                "Pin task mixture, serving constraints, privacy, and capability floors.",
+            )
+            items = [workload_action, resource_action, dataset_action]
+        else:
+            workload_action = ActionItem(
+                "set_workload",
+                "Define your workload",
+                "Tell Frontierwright what this model must do well on your machine.",
+            )
+            items = [resource_action, workload_action, dataset_action]
         if self.build.mode == "INTENT":
             items.append(
                 ActionItem(
@@ -865,6 +1417,32 @@ class FrontierwrightApp(App[None]):
                         "Run the frozen 64-task General/Reasoning/Math/Coding "
                         "bundle and update real stats."
                     ),
+                )
+            )
+            profile_title = {
+                EditionProfile.ACADEMY: "Measure speed and memory",
+                EditionProfile.STUDIO: "Profile Champion on this machine",
+                EditionProfile.LAB: "Profile Champion serving evidence",
+            }[edition]
+            profile_description = {
+                EditionProfile.ACADEMY: (
+                    "Measure how fast the real model runs and how much memory it uses; "
+                    "this shows why hardware changes which models are practical."
+                ),
+                EditionProfile.STUDIO: (
+                    "Measure latency, throughput, RAM, and VRAM so workload fit uses your "
+                    "actual machine rather than parameter-count guesses."
+                ),
+                EditionProfile.LAB: (
+                    "Record reproducible serving/runtime evidence for this exact Champion "
+                    "under explicit profile conditions."
+                ),
+            }[edition]
+            items.append(
+                ActionItem(
+                    "profile_champion_inference",
+                    profile_title,
+                    profile_description,
                 )
             )
 
@@ -942,11 +1520,35 @@ class FrontierwrightApp(App[None]):
                     "Run the same raw evaluation pack on both exact model fingerprints.",
                 )
             )
+            candidate_profile_title = {
+                EditionProfile.ACADEMY: "Measure candidate speed and memory",
+                EditionProfile.STUDIO: "Profile selected candidate on this machine",
+                EditionProfile.LAB: "Profile candidate serving evidence",
+            }[edition]
+            items.append(
+                ActionItem(
+                    "profile_candidate_inference",
+                    candidate_profile_title,
+                    (
+                        "Use the same measured runtime dimensions as the Champion so "
+                        "Candidate comparison can expose speed/memory trade-offs."
+                    ),
+                )
+            )
         return items
 
     def action_action_center(self) -> None:
+        try:
+            profile = EditionProfile(self.view.edition_profile or EditionProfile.STUDIO.value)
+        except ValueError:
+            profile = EditionProfile.STUDIO
+        policy = policy_for(profile)
         self.push_screen(
-            ActionCenterScreen(self._action_items()),
+            ActionCenterScreen(
+                self._action_items(),
+                title=policy.action_center_title,
+                intro=policy.action_center_intro,
+            ),
             self._action_center_result,
         )
 
@@ -980,6 +1582,118 @@ class FrontierwrightApp(App[None]):
                 self.notify("Resources detected.")
             except FrontierwrightError as exc:
                 self.notify(str(exc), severity="error")
+            return
+
+        if action_id == "set_workload":
+            try:
+                edition = EditionProfile(self.view.edition_profile or EditionProfile.STUDIO.value)
+            except ValueError:
+                edition = EditionProfile.STUDIO
+            workload_payload = self.workload.profile if self.workload.configured else {}
+            current_languages = workload_payload.get("languages")
+            current_domains = workload_payload.get("domains")
+            current_tasks = workload_payload.get("task_weights")
+            current_floors = workload_payload.get("critical_floors")
+            workload_fields = [
+                FormField(
+                    "name",
+                    "Workload name",
+                    self.workload.profile_name or "My real workload",
+                ),
+                FormField(
+                    "languages",
+                    "Languages (comma separated)",
+                    ", ".join(str(x) for x in current_languages)
+                    if isinstance(current_languages, list)
+                    else "",
+                ),
+                FormField(
+                    "domains",
+                    "Domains (comma separated)",
+                    ", ".join(str(x) for x in current_domains)
+                    if isinstance(current_domains, list)
+                    else "",
+                ),
+                FormField(
+                    "tasks",
+                    "Task weights (task=weight, comma separated)",
+                    ", ".join(f"{k}={v}" for k, v in sorted(current_tasks.items()))
+                    if isinstance(current_tasks, dict)
+                    else "",
+                    "research=2, coding=1",
+                ),
+            ]
+            if edition is not EditionProfile.ACADEMY:
+                workload_fields.extend(
+                    [
+                        FormField(
+                            "context_p50",
+                            "Typical context tokens (p50)",
+                            str(workload_payload.get("context_tokens_p50") or ""),
+                        ),
+                        FormField(
+                            "context_p95",
+                            "Long context tokens (p95)",
+                            str(workload_payload.get("context_tokens_p95") or ""),
+                        ),
+                        FormField(
+                            "max_latency",
+                            "Maximum acceptable latency seconds",
+                            str(workload_payload.get("max_latency_seconds") or ""),
+                        ),
+                        FormField(
+                            "min_tps",
+                            "Minimum throughput tok/s",
+                            str(workload_payload.get("min_tokens_per_second") or ""),
+                        ),
+                    ]
+                )
+            workload_fields.extend(
+                [
+                    FormField(
+                        "privacy",
+                        "Privacy classification",
+                        str(workload_payload.get("privacy") or "PRIVATE"),
+                    ),
+                    FormField(
+                        "floors",
+                        "Capability floors (axis=value, comma separated)",
+                        ", ".join(f"{k}={v}" for k, v in sorted(current_floors.items()))
+                        if isinstance(current_floors, dict)
+                        else "",
+                        "general=60, coding=55",
+                    ),
+                ]
+            )
+            description = {
+                EditionProfile.ACADEMY: (
+                    "Describe real tasks you care about. This does not give the model points; "
+                    "it helps explain why different model trade-offs matter. Advanced serving "
+                    "constraints are intentionally hidden here."
+                ),
+                EditionProfile.STUDIO: (
+                    "Define the actual work this model should fit. Unknown requirements stay "
+                    "unknown until measured; this profile is evidence, not a personality quiz."
+                ),
+                EditionProfile.LAB: (
+                    "Define the workload/serving contract used to judge candidate utility. "
+                    "Exact evaluator, reward, and runtime receipts remain separate evidence."
+                ),
+            }[edition]
+            self.push_screen(
+                WorkflowFormScreen(
+                    title=(
+                        "LEARNING WORKLOAD"
+                        if edition is EditionProfile.ACADEMY
+                        else "WORKLOAD / SERVING CONTRACT"
+                        if edition is EditionProfile.LAB
+                        else "YOUR WORKLOAD"
+                    ),
+                    description=description,
+                    fields=workload_fields,
+                ),
+                self._submit_workload,
+            )
             return
 
         if action_id == "add_dataset":
@@ -1171,6 +1885,64 @@ class FrontierwrightApp(App[None]):
             self._reconcile_latest_run()
             return
 
+        if action_id in {"profile_champion_inference", "profile_candidate_inference"}:
+            try:
+                edition = EditionProfile(self.view.edition_profile or EditionProfile.STUDIO.value)
+            except ValueError:
+                edition = EditionProfile.STUDIO
+            model_id = (
+                self.view.champion_model_id
+                if action_id == "profile_champion_inference"
+                else self._selected_candidate_model_id()
+            )
+            if not model_id:
+                self.notify("No model is available for runtime profiling.", severity="warning")
+                return
+            if edition is EditionProfile.ACADEMY:
+                title = "MEASURE SPEED + MEMORY"
+                description = (
+                    "Run the real model several times to measure latency, throughput, RAM, "
+                    "and VRAM. These measurements explain why hardware changes which models fit."
+                )
+                fields = [FormField("device", "Run on (auto/cpu/cuda)", "auto")]
+            elif edition is EditionProfile.LAB:
+                title = "PROFILE SERVING EVIDENCE"
+                description = (
+                    "Record exact local serving evidence for this model. Use identical profile "
+                    "conditions when comparing Champion and Candidate."
+                )
+                fields = [
+                    FormField(
+                        "python",
+                        "Runtime Python executable",
+                        self._reference_python_default(),
+                    ),
+                    FormField("device", "Device (auto/cpu/cuda)", "auto"),
+                    FormField("max_new_tokens", "Generated tokens per run", "16"),
+                    FormField("runs", "Measured runs", "3"),
+                ]
+            else:
+                title = "PROFILE MODEL ON THIS MACHINE"
+                description = (
+                    "Measure the exact model on your machine so Frontierwright can compare "
+                    "real speed and memory trade-offs instead of guessing from model size."
+                )
+                fields = [
+                    FormField(
+                        "python",
+                        "Runtime Python executable",
+                        self._reference_python_default(),
+                    ),
+                    FormField("device", "Device (auto/cpu/cuda)", "auto"),
+                    FormField("max_new_tokens", "Generated tokens per run", "16"),
+                    FormField("runs", "Measured runs", "3"),
+                ]
+            self.push_screen(
+                WorkflowFormScreen(title=title, description=description, fields=fields),
+                lambda values, target=model_id: self._submit_inference_profile(values, target),
+            )
+            return
+
         if action_id == "capability_v1":
             self.push_screen(
                 WorkflowFormScreen(
@@ -1287,8 +2059,7 @@ class FrontierwrightApp(App[None]):
             return
         try:
             priorities = {
-                axis: int(values[axis])
-                for axis in ("general", "reasoning", "math", "coding")
+                axis: int(values[axis]) for axis in ("general", "reasoning", "math", "coding")
             }
             set_build_intent(
                 self.root,
@@ -1320,6 +2091,53 @@ class FrontierwrightApp(App[None]):
             )
             self._refresh_all()
             self.notify("Measured build targets updated.")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_workload(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+
+        def labels(raw: str) -> tuple[str, ...]:
+            return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+        def weighted(raw: str) -> dict[str, float]:
+            result: dict[str, float] = {}
+            for item in labels(raw):
+                if "=" not in item:
+                    raise ValueError(f"Expected name=number: {item}")
+                name, raw_value = item.split("=", 1)
+                name = name.strip()
+                if not name:
+                    raise ValueError("Workload weight name cannot be empty.")
+                result[name] = float(raw_value)
+            return result
+
+        def optional_int(raw: str) -> int | None:
+            raw = raw.strip()
+            return int(raw) if raw else None
+
+        def optional_float(raw: str) -> float | None:
+            raw = raw.strip()
+            return float(raw) if raw else None
+
+        try:
+            privacy = DatasetClassification(values.get("privacy", "PRIVATE").upper())
+            profile = WorkloadProfile(
+                name=values["name"],
+                languages=labels(values.get("languages", "")),
+                domains=labels(values.get("domains", "")),
+                task_weights=weighted(values.get("tasks", "")),
+                context_tokens_p50=optional_int(values.get("context_p50", "")),
+                context_tokens_p95=optional_int(values.get("context_p95", "")),
+                max_latency_seconds=optional_float(values.get("max_latency", "")),
+                min_tokens_per_second=optional_float(values.get("min_tps", "")),
+                privacy=privacy,
+                critical_floors=weighted(values.get("floors", "")),
+            )
+            set_workload_profile(self.root, profile)
+            self._refresh_all()
+            self.notify("Workload profile updated.")
         except (FrontierwrightError, KeyError, ValueError) as exc:
             self.notify(str(exc), severity="error")
 
@@ -1483,6 +2301,38 @@ class FrontierwrightApp(App[None]):
         except FrontierwrightError as exc:
             self.notify(str(exc), severity="error")
 
+    def _submit_inference_profile(
+        self,
+        values: dict[str, str] | None,
+        model_id: str,
+    ) -> None:
+        if values is None:
+            return
+        try:
+            python_executable = values.get("python") or self._reference_python_default()
+            max_new_tokens = int(values.get("max_new_tokens") or "16")
+            measured_runs = int(values.get("runs") or "3")
+            result = profile_reference_inference(
+                self.root,
+                python_executable=python_executable,
+                model_id=model_id,
+                max_new_tokens=max_new_tokens,
+                warmup_runs=1,
+                measured_runs=measured_runs,
+                device=(values.get("device") or "auto").lower(),
+            )
+            self._refresh_all()
+            latency = result.metrics.get("latency_seconds_p50")
+            throughput = result.metrics.get("tokens_per_second_p50")
+            peak_vram = result.metrics.get("peak_vram_bytes")
+            self.notify(
+                "Runtime measured: "
+                f"p50={latency}s · {throughput} tok/s · "
+                f"peak VRAM={_human_bytes(peak_vram)}"
+            )
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
     def _submit_capability_v1(self, values: dict[str, str] | None) -> None:
         if values is None:
             return
@@ -1557,7 +2407,7 @@ class FrontierwrightApp(App[None]):
             self.notify(str(exc), severity="error")
 
     def action_show_help(self) -> None:
-        self.push_screen(HelpScreen(self.language))
+        self.push_screen(HelpScreen(self.language, self.view.edition_profile))
 
     async def action_back(self) -> None:
         return
