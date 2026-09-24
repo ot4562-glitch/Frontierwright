@@ -31,6 +31,8 @@ from frontierwright.domain import (
     BuildTargets,
     CandidateStatus,
     HistoryConfidence,
+    LineageRelation,
+    ModelFormat,
     ModelOrigin,
     ModelState,
     build_mode,
@@ -354,6 +356,25 @@ class MergeView:
     candidate_model_id: str | None = None
     model_fingerprint: str | None = None
     checkpoint: str | None = None
+    metrics: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class QuantizeView:
+    schema_version: int = 1
+    intervention_id: str = "frontierwright.optimize.symmetric-int8"
+    intervention_version: str = "1"
+    transform_id: str | None = None
+    replayed: bool = False
+    source_model_id: str | None = None
+    candidate_model_id: str | None = None
+    model_fingerprint: str | None = None
+    checkpoint: str | None = None
+    model_format: str | None = None
+    trainable: bool | None = None
     metrics: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
@@ -1082,6 +1103,298 @@ def merge_reference_models(
         other_model_id=other.model_id,
         primary_weight=primary_weight,
         other_weight=other_weight_value,
+        replayed=False,
+    )
+
+
+def _quantize_view_from_candidate(
+    registry: Registry,
+    *,
+    transform_id: str,
+    candidate_model_id: str,
+    source_model_id: str,
+    replayed: bool,
+) -> QuantizeView:
+    candidate = registry.get_candidate(candidate_model_id)
+    _verify_model_artifact_integrity(registry, candidate_model_id)
+    metrics: dict[str, object] = {}
+    metadata_path = Path(candidate.model.checkpoint) / "frontierwright-transform.json"
+    try:
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raw = {}
+    if isinstance(raw, dict):
+        metrics = dict(raw)
+    return QuantizeView(
+        transform_id=transform_id,
+        replayed=replayed,
+        source_model_id=source_model_id,
+        candidate_model_id=candidate.model.model_id,
+        model_fingerprint=candidate.model.fingerprint,
+        checkpoint=candidate.model.checkpoint,
+        model_format=candidate.model.model_format.value,
+        trainable=candidate.model.trainable,
+        metrics=metrics,
+    )
+
+
+def quantize_reference_model(
+    root: Path,
+    *,
+    python_executable: str,
+    timeout_seconds: float = 300.0,
+) -> QuantizeView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before quantizing a model.",
+            10,
+        )
+    if timeout_seconds <= 0:
+        raise FrontierwrightError("INVALID_TIMEOUT", "Quantization timeout must be positive.", 2)
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Training Python executable must be nonempty.",
+            2,
+        )
+
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required before quantization.",
+            12,
+        )
+    source = state.champion.model
+    _verify_model_artifact_integrity(registry, source.model_id)
+    if registry.get_model_birth(source.model_id) is not None:
+        raise FrontierwrightError(
+            "QUANTIZATION_SOURCE_NOT_TRAINED",
+            "An untrained birth root must complete initial pretraining before optimization.",
+            12,
+        )
+    if source.model_format is not ModelFormat.HUGGINGFACE or source.trainable is not True:
+        raise FrontierwrightError(
+            "QUANTIZATION_SOURCE_UNSUPPORTED",
+            "Reference int8 quantization requires a full trainable model checkpoint.",
+            12,
+        )
+
+    intervention = intervention_by_id("frontierwright.optimize.symmetric-int8")
+    if intervention is None:
+        raise FrontierwrightError(
+            "INTERVENTION_NOT_FOUND",
+            "Built-in symmetric int8 intervention is unavailable.",
+            4,
+        )
+
+    contract: dict[str, object] = {
+        "intervention_id": intervention.intervention_id,
+        "intervention_version": intervention.version,
+        "source": {
+            "model_id": source.model_id,
+            "fingerprint": source.fingerprint,
+        },
+        "format": "frontierwright-symmetric-int8-v1",
+    }
+    contract_json = json.dumps(
+        contract,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(contract_json.encode("utf-8")).hexdigest()
+    transform_id = f"transform-int8-{digest[:32]}"
+    candidate_model_id = f"model-int8-{digest[:32]}"
+
+    try:
+        registry.get_candidate(candidate_model_id)
+    except FrontierwrightError as exc:
+        if exc.code != "CANDIDATE_NOT_FOUND":
+            raise
+    else:
+        return _quantize_view_from_candidate(
+            registry,
+            transform_id=transform_id,
+            candidate_model_id=candidate_model_id,
+            source_model_id=source.model_id,
+            replayed=True,
+        )
+
+    transforms_root = registry.state_dir / "transforms"
+    final_root = transforms_root / transform_id
+    request_path = transforms_root / "requests" / f"{transform_id}.json"
+
+    if final_root.exists():
+        descriptor = inspect_local_model(final_root / "model")
+        if (
+            descriptor.model_format is not ModelFormat.FRONTIERWRIGHT_QUANTIZED
+            or descriptor.trainable
+        ):
+            raise FrontierwrightError(
+                "QUANTIZATION_ARTIFACT_INVALID",
+                "Existing quantization artifact is not a non-trainable quantized model.",
+                13,
+            )
+        model = ModelState(
+            model_id=candidate_model_id,
+            identity_id=source.identity_id,
+            origin=source.origin,
+            checkpoint=str(descriptor.source_path),
+            fingerprint=descriptor.fingerprint,
+            parent_model_id=source.model_id,
+            stats=(),
+            model_format=descriptor.model_format,
+            trainable=descriptor.trainable,
+        )
+        registry.register_transform_candidate(
+            model,
+            descriptor,
+            intervention_id=intervention.intervention_id,
+            intervention_version=intervention.version,
+            parents=((source.model_id, 1.0),),
+            relation=LineageRelation.TRANSFORMED_FROM,
+            details={
+                "transform_id": transform_id,
+                "recovered_existing_artifact": True,
+            },
+        )
+        return _quantize_view_from_candidate(
+            registry,
+            transform_id=transform_id,
+            candidate_model_id=candidate_model_id,
+            source_model_id=source.model_id,
+            replayed=True,
+        )
+
+    staging_root = transforms_root / ".staging" / f"{transform_id}-{uuid4().hex}"
+    staging_root.mkdir(parents=True, exist_ok=False)
+    request: dict[str, object] = {
+        "schema_version": 1,
+        "backend_id": REFERENCE_BACKEND_ID,
+        "operation": "quantize",
+        "model_source_path": source.checkpoint,
+        "parent": {
+            "model_id": source.model_id,
+            "fingerprint": source.fingerprint,
+        },
+        "output_root": str(staging_root.resolve()),
+    }
+    _write_state_json(request_path, request)
+
+    try:
+        result = run_structured_command(
+            (
+                python_executable,
+                "-m",
+                "frontierwright.reference_backend",
+                "{request_json}",
+            ),
+            environment_overrides={"PYTHONUNBUFFERED": "1"},
+            request_path=request_path,
+            timeout_seconds=timeout_seconds,
+        )
+        if result.get("operation") != "quantize":
+            raise FrontierwrightError(
+                "QUANTIZATION_RESULT_INVALID",
+                "Quantization backend did not return a quantize result.",
+                14,
+            )
+        output_raw = result.get("output_model_path")
+        metrics = result.get("metrics")
+        if not isinstance(output_raw, str) or not output_raw:
+            raise FrontierwrightError(
+                "QUANTIZATION_RESULT_INVALID",
+                "Quantization result lacks output_model_path.",
+                14,
+            )
+        if not isinstance(metrics, dict):
+            raise FrontierwrightError(
+                "QUANTIZATION_RESULT_INVALID",
+                "Quantization result metrics must be an object.",
+                14,
+            )
+        if metrics.get("intervention_id") != intervention.intervention_id:
+            raise FrontierwrightError(
+                "QUANTIZATION_RESULT_INVALID",
+                "Quantization intervention identity does not match the request.",
+                14,
+            )
+
+        backend_model_path = Path(output_raw).expanduser().resolve()
+        try:
+            backend_model_path.relative_to(staging_root.resolve())
+        except ValueError as exc:
+            raise FrontierwrightError(
+                "QUANTIZATION_OUTPUT_ESCAPE",
+                "Quantization output escaped the managed staging directory.",
+                14,
+            ) from exc
+
+        staged_descriptor = inspect_local_model(backend_model_path)
+        if (
+            staged_descriptor.model_format is not ModelFormat.FRONTIERWRIGHT_QUANTIZED
+            or staged_descriptor.trainable
+        ):
+            raise FrontierwrightError(
+                "QUANTIZATION_ARTIFACT_INVALID",
+                "Quantization backend did not produce a non-trainable quantized artifact.",
+                14,
+            )
+
+        if final_root.exists():
+            final_descriptor = inspect_local_model(final_root / "model")
+            if final_descriptor.fingerprint != staged_descriptor.fingerprint:
+                raise FrontierwrightError(
+                    "QUANTIZATION_ARTIFACT_CONFLICT",
+                    "Existing quantized artifact differs from the new result.",
+                    13,
+                )
+            shutil.rmtree(staging_root, ignore_errors=True)
+        else:
+            final_root.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staging_root, final_root)
+            final_descriptor = inspect_local_model(final_root / "model")
+            if final_descriptor.fingerprint != staged_descriptor.fingerprint:
+                raise FrontierwrightError(
+                    "QUANTIZATION_ARTIFACT_MISMATCH",
+                    "Quantized artifact fingerprint changed during publication.",
+                    14,
+                )
+
+        model = ModelState(
+            model_id=candidate_model_id,
+            identity_id=source.identity_id,
+            origin=source.origin,
+            checkpoint=str(final_descriptor.source_path),
+            fingerprint=final_descriptor.fingerprint,
+            parent_model_id=source.model_id,
+            stats=(),
+            model_format=final_descriptor.model_format,
+            trainable=final_descriptor.trainable,
+        )
+        registry.register_transform_candidate(
+            model,
+            final_descriptor,
+            intervention_id=intervention.intervention_id,
+            intervention_version=intervention.version,
+            parents=((source.model_id, 1.0),),
+            relation=LineageRelation.TRANSFORMED_FROM,
+            details={"transform_id": transform_id, "metrics": dict(metrics)},
+        )
+    except Exception:
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+
+    return _quantize_view_from_candidate(
+        registry,
+        transform_id=transform_id,
+        candidate_model_id=candidate_model_id,
+        source_model_id=source.model_id,
         replayed=False,
     )
 

@@ -54,6 +54,7 @@ class LineageRelation(StrEnum):
 class ModelFormat(StrEnum):
     HUGGINGFACE = "HUGGINGFACE"
     GGUF = "GGUF"
+    FRONTIERWRIGHT_QUANTIZED = "FRONTIERWRIGHT_QUANTIZED"
     CUSTOM = "CUSTOM"
 
 

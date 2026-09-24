@@ -112,6 +112,14 @@ def test_distillation_is_builtin_evolve_training_intervention() -> None:
     assert assessment.blockers == ()
 
 
+def test_symmetric_int8_is_builtin_optimize_artifact_transform() -> None:
+    item = intervention_by_id("frontierwright.optimize.symmetric-int8")
+    assert item is not None
+    assert item.family is InterventionFamily.OPTIMIZE
+    assert item.surface is InterventionSurface.ARTIFACT_TRANSFORM
+    assert item.training_path_id is None
+
+
 def test_linear_merge_is_builtin_evolve_artifact_transform() -> None:
     item = intervention_by_id("frontierwright.evolve.linear-merge")
     assert item is not None

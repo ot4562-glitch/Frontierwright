@@ -22,6 +22,10 @@ from pathlib import Path
 from typing import Any
 
 from frontierwright.reference_merge import merge_reference_models
+from frontierwright.reference_quantization import (
+    load_quantized_reference_state,
+    quantize_reference_model,
+)
 
 REFERENCE_BACKEND_ID = "frontierwright-reference-pytorch-v1"
 SUPPORTED_PATHS = (
@@ -1341,11 +1345,11 @@ def _load_reference_model(
     if not source.is_dir():
         raise ValueError("model_source_path must be a model directory")
     weights_path = source / "pytorch_model.bin"
+    quantized_weights_path = source / "quantized_model.pt"
+    quantized_metadata_path = source / "frontierwright-quantized.json"
     config_path = source / "config.json"
-    if not weights_path.is_file() or not config_path.is_file():
-        raise ValueError(
-            "reference model must contain config.json and pytorch_model.bin"
-        )
+    if not config_path.is_file():
+        raise ValueError("reference model must contain config.json")
 
     root_config = json.loads(config_path.read_text(encoding="utf-8"))
     if (
@@ -1359,11 +1363,19 @@ def _load_reference_model(
         )
 
     model = _build_model(torch, preset)
-    state_dict = torch.load(
-        weights_path,
-        map_location="cpu",
-        weights_only=True,
-    )
+    if weights_path.is_file():
+        state_dict = torch.load(
+            weights_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    elif quantized_weights_path.is_file() and quantized_metadata_path.is_file():
+        state_dict = load_quantized_reference_state(torch, source)
+    else:
+        raise ValueError(
+            "reference model must contain pytorch_model.bin or a supported "
+            "Frontierwright quantized checkpoint"
+        )
     model.load_state_dict(state_dict)
     return model.to(device)
 
@@ -2115,6 +2127,20 @@ def main(argv: list[str] | None = None) -> int:
                     backend_id=REFERENCE_BACKEND_ID,
                     presets=PRESETS,
                     build_model=_build_model,
+                    load_reference_model=_load_reference_model,
+                    parameter_count=_parameter_count,
+                    native_path=_native_path,
+                    reported_child_path=_reported_child_path,
+                    request=request,
+                )
+            )
+            return 0
+        if operation == "quantize":
+            _emit(
+                quantize_reference_model(
+                    torch=_import_torch(),
+                    backend_id=REFERENCE_BACKEND_ID,
+                    presets=PRESETS,
                     load_reference_model=_load_reference_model,
                     parameter_count=_parameter_count,
                     native_path=_native_path,

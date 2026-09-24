@@ -37,6 +37,13 @@ _PARTIAL_HISTORY_NAMES = {
     "run_config.json",
 }
 _LINEAGE_MANIFEST_NAME = "frontierwright-lineage.json"
+_QUANTIZED_ARTIFACT_NAMES = {
+    "config.json",
+    "tokenizer.json",
+    "frontierwright-quantized.json",
+    "frontierwright-transform.json",
+    "quantized_model.pt",
+}
 
 
 @dataclass(frozen=True)
@@ -178,6 +185,49 @@ class LocalHuggingFaceAdapter:
         )
 
 
+
+
+class LocalFrontierwrightQuantizedAdapter:
+    adapter_id = "frontierwright-quantized-v1"
+
+    def supports(self, source: Path) -> bool:
+        return (
+            source.is_dir()
+            and (source / "frontierwright-quantized.json").is_file()
+            and (source / "quantized_model.pt").is_file()
+        )
+
+    def inspect(self, source: Path) -> ImportedModelDescriptor:
+        root = source.resolve()
+        required = (
+            "config.json",
+            "tokenizer.json",
+            "frontierwright-quantized.json",
+            "quantized_model.pt",
+        )
+        missing = [name for name in required if not (root / name).is_file()]
+        if missing:
+            raise FrontierwrightError(
+                "MODEL_ARTIFACT_MISSING",
+                "Quantized Frontierwright model is missing: " + ", ".join(missing),
+                12,
+            )
+        artifacts = [
+            path
+            for path in root.rglob("*")
+            if path.is_file() and path.name in _QUANTIZED_ARTIFACT_NAMES
+        ]
+        fingerprint, total, files = _fingerprint_files(root, artifacts)
+        return ImportedModelDescriptor(
+            source_path=root,
+            model_format=ModelFormat.FRONTIERWRIGHT_QUANTIZED,
+            trainable=False,
+            fingerprint=fingerprint,
+            total_bytes=total,
+            files=files,
+        )
+
+
 class LocalGGUFAdapter:
     adapter_id = "local-gguf-v1"
 
@@ -199,6 +249,7 @@ class LocalGGUFAdapter:
 
 
 DEFAULT_ADAPTERS: tuple[ModelSourceAdapter, ...] = (
+    LocalFrontierwrightQuantizedAdapter(),
     LocalHuggingFaceAdapter(),
     LocalGGUFAdapter(),
 )

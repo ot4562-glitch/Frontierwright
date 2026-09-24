@@ -40,6 +40,7 @@ from frontierwright.service import (
     MergeView,
     PathsView,
     PlanView,
+    QuantizeView,
     ResourceView,
     RunView,
     StatsView,
@@ -75,6 +76,7 @@ from frontierwright.service import (
     prepare_dataset,
     prepare_dataset_mixture,
     promote_candidate,
+    quantize_reference_model,
     reconcile_training_run,
     reject_candidate,
     repair_run_receipt,
@@ -99,6 +101,7 @@ plan_app = typer.Typer(help="Create and inspect pinned training plans.")
 backend_app = typer.Typer(help="Inspect and configure training backends.")
 birth_app = typer.Typer(help="Materialize and inspect zero-model birth state.")
 evolve_app = typer.Typer(help="Evolve models through artifact transforms.")
+optimize_app = typer.Typer(help="Optimize model artifacts for deployment/inference.")
 lab_app = typer.Typer(help="Connect and inspect controlled private Lab infrastructure.")
 lab_adapters_app = typer.Typer(help="Manage Lab adapter manifests.")
 lab_app.add_typer(lab_adapters_app, name="adapters")
@@ -112,6 +115,7 @@ app.add_typer(plan_app, name="plan")
 app.add_typer(backend_app, name="backend")
 app.add_typer(birth_app, name="birth")
 app.add_typer(evolve_app, name="evolve")
+app.add_typer(optimize_app, name="optimize")
 app.add_typer(lab_app, name="lab")
 
 console = Console()
@@ -202,6 +206,10 @@ def _candidate_payload(view: CandidateView) -> dict[str, object]:
 
 
 def _merge_payload(view: MergeView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _quantize_payload(view: QuantizeView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -535,6 +543,22 @@ def _print_merge(view: MergeView) -> None:
     console.print(f"Candidate: {view.candidate_model_id}")
     console.print(f"Fingerprint: {view.model_fingerprint}")
     console.print(f"Replay: {'YES' if view.replayed else 'NO'}")
+    if view.checkpoint:
+        console.print(f"Checkpoint: {view.checkpoint}")
+
+
+def _print_quantize(view: QuantizeView) -> None:
+    console.print("[bold]INT8 QUANTIZATION[/bold]")
+    console.print(f"Transform: {view.transform_id}")
+    console.print(f"Source: {view.source_model_id}")
+    console.print(f"Candidate: {view.candidate_model_id}")
+    console.print(f"Format: {view.model_format}")
+    console.print(f"Trainable: {'YES' if view.trainable else 'NO'}")
+    console.print(f"Fingerprint: {view.model_fingerprint}")
+    console.print(f"Replay: {'YES' if view.replayed else 'NO'}")
+    ratio = view.metrics.get("tensor_storage_ratio")
+    if isinstance(ratio, (int, float)) and not isinstance(ratio, bool):
+        console.print(f"Tensor storage ratio: {float(ratio):.3f}")
     if view.checkpoint:
         console.print(f"Checkpoint: {view.checkpoint}")
 
@@ -961,6 +985,50 @@ def evolve_merge(
     _print_merge(view)
     console.print(
         "\nMerge created a PENDING candidate. Evaluate and compare it before promotion."
+    )
+
+
+@optimize_app.command("quantize")
+def optimize_quantize(
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    python_executable: Annotated[
+        str,
+        typer.Option(
+            "--python",
+            help="Python executable for the isolated PyTorch transform environment.",
+        ),
+    ] = sys.executable,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--timeout",
+            help="Maximum quantization backend wall time in seconds.",
+        ),
+    ] = 300.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = quantize_reference_model(
+            path,
+            python_executable=python_executable,
+            timeout_seconds=timeout_seconds,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_quantize_payload(view))
+        return
+    _print_quantize(view)
+    console.print(
+        "\nQuantization created a PENDING optimized-model candidate. "
+        "Evaluate and compare it before promotion."
     )
 
 

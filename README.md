@@ -123,7 +123,7 @@ Implemented now:
 - extensible intervention taxonomy spanning `BIRTH / LEARN / SPECIALIZE / ALIGN / EVOLVE / OPTIMIZE / EVALUATE / OPERATE`;
 - discoverable InterventionPlugin registry with explicit execution surfaces; built-in training interventions wrap their real path-assessment plugins rather than acting as display-only labels;
 - `frontierwright interventions --json` exposes stable intervention ID/provider/version/family/surface metadata to automation;
-- the five v1 training paths remain registered built-in interventions; post-v1 built-ins now include `frontierwright.align.dpo`, `frontierwright.evolve.distill`, and the EVOLVE artifact transform `frontierwright.evolve.linear-merge`; the list is not the permanent top-level ontology;
+- the five v1 training paths remain registered built-in interventions; post-v1 built-ins now include `frontierwright.align.dpo`, `frontierwright.evolve.distill`, the EVOLVE artifact transform `frontierwright.evolve.linear-merge`, and the OPTIMIZE artifact transform `frontierwright.optimize.symmetric-int8`; the list is not the permanent top-level ontology;
 - factual path prerequisite evaluation using current model trainability, local data inventory, resources, birth state, and history confidence;
 - Academy zero-model birth via `frontierwright birth zero`, with deterministic `zero-8m` / `zero-25m` root checkpoint materialization, exact fingerprinting, runtime provenance, and idempotent repeated birth requests;
 - from-scratch pretraining now requires and pins a materialized zero-model birth root instead of silently reinitializing weights;
@@ -140,6 +140,7 @@ Implemented now:
 - reference DPO consumes UTF-8 JSONL `{prompt, chosen, rejected}` preference pairs, keeps an exact frozen reference copy of the current checkpoint, optimizes the policy with the pairwise log-ratio objective and pinned `dpo_beta`, and runs the same objective during calibration so readiness reflects the real alignment workload;
 - reference distillation freezes the current Champion as teacher, initializes a separately pinned smaller student preset, minimizes a temperature-scaled teacher-logit KL term mixed with hard-token cross-entropy, requires the student to have fewer parameters than the teacher, calibrates the same teacher+student workload, and records `DISTILLED_FROM` lineage on the resulting PENDING candidate;
 - `frontierwright evolve merge` performs deterministic linear weight merging for two compatible Frontierwright reference models, requires identical preset/tokenizer/state structure, fingerprints transform provenance into the model artifact, creates a PENDING candidate, and records both parents as weighted `MERGED_FROM` lineage edges; identical transform requests replay the existing candidate instead of recomputing;
+- `frontierwright optimize quantize` performs deterministic per-tensor symmetric int8 post-training quantization of a trained Frontierwright reference Champion, preserves the full model as its parent, creates a non-trainable PENDING optimized-model candidate with `TRANSFORMED_FROM` lineage, and records exact source/quantized tensor-storage evidence; the reference evaluator can reload the quantized artifact for before/after raw evaluation, while an untrained birth root is explicitly rejected; the current reference loader dequantizes to float32 for execution, so Frontierwright claims the measured storage reduction only—not runtime RAM, latency, or throughput gains;
 - successful training output is copied into a Frontierwright-managed sealed artifact before candidate registration;
 - sealed artifact manifests bind the run, plan, intervention ID/version/family, dataset, dataset-preparation recipe, backend, effective config, model fingerprint, and exact file hashes;
 - built-in evaluation-pack registry exposed through `frontierwright eval packs`; the first pack runs deterministic held-out causal-LM evaluation for Frontierwright reference models;
@@ -152,7 +153,7 @@ Implemented now:
 - training creates a `PENDING` candidate and never silently changes the champion;
 - candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
 - promotion re-checks current champion/build/evaluation state transactionally, enforces frozen-scale build floors by default, and records explicit override evidence when a user intentionally accepts an unmeasured or build-violating candidate;
-- stable JSON/non-interactive machine surfaces for project/model/birth/evolve/resource/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter operations;
+- stable JSON/non-interactive machine surfaces for project/model/birth/evolve/optimize/resource/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter operations;
 - mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;
 - English/Korean human-string structure;
 - automated domain, migration, evaluation, execution recovery/idempotency, artifact integrity, candidate, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.

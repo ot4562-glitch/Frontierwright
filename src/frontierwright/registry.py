@@ -1523,11 +1523,17 @@ WHERE parent_model_id IS NOT NULL;
         intervention_version: str,
         parents: tuple[tuple[str, float], ...],
         details: dict[str, object],
+        relation: LineageRelation = LineageRelation.MERGED_FROM,
     ) -> None:
-        if len(parents) < 2:
+        minimum_parents = 2 if relation is LineageRelation.MERGED_FROM else 1
+        if len(parents) < minimum_parents:
             raise FrontierwrightError(
                 "TRANSFORM_PARENTS_INVALID",
-                "Artifact transforms require at least two parent models.",
+                (
+                    "Merge transforms require at least two parent models."
+                    if relation is LineageRelation.MERGED_FROM
+                    else "Artifact transforms require at least one parent model."
+                ),
                 2,
             )
         with self.connect(write=True) as connection:
@@ -1544,14 +1550,25 @@ WHERE parent_model_id IS NOT NULL;
                 )
 
             for parent_model_id, weight in parents:
-                if (
+                upper_inclusive = relation is not LineageRelation.MERGED_FROM
+                invalid_weight = (
                     isinstance(weight, bool)
                     or not isinstance(weight, (int, float))
-                    or not 0.0 < float(weight) < 1.0
-                ):
+                    or float(weight) <= 0.0
+                    or (
+                        float(weight) > 1.0
+                        if upper_inclusive
+                        else float(weight) >= 1.0
+                    )
+                )
+                if invalid_weight:
                     raise FrontierwrightError(
                         "TRANSFORM_WEIGHT_INVALID",
-                        "Transform parent weights must be strictly between 0 and 1.",
+                        (
+                            "Merge parent weights must be strictly between 0 and 1."
+                            if relation is LineageRelation.MERGED_FROM
+                            else "Transform parent weights must be in (0, 1]."
+                        ),
                         2,
                     )
                 row = connection.execute(
@@ -1617,7 +1634,7 @@ WHERE parent_model_id IS NOT NULL;
                     connection,
                     child_model_id=model.model_id,
                     parent_model_id=parent_model_id,
-                    relation=LineageRelation.MERGED_FROM,
+                    relation=relation,
                     ordinal=ordinal,
                     details={
                         "weight": float(weight),
@@ -1633,6 +1650,7 @@ WHERE parent_model_id IS NOT NULL;
                     "fingerprint": model.fingerprint,
                     "intervention_id": intervention_id,
                     "intervention_version": intervention_version,
+                    "lineage_relation": relation.value,
                     "parents": [
                         {"model_id": parent_id, "weight": float(weight)}
                         for parent_id, weight in parents

@@ -199,6 +199,16 @@ BUILTIN_INTERVENTION_PLUGINS: tuple[InterventionPlugin, ...] = (
     ),
     ArtifactTransformInterventionPlugin(
         descriptor=InterventionDescriptor(
+            intervention_id="frontierwright.optimize.symmetric-int8",
+            family=InterventionFamily.OPTIMIZE,
+            title="Symmetric int8 quantization",
+            version="1",
+            provider="frontierwright",
+            surface=InterventionSurface.ARTIFACT_TRANSFORM,
+        )
+    ),
+    ArtifactTransformInterventionPlugin(
+        descriptor=InterventionDescriptor(
             intervention_id="frontierwright.evolve.linear-merge",
             family=InterventionFamily.EVOLVE,
             title="Linear weight merge",

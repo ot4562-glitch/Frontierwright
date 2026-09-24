@@ -115,6 +115,58 @@ def test_imported_model_becomes_current_unmeasured_champion(tmp_path: Path) -> N
     assert view.model_fingerprint is not None
 
 
+def test_frontierwright_quantized_is_inspectable_but_not_trainable(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "quantized"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "frontierwright_reference_backend": (
+                    "frontierwright-reference-pytorch-v1"
+                ),
+                "preset": "zero-8m",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model / "tokenizer.json").write_text(
+        '{"type":"frontierwright-byte-level","vocab_size":256}',
+        encoding="utf-8",
+    )
+    (model / "frontierwright-quantized.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "format": "frontierwright-symmetric-int8-v1",
+                "tensor_metadata": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model / "frontierwright-transform.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "intervention_id": "frontierwright.optimize.symmetric-int8",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model / "quantized_model.pt").write_bytes(b"quantized-fixture")
+
+    first = inspect_local_model(model)
+    second = inspect_local_model(model)
+    assert first.model_format is ModelFormat.FRONTIERWRIGHT_QUANTIZED
+    assert first.trainable is False
+    assert first.fingerprint == second.fingerprint
+
+    (model / "quantized_model.pt").write_bytes(b"quantized-fixture-changed")
+    changed = inspect_local_model(model)
+    assert changed.fingerprint != first.fingerprint
+
+
 def test_gguf_is_inspectable_but_not_trainable(tmp_path: Path) -> None:
     gguf = tmp_path / "model.gguf"
     gguf.write_bytes(b"GGUF-test")
