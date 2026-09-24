@@ -2,12 +2,19 @@ import json
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 import frontierwright.service as service_module
+from frontierwright.cli import app
 from frontierwright.domain import ModelFormat, ModelOrigin, ModelState
 from frontierwright.errors import FrontierwrightError
 from frontierwright.registry import Registry
-from frontierwright.service import compare_candidate, merge_reference_models, promote_candidate
+from frontierwright.service import (
+    compare_candidate,
+    merge_reference_models,
+    preflight_merge_reference_models,
+    promote_candidate,
+)
 
 
 def make_model_dir(root: Path, label: str) -> Path:
@@ -198,6 +205,52 @@ def test_identical_merge_replays_without_backend_rerun(
     assert first.replayed is False
     assert second.replayed is True
 
+
+
+
+def test_merge_dry_run_is_side_effect_free_and_predicts_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, registry, _, other = setup_project(tmp_path)
+
+    def must_not_execute(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("merge dry-run executed backend")
+
+    monkeypatch.setattr(service_module, "run_structured_command", must_not_execute)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "evolve", "merge", other.model_id,
+            "--path", str(project),
+            "--other-weight", "0.4",
+            "--python", "fixture-python",
+            "--dry-run", "--json", "--non-interactive", "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["action"] == "evolve-merge"
+    assert payload["would_replay"] is False
+    assert len(registry.read().candidates) == 2
+
+    monkeypatch.setattr(service_module, "run_structured_command", fake_merge_backend)
+    created = merge_reference_models(
+        project,
+        other_model_id=other.model_id,
+        other_weight=0.4,
+        python_executable="fixture-python",
+    )
+    replay = preflight_merge_reference_models(
+        project,
+        other_model_id=other.model_id,
+        other_weight=0.4,
+        python_executable="different-python",
+    )
+    assert replay.would_replay is True
+    assert replay.details["candidate_model_id"] == created.candidate_model_id
 
 def test_merge_artifact_tampering_blocks_compare_and_promotion(
     tmp_path: Path,

@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 
@@ -39,6 +40,23 @@ def _venv_frontierwright(root: Path) -> Path:
     return root / "bin" / "frontierwright"
 
 
+def _assert_release_legal_files(wheel: Path) -> None:
+    required = {"LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"}
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+    present = {
+        Path(name).name
+        for name in names
+        if ".dist-info/licenses/" in name.replace("\\", "/")
+    }
+    missing = required - present
+    if missing:
+        raise SystemExit(
+            "wheel is missing required release legal files: "
+            + ", ".join(sorted(missing))
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("wheel", type=Path, nargs="?")
@@ -53,6 +71,7 @@ def main() -> int:
         wheel = args.wheel.expanduser().resolve()
     if not wheel.is_file():
         raise SystemExit(f"wheel not found: {wheel}")
+    _assert_release_legal_files(wheel)
 
     with tempfile.TemporaryDirectory(prefix="frontierwright-release-smoke-") as tmp:
         tmp_root = Path(tmp)

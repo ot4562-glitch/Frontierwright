@@ -2,8 +2,10 @@ import json
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 import frontierwright.service as service_module
+from frontierwright.cli import app
 from frontierwright.data import DatasetRole
 from frontierwright.domain import ModelOrigin, ModelState
 from frontierwright.errors import FrontierwrightError
@@ -16,6 +18,7 @@ from frontierwright.service import (
     get_evaluation_packs,
     get_stats_view,
     import_local_model,
+    preflight_evaluation_pack,
     run_evaluation_pack,
 )
 
@@ -207,6 +210,99 @@ def test_reference_evaluation_replays_identical_receipt_without_backend(
     assert first.receipt_sha256 == second.receipt_sha256
     assert second.replayed is True
 
+
+
+
+def test_reference_evaluation_preflight_is_side_effect_free_and_predicts_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, dataset_id = setup_project(tmp_path)
+    registry = Registry(project)
+
+    preview = preflight_evaluation_pack(
+        project,
+        pack_id=REFERENCE_LM_PACK.pack_id,
+        dataset_id=dataset_id,
+        python_executable="fixture-python",
+        device="cpu",
+        batch_size=2,
+        max_batches=2,
+    )
+    assert preview.action == "eval-run"
+    assert preview.ready is True
+    assert preview.would_replay is False
+    receipt_id = str(preview.details["receipt_id"])
+    assert registry.get_evaluation_receipt(receipt_id) is None
+
+    monkeypatch.setattr(
+        service_module,
+        "run_structured_command",
+        fake_evaluator_result,
+    )
+    measured = run_evaluation_pack(
+        project,
+        pack_id=REFERENCE_LM_PACK.pack_id,
+        dataset_id=dataset_id,
+        python_executable="fixture-python",
+        device="cpu",
+        batch_size=2,
+        max_batches=2,
+    )
+    replay = preflight_evaluation_pack(
+        project,
+        pack_id=REFERENCE_LM_PACK.pack_id,
+        dataset_id=dataset_id,
+        python_executable="different-python",
+        device="cpu",
+        batch_size=2,
+        max_batches=2,
+    )
+    assert replay.would_replay is True
+    assert replay.details["receipt_id"] == measured.receipt_id
+
+
+def test_reference_evaluation_cli_dry_run_does_not_execute_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, dataset_id = setup_project(tmp_path)
+
+    def must_not_execute(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("dry-run executed raw evaluator backend")
+
+    monkeypatch.setattr(service_module, "run_structured_command", must_not_execute)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "run",
+            "--path",
+            str(project),
+            "--dataset",
+            dataset_id,
+            "--python",
+            "fixture-python",
+            "--device",
+            "cpu",
+            "--batch-size",
+            "2",
+            "--max-batches",
+            "2",
+            "--dry-run",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["action"] == "eval-run"
+    assert payload["ready"] is True
+    assert payload["would_replay"] is False
 
 def test_evaluation_config_change_creates_distinct_receipt(
     tmp_path: Path,

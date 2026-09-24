@@ -73,6 +73,19 @@ def _export_id_for(
     return f"export-{digest[:32]}"
 
 
+def portable_export_id_for(
+    *,
+    model_fingerprint: str,
+    provenance: dict[str, object],
+) -> str:
+    """Return the deterministic portable-export identity without writing files."""
+
+    return _export_id_for(
+        model_fingerprint=model_fingerprint,
+        provenance=provenance,
+    )
+
+
 def _safe_bundle_path(root: Path, relative: str) -> Path:
     candidate = (root / relative).resolve()
     try:

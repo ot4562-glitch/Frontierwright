@@ -3,8 +3,10 @@ import math
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 import frontierwright.service as service_module
+from frontierwright.cli import app
 from frontierwright.data import DatasetRole
 from frontierwright.domain import ModelOrigin, ModelState
 from frontierwright.errors import FrontierwrightError
@@ -16,6 +18,7 @@ from frontierwright.service import (
     compare_candidate,
     compare_candidate_evaluation,
     import_local_model,
+    preflight_quantize_reference_model,
     promote_candidate,
     quantize_reference_model,
 )
@@ -211,6 +214,44 @@ def test_identical_quantization_replays_without_backend_rerun(
 
 
 
+
+
+
+def test_quantization_dry_run_is_side_effect_free_and_predicts_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, registry, champion_id = setup_project(tmp_path)
+
+    def must_not_execute(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("quantization dry-run executed backend")
+
+    monkeypatch.setattr(service_module, "run_structured_command", must_not_execute)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "optimize", "quantize",
+            "--path", str(project),
+            "--python", "fixture-python",
+            "--dry-run", "--json", "--non-interactive", "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["action"] == "optimize-quantize"
+    assert payload["would_replay"] is False
+    assert registry.read().project["champion_id"] == champion_id
+
+    monkeypatch.setattr(service_module, "run_structured_command", fake_quantize_backend)
+    created = quantize_reference_model(project, python_executable="fixture-python")
+    replay = preflight_quantize_reference_model(
+        project,
+        python_executable="different-python",
+    )
+    assert replay.would_replay is True
+    assert replay.details["candidate_model_id"] == created.candidate_model_id
 
 def test_quantized_candidate_runs_normal_raw_evaluation_compare(
     tmp_path: Path,

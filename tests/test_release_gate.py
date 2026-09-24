@@ -170,3 +170,21 @@ def test_evaluation_backend_request_excludes_game_and_project_metadata(
         "history_confidence",
     ):
         assert forbidden not in serialized
+
+
+def test_release_legal_notices_are_prepared() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    notice = (repository_root / "NOTICE").read_text(encoding="utf-8")
+    third_party = (repository_root / "THIRD_PARTY_NOTICES.md").read_text(
+        encoding="utf-8"
+    )
+    pyproject = (repository_root / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "must be added" not in notice.lower()
+    assert "THIRD_PARTY_NOTICES.md" in notice
+    assert "Typer" in third_party
+    assert "Textual" in third_party
+    assert "Rich" in third_party
+    assert "PyTorch" in third_party
+    assert "psutil" in third_party
+    assert 'license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]' in pyproject

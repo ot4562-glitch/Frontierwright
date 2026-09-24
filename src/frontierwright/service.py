@@ -73,7 +73,11 @@ from frontierwright.execution import (
     run_calibration_backend,
     run_structured_command,
 )
-from frontierwright.exporting import publish_portable_export, verify_portable_export
+from frontierwright.exporting import (
+    portable_export_id_for,
+    publish_portable_export,
+    verify_portable_export,
+)
 from frontierwright.interventions import (
     assess_training_interventions,
     intervention_by_id,
@@ -1045,6 +1049,140 @@ def train_project_tokenizer(
         raise
 
 
+def preflight_zero_birth(
+    root: Path,
+    *,
+    preset: str,
+    seed: int,
+    python_executable: str,
+    tokenizer_artifact_id: str | None = None,
+    timeout_seconds: float = 300.0,
+) -> ActionPreflightView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a ZERO-origin Frontierwright project before model birth.",
+            10,
+        )
+    if preset not in PRESETS:
+        raise FrontierwrightError(
+            "BIRTH_PRESET_UNKNOWN",
+            f"Unknown zero-model preset: {preset}",
+            2,
+        )
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise FrontierwrightError(
+            "BIRTH_SEED_INVALID",
+            "Birth seed must be a nonnegative integer.",
+            2,
+        )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
+        raise FrontierwrightError(
+            "INVALID_TIMEOUT",
+            "Birth timeout must be a positive finite number.",
+            2,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Training Python executable must be nonempty.",
+            2,
+        )
+
+    state = registry.read()
+    if ModelOrigin(state.project["origin"]) is not ModelOrigin.ZERO:
+        raise FrontierwrightError(
+            "BIRTH_ORIGIN_MISMATCH",
+            "Model birth is only valid for ZERO-origin projects.",
+            13,
+        )
+
+    tokenizer_fingerprint: str | None = None
+    tokenizer_vocab_size: int | None = None
+    if tokenizer_artifact_id is not None:
+        if not tokenizer_artifact_id.strip():
+            raise FrontierwrightError(
+                "BIRTH_TOKENIZER_INVALID",
+                "Tokenizer artifact ID must be nonempty when supplied.",
+                2,
+            )
+        tokenizer = next(
+            (
+                item
+                for item in get_tokenizers_view(root).tokenizers
+                if item.get("artifact_id") == tokenizer_artifact_id
+            ),
+            None,
+        )
+        if tokenizer is None:
+            raise FrontierwrightError(
+                "BIRTH_TOKENIZER_NOT_FOUND",
+                "Selected tokenizer artifact is not registered in this project.",
+                12,
+            )
+        raw_fingerprint = tokenizer.get("fingerprint")
+        raw_vocab_size = tokenizer.get("vocab_size")
+        if not isinstance(raw_fingerprint, str) or not raw_fingerprint:
+            raise FrontierwrightError(
+                "BIRTH_TOKENIZER_INVALID",
+                "Selected tokenizer artifact has no stable fingerprint.",
+                4,
+            )
+        if (
+            isinstance(raw_vocab_size, bool)
+            or not isinstance(raw_vocab_size, int)
+            or raw_vocab_size <= 0
+        ):
+            raise FrontierwrightError(
+                "BIRTH_TOKENIZER_INVALID",
+                "Selected tokenizer artifact has no valid vocabulary size.",
+                4,
+            )
+        tokenizer_fingerprint = raw_fingerprint
+        tokenizer_vocab_size = raw_vocab_size
+
+    existing_model_id: str | None = None
+    would_replay = False
+    if state.champion is not None:
+        existing_model_id = state.champion.model.model_id
+        existing = registry.get_model_birth(existing_model_id)
+        would_replay = bool(
+            existing is not None
+            and existing.get("preset") == preset
+            and existing.get("seed") == seed
+            and existing.get("tokenizer_artifact_id") == tokenizer_artifact_id
+            and existing.get("tokenizer_fingerprint") == tokenizer_fingerprint
+        )
+        if not would_replay:
+            raise FrontierwrightError(
+                "MODEL_ALREADY_BORN",
+                "Project already has a materialized current model.",
+                13,
+            )
+
+    return ActionPreflightView(
+        action="birth-zero",
+        ready=True,
+        would_replay=would_replay,
+        details={
+            "preset": preset,
+            "seed": seed,
+            "python_executable": python_executable,
+            "timeout_seconds": float(timeout_seconds),
+            "tokenizer_artifact_id": tokenizer_artifact_id,
+            "tokenizer_fingerprint": tokenizer_fingerprint,
+            "tokenizer_vocab_size": tokenizer_vocab_size,
+            "existing_model_id": existing_model_id,
+        },
+    )
+
+
 def birth_zero_model(
     root: Path,
     *,
@@ -1334,6 +1472,129 @@ def _merge_view_from_candidate(
         model_fingerprint=candidate.model.fingerprint,
         checkpoint=candidate.model.checkpoint,
         metrics=metrics,
+    )
+
+
+def preflight_merge_reference_models(
+    root: Path,
+    *,
+    other_model_id: str,
+    other_weight: float,
+    python_executable: str,
+    timeout_seconds: float = 300.0,
+) -> ActionPreflightView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before merging models.",
+            10,
+        )
+    if (
+        isinstance(other_weight, bool)
+        or not isinstance(other_weight, (int, float))
+        or not math.isfinite(float(other_weight))
+        or not 0.0 < float(other_weight) < 1.0
+    ):
+        raise FrontierwrightError(
+            "MERGE_WEIGHT_INVALID",
+            "Merge other-model weight must be strictly between 0 and 1.",
+            2,
+        )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
+        raise FrontierwrightError("INVALID_TIMEOUT", "Merge timeout must be positive.", 2)
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Training Python executable must be nonempty.",
+            2,
+        )
+
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required before model merge.",
+            12,
+        )
+    primary = state.champion.model
+    other = registry.get_model(other_model_id)
+    if other.model_id == primary.model_id:
+        raise FrontierwrightError(
+            "MERGE_PARENT_CONFLICT",
+            "Merge requires two different model identities.",
+            2,
+        )
+    if other.identity_id != primary.identity_id:
+        raise FrontierwrightError(
+            "IDENTITY_MISMATCH",
+            "Merge parents must belong to the same Frontierwright identity.",
+            13,
+        )
+    _verify_model_artifact_integrity(registry, primary.model_id)
+    _verify_model_artifact_integrity(registry, other.model_id)
+
+    intervention = intervention_by_id("frontierwright.evolve.linear-merge")
+    if intervention is None:
+        raise FrontierwrightError(
+            "INTERVENTION_NOT_FOUND",
+            "Built-in linear merge intervention is unavailable.",
+            4,
+        )
+    other_weight_value = float(other_weight)
+    primary_weight = 1.0 - other_weight_value
+    contract: dict[str, object] = {
+        "intervention_id": intervention.intervention_id,
+        "intervention_version": intervention.version,
+        "primary": {
+            "model_id": primary.model_id,
+            "fingerprint": primary.fingerprint,
+            "weight": primary_weight,
+        },
+        "other": {
+            "model_id": other.model_id,
+            "fingerprint": other.fingerprint,
+            "weight": other_weight_value,
+        },
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            contract,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    transform_id = f"transform-merge-{digest[:32]}"
+    candidate_model_id = f"model-merge-{digest[:32]}"
+    try:
+        registry.get_candidate(candidate_model_id)
+        would_replay = True
+    except FrontierwrightError as exc:
+        if exc.code != "CANDIDATE_NOT_FOUND":
+            raise
+        would_replay = (registry.state_dir / "transforms" / transform_id).exists()
+
+    return ActionPreflightView(
+        action="evolve-merge",
+        ready=True,
+        would_replay=would_replay,
+        details={
+            "transform_id": transform_id,
+            "candidate_model_id": candidate_model_id,
+            "primary_model_id": primary.model_id,
+            "other_model_id": other.model_id,
+            "primary_weight": primary_weight,
+            "other_weight": other_weight_value,
+            "python_executable": python_executable,
+            "timeout_seconds": float(timeout_seconds),
+        },
     )
 
 
@@ -1664,6 +1925,108 @@ def _quantize_view_from_candidate(
     )
 
 
+def preflight_quantize_reference_model(
+    root: Path,
+    *,
+    python_executable: str,
+    timeout_seconds: float = 300.0,
+) -> ActionPreflightView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before quantizing a model.",
+            10,
+        )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
+        raise FrontierwrightError(
+            "INVALID_TIMEOUT",
+            "Quantization timeout must be positive.",
+            2,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Training Python executable must be nonempty.",
+            2,
+        )
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required before quantization.",
+            12,
+        )
+    source = state.champion.model
+    _verify_model_artifact_integrity(registry, source.model_id)
+    if registry.get_model_birth(source.model_id) is not None:
+        raise FrontierwrightError(
+            "QUANTIZATION_SOURCE_NOT_TRAINED",
+            "An untrained birth root must complete initial pretraining before optimization.",
+            12,
+        )
+    if source.model_format is not ModelFormat.HUGGINGFACE or source.trainable is not True:
+        raise FrontierwrightError(
+            "QUANTIZATION_SOURCE_UNSUPPORTED",
+            "Reference int8 quantization requires a full trainable model checkpoint.",
+            12,
+        )
+    intervention = intervention_by_id("frontierwright.optimize.symmetric-int8")
+    if intervention is None:
+        raise FrontierwrightError(
+            "INTERVENTION_NOT_FOUND",
+            "Built-in symmetric int8 intervention is unavailable.",
+            4,
+        )
+    contract: dict[str, object] = {
+        "intervention_id": intervention.intervention_id,
+        "intervention_version": intervention.version,
+        "source": {
+            "model_id": source.model_id,
+            "fingerprint": source.fingerprint,
+        },
+        "format": "frontierwright-symmetric-int8-v1",
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            contract,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    transform_id = f"transform-int8-{digest[:32]}"
+    candidate_model_id = f"model-int8-{digest[:32]}"
+    try:
+        registry.get_candidate(candidate_model_id)
+        would_replay = True
+    except FrontierwrightError as exc:
+        if exc.code != "CANDIDATE_NOT_FOUND":
+            raise
+        would_replay = (registry.state_dir / "transforms" / transform_id).exists()
+
+    return ActionPreflightView(
+        action="optimize-quantize",
+        ready=True,
+        would_replay=would_replay,
+        details={
+            "transform_id": transform_id,
+            "candidate_model_id": candidate_model_id,
+            "source_model_id": source.model_id,
+            "source_fingerprint": source.fingerprint,
+            "format": "frontierwright-symmetric-int8-v1",
+            "python_executable": python_executable,
+            "timeout_seconds": float(timeout_seconds),
+        },
+    )
+
+
 def quantize_reference_model(
     root: Path,
     *,
@@ -1943,6 +2306,132 @@ def _portable_capability_evidence(
         "measurements",
     )
     return {key: profile.get(key) for key in keys}
+
+
+def preflight_export_champion_bundle(
+    root: Path,
+    destination: Path,
+) -> ActionPreflightView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before exporting a model.",
+            10,
+        )
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required before export.",
+            12,
+        )
+    model = state.champion.model
+    _verify_model_artifact_integrity(registry, model.model_id)
+    descriptor = inspect_local_model(Path(model.checkpoint))
+    if descriptor.fingerprint != model.fingerprint:
+        raise FrontierwrightError(
+            "ARTIFACT_TAMPERED",
+            "Current champion bytes no longer match the registered fingerprint.",
+            13,
+        )
+    intervention = intervention_by_id("frontierwright.operate.portable-export")
+    if intervention is None:
+        raise FrontierwrightError(
+            "INTERVENTION_NOT_FOUND",
+            "Built-in portable export intervention is unavailable.",
+            4,
+        )
+
+    artifact = registry.get_model_artifact(model.model_id)
+    history_evidence: dict[str, object] | None = None
+    if artifact is not None:
+        history_evidence = {
+            "confidence": artifact.get("evidence_confidence"),
+            "evidence_files": artifact.get("evidence_files", []),
+            "reason": artifact.get("evidence_reason"),
+        }
+    lineage = [
+        {
+            "parent_model_id": edge.get("parent_model_id"),
+            "relation": edge.get("relation"),
+            "ordinal": edge.get("ordinal"),
+            "details": edge.get("details", {}),
+        }
+        for edge in registry.get_model_lineage(model.model_id)
+    ]
+    profile = registry.get_active_capability_profile(model.model_id)
+    provenance: dict[str, object] = {
+        "project": {
+            "project_id": state.project.get("project_id"),
+            "name": state.project.get("name"),
+            "edition_profile": state.project.get("edition_profile"),
+            "language": state.project.get("language"),
+        },
+        "model": {
+            "model_id": model.model_id,
+            "identity_id": model.identity_id,
+            "origin": model.origin.value,
+            "model_format": model.model_format.value,
+            "trainable": model.trainable,
+            "fingerprint": model.fingerprint,
+            "parent_model_id": model.parent_model_id,
+        },
+        "history_evidence": history_evidence,
+        "lineage": lineage,
+        "capability_evidence": _portable_capability_evidence(profile),
+    }
+    export_id = portable_export_id_for(
+        model_fingerprint=descriptor.fingerprint,
+        provenance=provenance,
+    )
+    resolved_destination = destination.expanduser().resolve()
+    source = descriptor.source_path.resolve()
+    if source.is_dir():
+        try:
+            resolved_destination.relative_to(source)
+        except ValueError:
+            pass
+        else:
+            raise FrontierwrightError(
+                "EXPORT_DESTINATION_UNSAFE",
+                "Export destination must not be inside the source model directory.",
+                2,
+            )
+
+    would_replay = False
+    if resolved_destination.exists():
+        try:
+            verified = verify_portable_export(resolved_destination)
+        except FrontierwrightError as exc:
+            raise FrontierwrightError(
+                "EXPORT_DESTINATION_CONFLICT",
+                "Export destination already exists but is not the expected portable export.",
+                13,
+            ) from exc
+        if (
+            verified.export_id != export_id
+            or verified.descriptor.fingerprint != descriptor.fingerprint
+        ):
+            raise FrontierwrightError(
+                "EXPORT_DESTINATION_CONFLICT",
+                "Export destination is bound to a different export identity.",
+                13,
+            )
+        would_replay = True
+
+    return ActionPreflightView(
+        action="operate-export",
+        ready=True,
+        would_replay=would_replay,
+        details={
+            "export_id": export_id,
+            "model_id": model.model_id,
+            "model_fingerprint": model.fingerprint,
+            "destination": str(resolved_destination),
+            "total_bytes": descriptor.total_bytes,
+        },
+    )
 
 
 def export_champion_bundle(
@@ -2646,6 +3135,129 @@ def _capability_v1_run_view(
     )
 
 
+def preflight_capability_v1(
+    root: Path,
+    *,
+    model_id: str | None = None,
+    python_executable: str,
+    device: str = "auto",
+    timeout_seconds: float = 300.0,
+) -> ActionPreflightView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before capability evaluation.",
+            10,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Capability evaluator Python executable must be nonempty.",
+            2,
+        )
+    if device not in {"auto", "cpu", "cuda"}:
+        raise FrontierwrightError(
+            "EVALUATION_CONFIG_INVALID",
+            "device must be auto, cpu, or cuda.",
+            2,
+        )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
+        raise FrontierwrightError(
+            "EVALUATION_CONFIG_INVALID",
+            "timeout_seconds must be a positive finite number.",
+            2,
+        )
+
+    state = registry.read()
+    if model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "A current champion or explicit --model is required for capability evaluation.",
+                12,
+            )
+        model = state.champion.model
+    else:
+        model = registry.get_model(model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+
+    bundle_hash = capability_v1_bundle_hash()
+    task_counts = capability_v1_task_counts()
+    config = {"device": device}
+    identity_payload: dict[str, object] = {
+        "schema_version": 1,
+        "bundle_id": CAPABILITY_V1_BUNDLE_ID,
+        "bundle_version": CAPABILITY_V1_BUNDLE_VERSION,
+        "bundle_hash": bundle_hash,
+        "scale_hash": CAPABILITY_V1_SCALE.sha256,
+        "scoring": CAPABILITY_V1_SCORING,
+        "model_id": model.model_id,
+        "model_fingerprint": model.fingerprint,
+        "config": config,
+    }
+    identity_digest = hashlib.sha256(
+        json.dumps(
+            identity_payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt_id = f"receipt-cap-v1-{identity_digest[:32]}"
+
+    existing = registry.get_evaluation_receipt(receipt_id)
+    if existing is not None:
+        receipt = _receipt_from_registry_row(existing)
+        expected = {
+            "bundle_id": CAPABILITY_V1_BUNDLE_ID,
+            "bundle_version": CAPABILITY_V1_BUNDLE_VERSION,
+            "bundle_hash": bundle_hash,
+            "scale_id": CAPABILITY_V1_SCALE.scale_id,
+            "scale_version": CAPABILITY_V1_SCALE.scale_version,
+            "scale_hash": CAPABILITY_V1_SCALE.sha256,
+            "scoring": CAPABILITY_V1_SCORING,
+            "task_counts": task_counts,
+            "config": config,
+        }
+        if not (
+            receipt.model_id == model.model_id
+            and receipt.model_fingerprint == model.fingerprint
+            and receipt.evaluator_id == CAPABILITY_V1_EVALUATOR_ID
+            and receipt.evaluator_version == CAPABILITY_V1_EVALUATOR_VERSION
+            and all(receipt.conditions.get(key) == value for key, value in expected.items())
+        ):
+            raise FrontierwrightError(
+                "EVALUATION_RECEIPT_CONFLICT",
+                "Capability v1 receipt identity is occupied by different evidence.",
+                13,
+            )
+
+    return ActionPreflightView(
+        action="eval-capability-v1",
+        ready=True,
+        would_replay=existing is not None,
+        details={
+            "model_id": model.model_id,
+            "model_fingerprint": model.fingerprint,
+            "bundle_id": CAPABILITY_V1_BUNDLE_ID,
+            "bundle_version": CAPABILITY_V1_BUNDLE_VERSION,
+            "bundle_hash": bundle_hash,
+            "scale_hash": CAPABILITY_V1_SCALE.sha256,
+            "receipt_id": receipt_id,
+            "device": device,
+            "python_executable": python_executable,
+            "timeout_seconds": float(timeout_seconds),
+        },
+    )
+
+
 def run_capability_v1(
     root: Path,
     *,
@@ -3048,6 +3660,202 @@ def _raw_measurement_map(
             )
         result[key] = (float(value), direction)
     return result
+
+
+def preflight_reference_evaluation(
+    root: Path,
+    *,
+    dataset_id: str,
+    model_id: str | None = None,
+    python_executable: str,
+    device: str = "auto",
+    batch_size: int = 4,
+    max_batches: int = 16,
+    max_dataset_bytes: int = 64 * 1024 * 1024,
+    timeout_seconds: float = 300.0,
+) -> ActionPreflightView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before evaluation.",
+            10,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Evaluation Python executable must be nonempty.",
+            2,
+        )
+    if device not in {"auto", "cpu", "cuda"}:
+        raise FrontierwrightError(
+            "EVALUATION_CONFIG_INVALID",
+            "device must be auto, cpu, or cuda.",
+            2,
+        )
+    for label, value in (
+        ("batch_size", batch_size),
+        ("max_batches", max_batches),
+        ("max_dataset_bytes", max_dataset_bytes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise FrontierwrightError(
+                "EVALUATION_CONFIG_INVALID",
+                f"{label} must be a positive integer.",
+                2,
+            )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
+        raise FrontierwrightError(
+            "EVALUATION_CONFIG_INVALID",
+            "timeout_seconds must be a positive finite number.",
+            2,
+        )
+
+    state = registry.read()
+    if model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "A current champion or explicit --model is required for evaluation.",
+                12,
+            )
+        model = state.champion.model
+    else:
+        model = registry.get_model(model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+
+    dataset = next(
+        (item for item in state.datasets if item.get("dataset_id") == dataset_id),
+        None,
+    )
+    if dataset is None:
+        raise FrontierwrightError(
+            "DATASET_NOT_FOUND",
+            f"Active evaluation dataset not found: {dataset_id}",
+            3,
+        )
+    source_path = dataset.get("source_path")
+    fingerprint = dataset.get("fingerprint")
+    if not isinstance(source_path, str) or not isinstance(fingerprint, str):
+        raise FrontierwrightError(
+            "DATASET_INVALID",
+            "Evaluation dataset registry metadata is incomplete.",
+            4,
+        )
+    descriptor = inspect_local_dataset(Path(source_path))
+    if descriptor.fingerprint != fingerprint:
+        raise FrontierwrightError(
+            "DATASET_CONTENT_DRIFT",
+            "Evaluation dataset content changed after registration.",
+            13,
+        )
+
+    config: dict[str, object] = {
+        "device": device,
+        "batch_size": batch_size,
+        "max_batches": max_batches,
+        "max_dataset_bytes": max_dataset_bytes,
+    }
+    identity_payload: dict[str, object] = {
+        "schema_version": 1,
+        "pack_id": REFERENCE_LM_PACK.pack_id,
+        "pack_version": REFERENCE_LM_PACK.pack_version,
+        "model_id": model.model_id,
+        "model_fingerprint": model.fingerprint,
+        "dataset_id": dataset_id,
+        "dataset_fingerprint": fingerprint,
+        "config": config,
+    }
+    identity_digest = hashlib.sha256(
+        json.dumps(
+            identity_payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt_id = f"receipt-eval-{identity_digest[:32]}"
+    existing = registry.get_evaluation_receipt(receipt_id)
+    if existing is not None:
+        receipt = _receipt_from_registry_row(existing)
+        expected_conditions = {
+            "pack_id": REFERENCE_LM_PACK.pack_id,
+            "pack_version": REFERENCE_LM_PACK.pack_version,
+            "dataset_id": dataset_id,
+            "dataset_fingerprint": fingerprint,
+            "config": config,
+        }
+        if not (
+            receipt.model_id == model.model_id
+            and receipt.model_fingerprint == model.fingerprint
+            and receipt.evaluator_id == REFERENCE_LM_PACK.evaluator_id
+            and receipt.evaluator_version == REFERENCE_LM_PACK.evaluator_version
+            and all(
+                receipt.conditions.get(key) == value
+                for key, value in expected_conditions.items()
+            )
+        ):
+            raise FrontierwrightError(
+                "EVALUATION_RECEIPT_CONFLICT",
+                "Deterministic evaluation receipt ID is occupied by different evidence.",
+                13,
+            )
+
+    return ActionPreflightView(
+        action="eval-run",
+        ready=True,
+        would_replay=existing is not None,
+        details={
+            "pack_id": REFERENCE_LM_PACK.pack_id,
+            "pack_version": REFERENCE_LM_PACK.pack_version,
+            "model_id": model.model_id,
+            "model_fingerprint": model.fingerprint,
+            "dataset_id": dataset_id,
+            "dataset_fingerprint": fingerprint,
+            "receipt_id": receipt_id,
+            "config": config,
+            "python_executable": python_executable,
+            "timeout_seconds": float(timeout_seconds),
+        },
+    )
+
+
+def preflight_evaluation_pack(
+    root: Path,
+    *,
+    pack_id: str,
+    dataset_id: str,
+    model_id: str | None = None,
+    python_executable: str,
+    device: str = "auto",
+    batch_size: int = 4,
+    max_batches: int = 16,
+    max_dataset_bytes: int = 64 * 1024 * 1024,
+    timeout_seconds: float = 300.0,
+) -> ActionPreflightView:
+    if pack_id != REFERENCE_LM_PACK.pack_id:
+        raise FrontierwrightError(
+            "EVALUATION_PACK_UNSUPPORTED",
+            f"Evaluation pack is not executable in this build: {pack_id}",
+            12,
+        )
+    return preflight_reference_evaluation(
+        root,
+        dataset_id=dataset_id,
+        model_id=model_id,
+        python_executable=python_executable,
+        device=device,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        max_dataset_bytes=max_dataset_bytes,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def run_reference_evaluation(
@@ -4018,6 +4826,111 @@ def _resolve_preparation_sources(
     return resolved
 
 
+def preflight_prepare_dataset(
+    root: Path,
+    *,
+    dataset_id: str,
+    plugin_id: str,
+    config: dict[str, object] | None = None,
+) -> ActionPreflightView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before preparing data.",
+            10,
+        )
+    state = registry.read()
+    source = next(
+        (item for item in state.datasets if item.get("dataset_id") == dataset_id),
+        None,
+    )
+    if source is None:
+        raise FrontierwrightError(
+            "DATASET_NOT_FOUND",
+            "Source dataset is not active in this project.",
+            3,
+        )
+    plugin = data_preparation_plugin(plugin_id)
+    source_role = source.get("role")
+    if plugin_id == PREFERENCE_JSONL_PLUGIN_ID and source_role != DatasetRole.PREFERENCE.value:
+        raise FrontierwrightError(
+            "DATA_RECIPE_ROLE_INCOMPATIBLE",
+            "preference-jsonl requires a PREFERENCE dataset.",
+            12,
+        )
+    if (
+        source_role == DatasetRole.PREFERENCE.value
+        and plugin_id not in {SNAPSHOT_COPY_PLUGIN_ID, PREFERENCE_JSONL_PLUGIN_ID}
+    ):
+        raise FrontierwrightError(
+            "DATA_RECIPE_ROLE_INCOMPATIBLE",
+            "PREFERENCE datasets may only use snapshot-copy or preference-jsonl preparation.",
+            12,
+        )
+    source_is_prepared = isinstance(source.get("preparation_recipe_hash"), str)
+    if source_is_prepared and not plugin.accepts_prepared_source:
+        raise FrontierwrightError(
+            "DATASET_ALREADY_PREPARED",
+            "This preparation recipe does not accept an already prepared source.",
+            13,
+        )
+    if plugin.requires_prepared_source and not source_is_prepared:
+        raise FrontierwrightError(
+            "DATA_RECIPE_PREPARED_SOURCE_REQUIRED",
+            "This preparation recipe requires a managed prepared dataset as its source.",
+            13,
+        )
+    source_path = source.get("source_path")
+    source_fingerprint = source.get("fingerprint")
+    if not isinstance(source_path, str) or not isinstance(source_fingerprint, str):
+        raise FrontierwrightError(
+            "DATASET_INVALID",
+            "Source dataset registry metadata is incomplete.",
+            4,
+        )
+    descriptor = inspect_local_dataset(Path(source_path))
+    if descriptor.fingerprint != source_fingerprint:
+        raise FrontierwrightError(
+            "DATASET_CONTENT_DRIFT",
+            "Source dataset content changed after registration; register the new content first.",
+            13,
+        )
+    recipe = plugin.build_recipe(
+        source_dataset_id=dataset_id,
+        source_fingerprint=source_fingerprint,
+        config=config,
+    )
+    resolved = _resolve_preparation_sources(state, plugin, recipe)
+    existing_dataset_id = next(
+        (
+            str(item["dataset_id"])
+            for item in state.datasets
+            if item.get("preparation_recipe_hash") == recipe.recipe_hash
+            and isinstance(item.get("dataset_id"), str)
+        ),
+        None,
+    )
+    artifact_root = registry.state_dir / "data" / "prepared" / recipe.recipe_id
+    return ActionPreflightView(
+        action="data-prepare",
+        ready=True,
+        would_replay=existing_dataset_id is not None,
+        details={
+            "dataset_id": dataset_id,
+            "source_fingerprint": source_fingerprint,
+            "plugin_id": recipe.plugin_id,
+            "plugin_version": recipe.plugin_version,
+            "recipe_id": recipe.recipe_id,
+            "recipe_hash": recipe.recipe_hash,
+            "config": recipe.config,
+            "source_count": len(resolved),
+            "existing_dataset_id": existing_dataset_id,
+            "managed_artifact_exists": artifact_root.exists(),
+        },
+    )
+
+
 def prepare_dataset(
     root: Path,
     *,
@@ -4135,6 +5048,140 @@ def prepare_dataset_snapshot(
         name=name,
     )
 
+
+
+def preflight_prepare_dataset_mixture(
+    root: Path,
+    *,
+    inputs: list[tuple[str, int]],
+    max_output_bytes: int = 4 * 1024**3,
+) -> ActionPreflightView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before mixing data.",
+            10,
+        )
+    if len(inputs) < 2:
+        raise FrontierwrightError(
+            "DATA_MIXTURE_INPUTS_INVALID",
+            "A weighted mixture requires at least two prepared datasets.",
+            2,
+        )
+    if (
+        isinstance(max_output_bytes, bool)
+        or not isinstance(max_output_bytes, int)
+        or max_output_bytes <= 0
+    ):
+        raise FrontierwrightError(
+            "DATA_MIXTURE_INPUTS_INVALID",
+            "max_output_bytes must be a positive integer.",
+            2,
+        )
+
+    state = registry.read()
+    rows = {
+        str(item["dataset_id"]): item
+        for item in state.datasets
+        if isinstance(item.get("dataset_id"), str)
+    }
+    seen_ids: set[str] = set()
+    selected: list[dict[str, object]] = []
+    source_specs: list[dict[str, object]] = []
+    for dataset_id, parts in inputs:
+        if dataset_id in seen_ids:
+            raise FrontierwrightError(
+                "DATA_MIXTURE_INPUTS_INVALID",
+                f"Mixture dataset is duplicated: {dataset_id}",
+                2,
+            )
+        seen_ids.add(dataset_id)
+        if isinstance(parts, bool) or not isinstance(parts, int) or parts <= 0:
+            raise FrontierwrightError(
+                "DATA_MIXTURE_INPUTS_INVALID",
+                f"Mixture parts must be a positive integer: {dataset_id}",
+                2,
+            )
+        row = rows.get(dataset_id)
+        if row is None:
+            raise FrontierwrightError(
+                "DATASET_NOT_FOUND",
+                f"Mixture source dataset is not active: {dataset_id}",
+                3,
+            )
+        recipe_id = row.get("preparation_recipe_id")
+        fingerprint = row.get("fingerprint")
+        if not isinstance(recipe_id, str) or not isinstance(fingerprint, str):
+            raise FrontierwrightError(
+                "DATA_MIXTURE_SOURCE_INVALID",
+                f"Weighted mixture source is not managed prepared text: {dataset_id}",
+                13,
+            )
+        source_recipe = registry.get_data_recipe(recipe_id)
+        if source_recipe is None or source_recipe.get("plugin_id") not in {
+            TEXT_LINES_PLUGIN_ID,
+            WEIGHTED_TEXT_MIXTURE_PLUGIN_ID,
+        }:
+            raise FrontierwrightError(
+                "DATA_MIXTURE_SOURCE_INVALID",
+                f"Weighted mixture source has incompatible recipe: {dataset_id}",
+                13,
+            )
+        selected.append(row)
+        source_specs.append(
+            {"dataset_id": dataset_id, "fingerprint": fingerprint, "parts": parts}
+        )
+
+    roles = {str(item["role"]) for item in selected}
+    provenances = {str(item["provenance"]) for item in selected}
+    if len(roles) != 1:
+        raise FrontierwrightError(
+            "DATA_MIXTURE_METADATA_CONFLICT",
+            "Mixture sources must have the same dataset role.",
+            13,
+        )
+    if len(provenances) != 1:
+        raise FrontierwrightError(
+            "DATA_MIXTURE_METADATA_CONFLICT",
+            "Mixture sources must have the same provenance.",
+            13,
+        )
+
+    primary = selected[0]
+    plugin = data_preparation_plugin(WEIGHTED_TEXT_MIXTURE_PLUGIN_ID)
+    recipe = plugin.build_recipe(
+        source_dataset_id=str(primary["dataset_id"]),
+        source_fingerprint=str(primary["fingerprint"]),
+        config={"sources": source_specs, "max_output_bytes": max_output_bytes},
+    )
+    resolved = _resolve_preparation_sources(state, plugin, recipe)
+    existing_dataset_id = next(
+        (
+            str(item["dataset_id"])
+            for item in state.datasets
+            if item.get("preparation_recipe_hash") == recipe.recipe_hash
+            and isinstance(item.get("dataset_id"), str)
+        ),
+        None,
+    )
+    artifact_root = registry.state_dir / "data" / "prepared" / recipe.recipe_id
+    return ActionPreflightView(
+        action="data-mix",
+        ready=True,
+        would_replay=existing_dataset_id is not None,
+        details={
+            "recipe_id": recipe.recipe_id,
+            "recipe_hash": recipe.recipe_hash,
+            "plugin_id": recipe.plugin_id,
+            "plugin_version": recipe.plugin_version,
+            "sources": source_specs,
+            "source_count": len(resolved),
+            "max_output_bytes": max_output_bytes,
+            "existing_dataset_id": existing_dataset_id,
+            "managed_artifact_exists": artifact_root.exists(),
+        },
+    )
 
 
 def prepare_dataset_mixture(

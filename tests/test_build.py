@@ -143,6 +143,22 @@ def test_inserted_unmeasured_model_cannot_fake_numeric_build(tmp_path: Path) -> 
         )
 
 
+def test_internal_lab_unmeasured_model_cannot_fake_numeric_build(
+    tmp_path: Path,
+) -> None:
+    Registry(tmp_path).initialize("Lab", ModelOrigin.INTERNAL_LAB)
+
+    view = get_build_view(tmp_path)
+    assert view.mode == "NOT_READY"
+
+    with pytest.raises(FrontierwrightError, match="current build mode is NOT_READY"):
+        set_build_targets(
+            tmp_path,
+            targets={"coding": 140},
+            floors={"general": 120},
+        )
+
+
 def test_measured_model_unlocks_targets_and_floors(tmp_path: Path) -> None:
     registry = Registry(tmp_path)
     registry.initialize("ZERO", ModelOrigin.ZERO)

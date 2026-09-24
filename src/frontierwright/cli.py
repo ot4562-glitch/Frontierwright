@@ -84,7 +84,16 @@ from frontierwright.service import (
     ingest_stats,
     initialize_project,
     merge_reference_models,
+    preflight_capability_v1,
+    preflight_evaluation_pack,
+    preflight_export_champion_bundle,
+    preflight_merge_reference_models,
+    preflight_prepare_dataset,
+    preflight_prepare_dataset_mixture,
+    preflight_project_tokenizer,
+    preflight_quantize_reference_model,
     preflight_training_calibration,
+    preflight_zero_birth,
     prepare_dataset,
     prepare_dataset_mixture,
     profile_reference_inference,
@@ -1051,12 +1060,32 @@ def birth_tokenizer(
             help="Maximum source bytes used to learn merge rules.",
         ),
     ] = DEFAULT_MAX_TRAINING_BYTES,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Validate tokenizer birth and show replay identity without training it.",
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
     try:
+        if dry_run:
+            preview = preflight_project_tokenizer(
+                path,
+                dataset_id=dataset_id,
+                vocab_size=vocab_size,
+                max_training_bytes=max_training_bytes,
+            )
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
+
         view = train_project_tokenizer(
             path,
             dataset_id=dataset_id,
@@ -1125,12 +1154,37 @@ def birth_zero(
         float,
         typer.Option("--timeout", help="Maximum birth backend wall time in seconds."),
     ] = 300.0,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help=(
+                "Validate zero-model birth and show replay identity "
+                "without materializing weights."
+            ),
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
     try:
+        if dry_run:
+            preview = preflight_zero_birth(
+                path,
+                preset=preset,
+                seed=seed,
+                python_executable=python_executable,
+                tokenizer_artifact_id=tokenizer_artifact_id,
+                timeout_seconds=timeout_seconds,
+            )
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
+
         view = birth_zero_model(
             path,
             preset=preset,
@@ -1178,12 +1232,29 @@ def evolve_merge(
         float,
         typer.Option("--timeout", help="Maximum merge backend wall time in seconds."),
     ] = 300.0,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Validate merge identity without materializing it."),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
     try:
+        if dry_run:
+            preview = preflight_merge_reference_models(
+                path,
+                other_model_id=other_model_id,
+                other_weight=other_weight,
+                python_executable=python_executable,
+                timeout_seconds=timeout_seconds,
+            )
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
         view = merge_reference_models(
             path,
             other_model_id=other_model_id,
@@ -1223,12 +1294,27 @@ def optimize_quantize(
             help="Maximum quantization backend wall time in seconds.",
         ),
     ] = 300.0,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Validate quantization identity without materializing it."),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
     try:
+        if dry_run:
+            preview = preflight_quantize_reference_model(
+                path,
+                python_executable=python_executable,
+                timeout_seconds=timeout_seconds,
+            )
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
         view = quantize_reference_model(
             path,
             python_executable=python_executable,
@@ -1259,12 +1345,23 @@ def operate_export(
         Path,
         typer.Option("--path", help="Frontierwright project directory."),
     ] = Path("."),
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Validate export identity and destination without copying."),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
     try:
+        if dry_run:
+            preview = preflight_export_champion_bundle(path, destination)
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
         view = export_champion_bundle(path, destination)
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)
@@ -1703,12 +1800,33 @@ def evaluation_capability_v1(
         float,
         typer.Option("--timeout", min=0.001, help="Maximum evaluator wall time."),
     ] = 300.0,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Validate Capability v1 identity and replay status without evaluating.",
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
     try:
+        if dry_run:
+            preview = preflight_capability_v1(
+                path,
+                model_id=model,
+                python_executable=python_executable,
+                device=device,
+                timeout_seconds=timeout_seconds,
+            )
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
+
         view = run_capability_v1(
             path,
             model_id=model,
@@ -1812,12 +1930,38 @@ def evaluation_run(
         float,
         typer.Option("--timeout", min=0.001, help="Maximum evaluator wall time."),
     ] = 300.0,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Validate evaluation identity and replay status without evaluating.",
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
     try:
+        if dry_run:
+            preview = preflight_evaluation_pack(
+                path,
+                pack_id=pack,
+                dataset_id=dataset,
+                model_id=model,
+                python_executable=python_executable,
+                device=device,
+                batch_size=batch_size,
+                max_batches=max_batches,
+                max_dataset_bytes=max_dataset_bytes,
+                timeout_seconds=timeout_seconds,
+            )
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
+
         view = run_evaluation_pack(
             path,
             pack_id=pack,
@@ -2034,6 +2178,13 @@ def data_prepare(
             help="Shard size for byte-shards-v1. Omit to use the recipe default.",
         ),
     ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Validate recipe identity and replay status without materializing data.",
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
@@ -2061,6 +2212,19 @@ def data_prepare(
         else None
     )
     try:
+        if dry_run:
+            preview = preflight_prepare_dataset(
+                path,
+                dataset_id=dataset,
+                plugin_id=plugin_id,
+                config=config,
+            )
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
+
         view = prepare_dataset(
             path,
             dataset_id=dataset,
@@ -2099,6 +2263,13 @@ def data_mix(
             help="Hard preparation limit for the materialized mixed corpus.",
         ),
     ] = 4 * 1024**3,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Validate mixture identity and replay status without materializing data.",
+        ),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
@@ -2131,6 +2302,18 @@ def data_mix(
         parsed.append((dataset_id, parts))
 
     try:
+        if dry_run:
+            preview = preflight_prepare_dataset_mixture(
+                path,
+                inputs=parsed,
+                max_output_bytes=max_output_bytes,
+            )
+            if json_output:
+                _emit_json({"ok": True, **preview.to_dict()})
+                return
+            _print_preflight(preview)
+            return
+
         view = prepare_dataset_mixture(
             path,
             inputs=parsed,

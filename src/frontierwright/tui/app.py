@@ -1517,7 +1517,10 @@ class FrontierwrightApp(App[None]):
             )
             self._refresh_all()
             self.notify(f"Candidate Capability v1 measured: {result.model_id}")
-            self.push_screen(CandidateScreen(compare_candidate(self.root, model_id)))
+            self.push_screen(
+                CandidateScreen(compare_candidate(self.root, model_id)),
+                lambda decision: self._candidate_result(model_id, decision),
+            )
         except (FrontierwrightError, KeyError, ValueError) as exc:
             self.notify(str(exc), severity="error")
 

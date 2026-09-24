@@ -179,6 +179,68 @@ def test_birth_tokenizer_cli_json_surface(tmp_path: Path) -> None:
     assert list_payload["tokenizers"][0]["artifact_id"] == payload["artifact_id"]
 
 
+def test_birth_tokenizer_cli_dry_run_is_side_effect_free_and_predicts_replay(
+    tmp_path: Path,
+) -> None:
+    project, _, dataset_id = setup_zero_with_pretrain(tmp_path)
+
+    preview = runner.invoke(
+        app,
+        [
+            "birth",
+            "tokenizer",
+            dataset_id,
+            "--path",
+            str(project),
+            "--vocab-size",
+            "276",
+            "--max-training-bytes",
+            "4096",
+            "--dry-run",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert preview.exit_code == 0, preview.output
+    payload = json.loads(preview.stdout)
+    assert payload["ok"] is True
+    assert payload["action"] == "birth-tokenizer"
+    assert payload["ready"] is True
+    assert payload["would_replay"] is False
+    assert get_tokenizers_view(project).tokenizers == []
+
+    train_project_tokenizer(
+        project,
+        dataset_id=dataset_id,
+        vocab_size=276,
+        max_training_bytes=4096,
+    )
+
+    replay_preview = runner.invoke(
+        app,
+        [
+            "birth",
+            "tokenizer",
+            dataset_id,
+            "--path",
+            str(project),
+            "--vocab-size",
+            "276",
+            "--max-training-bytes",
+            "4096",
+            "--dry-run",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert replay_preview.exit_code == 0, replay_preview.output
+    replay_payload = json.loads(replay_preview.stdout)
+    assert replay_payload["would_replay"] is True
+    assert replay_payload["details"]["existing_artifact_id"] is not None
+
+
 def test_birth_zero_cli_exposes_tokenizer_artifact_option() -> None:
     root = get_command(app)
     birth = root.commands["birth"]

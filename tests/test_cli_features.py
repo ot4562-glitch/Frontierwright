@@ -482,3 +482,205 @@ def test_data_mix_cli_materializes_weighted_managed_corpus(tmp_path: Path) -> No
     mixture = next(item for item in payload["datasets"] if item["name"] == "CLI mixture")
     output = Path(str(mixture["source_path"])) / "corpus.txt"
     assert output.read_text(encoding="utf-8") == "alpha\nalpha\nbeta\n"
+
+
+def test_data_prepare_and_mix_cli_dry_runs_are_side_effect_free(tmp_path: Path) -> None:
+    project = tmp_path / "project-dry-run"
+    init = runner.invoke(
+        app,
+        [
+            "project",
+            "init",
+            str(project),
+            "--name",
+            "NOVA",
+            "--origin",
+            "ZERO",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert init.exit_code == 0, init.output
+
+    prepared_ids: list[str] = []
+    for index, text in enumerate(("alpha\n", "beta\n"), start=1):
+        source = tmp_path / f"dry-source-{index}"
+        source.mkdir()
+        (source / "train.txt").write_text(text, encoding="utf-8")
+        added = runner.invoke(
+            app,
+            [
+                "data",
+                "add",
+                str(source),
+                "--role",
+                "PRETRAIN",
+                "--path",
+                str(project),
+                "--name",
+                f"Dry raw {index}",
+                "--json",
+                "--non-interactive",
+                "--yes",
+            ],
+        )
+        assert added.exit_code == 0, added.output
+        raw = next(
+            item
+            for item in json.loads(added.stdout)["datasets"]
+            if item["name"] == f"Dry raw {index}"
+        )
+
+        preview = runner.invoke(
+            app,
+            [
+                "data",
+                "prepare",
+                "--dataset",
+                str(raw["dataset_id"]),
+                "--recipe",
+                "text-lines-v1",
+                "--path",
+                str(project),
+                "--dry-run",
+                "--json",
+                "--non-interactive",
+                "--yes",
+            ],
+        )
+        assert preview.exit_code == 0, preview.output
+        preview_payload = json.loads(preview.stdout)
+        assert preview_payload["action"] == "data-prepare"
+        assert preview_payload["ready"] is True
+        assert preview_payload["would_replay"] is False
+        before_count = len(json.loads(added.stdout)["datasets"])
+        after_preview = runner.invoke(
+            app,
+            [
+                "data",
+                "show",
+                "--path",
+                str(project),
+                "--json",
+                "--non-interactive",
+            ],
+        )
+        assert after_preview.exit_code == 0, after_preview.output
+        assert len(json.loads(after_preview.stdout)["datasets"]) == before_count
+
+        prepared = runner.invoke(
+            app,
+            [
+                "data",
+                "prepare",
+                "--dataset",
+                str(raw["dataset_id"]),
+                "--recipe",
+                "text-lines-v1",
+                "--path",
+                str(project),
+                "--name",
+                f"Dry prepared {index}",
+                "--json",
+                "--non-interactive",
+                "--yes",
+            ],
+        )
+        assert prepared.exit_code == 0, prepared.output
+        prepared_payload = json.loads(prepared.stdout)
+        managed = next(
+            item
+            for item in prepared_payload["datasets"]
+            if item["name"] == f"Dry prepared {index}"
+        )
+        prepared_ids.append(str(managed["dataset_id"]))
+
+        replay = runner.invoke(
+            app,
+            [
+                "data",
+                "prepare",
+                "--dataset",
+                str(raw["dataset_id"]),
+                "--recipe",
+                "text-lines-v1",
+                "--path",
+                str(project),
+                "--dry-run",
+                "--json",
+                "--non-interactive",
+                "--yes",
+            ],
+        )
+        assert replay.exit_code == 0, replay.output
+        assert json.loads(replay.stdout)["would_replay"] is True
+
+    mix_preview = runner.invoke(
+        app,
+        [
+            "data",
+            "mix",
+            "--input",
+            f"{prepared_ids[0]}:2",
+            "--input",
+            f"{prepared_ids[1]}:1",
+            "--path",
+            str(project),
+            "--max-output-bytes",
+            "1024",
+            "--dry-run",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert mix_preview.exit_code == 0, mix_preview.output
+    mix_preview_payload = json.loads(mix_preview.stdout)
+    assert mix_preview_payload["action"] == "data-mix"
+    assert mix_preview_payload["ready"] is True
+    assert mix_preview_payload["would_replay"] is False
+
+    mixed = runner.invoke(
+        app,
+        [
+            "data",
+            "mix",
+            "--input",
+            f"{prepared_ids[0]}:2",
+            "--input",
+            f"{prepared_ids[1]}:1",
+            "--path",
+            str(project),
+            "--name",
+            "Dry mixture",
+            "--max-output-bytes",
+            "1024",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert mixed.exit_code == 0, mixed.output
+
+    mix_replay = runner.invoke(
+        app,
+        [
+            "data",
+            "mix",
+            "--input",
+            f"{prepared_ids[0]}:2",
+            "--input",
+            f"{prepared_ids[1]}:1",
+            "--path",
+            str(project),
+            "--max-output-bytes",
+            "1024",
+            "--dry-run",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert mix_replay.exit_code == 0, mix_replay.output
+    assert json.loads(mix_replay.stdout)["would_replay"] is True

@@ -120,7 +120,7 @@ Implemented now:
 - built-in weighted text-mixture preparation composes multiple managed text corpora with exact source fingerprints/parts, conservative metadata/classification propagation, deterministic output, and a hard materialization-size limit;
 - built-in `byte-shards-v1` chained preparation converts managed `corpus.txt` into deterministic uint8 byte-ID shards, records the exact training-unit count, and lets the reference backend reconstruct shard streams without inserting synthetic separators;
 - prepared-source chaining is explicit per plugin: immutable prepared data is never silently reprocessed by a recipe that did not declare support;
-- prepared datasets retain source-dataset ID plus recipe ID/hash, and training plans pin the recipe hash in addition to dataset bytes;
+- prepared datasets retain source-dataset ID plus recipe ID/hash, and training plans pin the recipe hash in addition to dataset bytes; `data prepare --dry-run` and `data mix --dry-run` validate recipe identity/replay without materializing output;
 - extensible intervention taxonomy spanning `BIRTH / LEARN / SPECIALIZE / ALIGN / EVOLVE / OPTIMIZE / EVALUATE / OPERATE`;
 - discoverable InterventionPlugin registry with explicit execution surfaces; built-in training interventions wrap their real path-assessment plugins rather than acting as display-only labels;
 - `frontierwright interventions --json` exposes stable intervention ID/provider/version/family/surface metadata to automation;
@@ -198,8 +198,17 @@ Verification:
 .venv/bin/python -m build
 ```
 
+Canonical v1 candidate gate (requires a separate Python with the `train` extra):
+
+```bash
+.venv/bin/python tools/v1_release_gate.py \
+  --training-python /path/to/training-python
+```
+
+The gate runs static checks, the full automated suite, package build, clean-wheel install smoke, and a real local PyTorch Birth -> train -> Capability v1 -> compare -> promote lifecycle.
+
 ## License
 
 Frontierwright is released under the **Apache License 2.0**.
 
-The repository includes the standard Apache-2.0 `LICENSE` text and a `NOTICE` file. Third-party notice obligations must be reviewed as distributable dependencies/assets are added.
+The repository includes the standard Apache-2.0 `LICENSE`, `NOTICE`, and `THIRD_PARTY_NOTICES.md`. Frontierwright does not currently vendor runtime/training dependency payloads; bundled third-party assets must be reviewed again if release packaging changes.

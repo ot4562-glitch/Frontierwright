@@ -13,6 +13,7 @@ from frontierwright.service import (
     birth_zero_model,
     get_birth_view,
     get_status,
+    preflight_zero_birth,
     train_project_tokenizer,
 )
 
@@ -270,3 +271,47 @@ def test_zero_birth_binds_managed_tokenizer_artifact(
     )
     managed_tokenizer = json.loads(Path(tokenizer.path).read_text(encoding="utf-8"))
     assert model_tokenizer == managed_tokenizer
+
+def test_zero_birth_preflight_is_side_effect_free_and_predicts_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    registry = Registry(project)
+    registry.initialize("NOVA", ModelOrigin.ZERO)
+
+    preview = preflight_zero_birth(
+        project,
+        preset="zero-8m",
+        seed=42,
+        python_executable="fixture-python",
+    )
+    assert preview.action == "birth-zero"
+    assert preview.ready is True
+    assert preview.would_replay is False
+    assert registry.read().champion is None
+
+    monkeypatch.setattr(service_module, "run_structured_command", fake_birth_backend)
+    born = birth_zero_model(
+        project,
+        preset="zero-8m",
+        seed=42,
+        python_executable="fixture-python",
+    )
+
+    replay = preflight_zero_birth(
+        project,
+        preset="zero-8m",
+        seed=42,
+        python_executable="fixture-python",
+    )
+    assert replay.would_replay is True
+    assert replay.details["existing_model_id"] == born.model_id
+
+    with pytest.raises(FrontierwrightError, match="already has a materialized current model"):
+        preflight_zero_birth(
+            project,
+            preset="zero-8m",
+            seed=43,
+            python_executable="fixture-python",
+        )

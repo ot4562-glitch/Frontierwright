@@ -27,6 +27,7 @@ from frontierwright.service import (
     get_build_view,
     get_stats_view,
     import_local_model,
+    preflight_capability_v1,
     run_capability_v1,
 )
 
@@ -229,6 +230,84 @@ def test_capability_v1_generates_receipt_activates_stats_and_replays(
     assert stored["conditions"]["bundle_hash"] == capability_v1_bundle_hash()
     assert stored["conditions"]["scale_hash"] == CAPABILITY_V1_SCALE.sha256
 
+
+
+
+def test_capability_v1_preflight_is_side_effect_free_and_predicts_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = setup_project(tmp_path)
+    registry = Registry(project)
+
+    preview = preflight_capability_v1(
+        project,
+        python_executable="fixture-python",
+        device="cpu",
+    )
+    assert preview.action == "eval-capability-v1"
+    assert preview.ready is True
+    assert preview.would_replay is False
+    assert preview.details["receipt_id"] is not None
+    assert registry.get_evaluation_receipt(str(preview.details["receipt_id"])) is None
+    assert registry.get_active_capability_profile(
+        str(preview.details["model_id"])
+    ) is None
+
+    monkeypatch.setattr(
+        service_module,
+        "run_structured_command",
+        fake_capability_result,
+    )
+    measured = run_capability_v1(
+        project,
+        python_executable="fixture-python",
+        device="cpu",
+    )
+
+    replay = preflight_capability_v1(
+        project,
+        python_executable="different-python",
+        device="cpu",
+    )
+    assert replay.would_replay is True
+    assert replay.details["receipt_id"] == measured.receipt_id
+
+
+def test_capability_v1_cli_dry_run_does_not_execute_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = setup_project(tmp_path)
+
+    def must_not_execute(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("dry-run executed Capability v1 backend")
+
+    monkeypatch.setattr(service_module, "run_structured_command", must_not_execute)
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "capability-v1",
+            "--path",
+            str(project),
+            "--python",
+            "fixture-python",
+            "--device",
+            "cpu",
+            "--dry-run",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["action"] == "eval-capability-v1"
+    assert payload["ready"] is True
+    assert payload["would_replay"] is False
 
 def test_capability_v1_rejects_bundle_identity_drift(
     tmp_path: Path,

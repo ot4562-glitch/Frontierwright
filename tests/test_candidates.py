@@ -335,9 +335,11 @@ def test_rejected_candidate_stays_in_history_and_cannot_be_promoted(
     project = tmp_path / "project"
     _, _, candidate = create_project(project)
 
+    champion_before = get_status(project).champion_model_id
     view = reject_candidate(project, candidate.model_id)
     item = next(item for item in view.candidates if item["model_id"] == candidate.model_id)
     assert item["status"] == "REJECTED"
+    assert get_status(project).champion_model_id == champion_before
 
     with pytest.raises(FrontierwrightError, match="Only PENDING"):
         promote_candidate(

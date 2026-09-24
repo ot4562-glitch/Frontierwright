@@ -11,6 +11,7 @@ from frontierwright.models import inspect_local_model
 from frontierwright.service import (
     export_champion_bundle,
     import_local_model,
+    preflight_export_champion_bundle,
     verify_export_bundle,
 )
 
@@ -96,6 +97,37 @@ def test_identical_portable_export_replays_existing_bundle(tmp_path: Path) -> No
     assert first.replayed is False
     assert second.replayed is True
 
+
+
+
+def test_export_dry_run_is_side_effect_free_and_predicts_replay(tmp_path: Path) -> None:
+    project, _ = setup_project(tmp_path)
+    destination = tmp_path / "bundle"
+
+    preview = preflight_export_champion_bundle(project, destination)
+    assert preview.action == "operate-export"
+    assert preview.ready is True
+    assert preview.would_replay is False
+    assert not destination.exists()
+
+    result = runner.invoke(
+        app,
+        [
+            "operate", "export", str(destination),
+            "--path", str(project),
+            "--dry-run", "--json", "--non-interactive", "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["action"] == "operate-export"
+    assert payload["would_replay"] is False
+    assert not destination.exists()
+
+    exported = export_champion_bundle(project, destination)
+    replay = preflight_export_champion_bundle(project, destination)
+    assert replay.would_replay is True
+    assert replay.details["export_id"] == exported.export_id
 
 def test_exported_model_tampering_is_detected_on_replay(tmp_path: Path) -> None:
     project, _ = setup_project(tmp_path)
