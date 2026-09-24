@@ -26,11 +26,11 @@ from frontierwright.recipes import (
 )
 from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.reference_tokenizer import DEFAULT_MAX_TRAINING_BYTES
-from frontierwright.registry import Registry
 from frontierwright.service import (
     BirthView,
     BuildView,
     CandidateView,
+    CapabilityV1RunView,
     CompareView,
     DataView,
     EvaluationCompareView,
@@ -82,6 +82,7 @@ from frontierwright.service import (
     get_tokenizers_view,
     import_local_model,
     ingest_stats,
+    initialize_project,
     merge_reference_models,
     prepare_dataset,
     prepare_dataset_mixture,
@@ -91,6 +92,7 @@ from frontierwright.service import (
     reconcile_training_run,
     reject_candidate,
     repair_run_receipt,
+    run_capability_v1,
     run_evaluation_pack,
     set_build_intent,
     set_build_targets,
@@ -860,13 +862,13 @@ def project_init(
 ) -> None:
     del non_interactive, yes
     try:
-        Registry(path).initialize(
-            name,
-            origin,
+        view = initialize_project(
+            path,
+            name=name,
+            origin=origin,
             language=language,
             edition_profile=edition,
         )
-        view = get_status(path)
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)
 
@@ -1663,6 +1665,63 @@ def stats_ingest(
         _emit_json(_stats_payload(view))
         return
     _print_stats(view)
+
+
+@evaluation_app.command("capability-v1")
+def evaluation_capability_v1(
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Model ID. Defaults to current champion."),
+    ] = None,
+    python_executable: Annotated[
+        str,
+        typer.Option(
+            "--python",
+            help="Python executable for the isolated evaluator environment.",
+        ),
+    ] = sys.executable,
+    device: Annotated[
+        str,
+        typer.Option("--device", help="auto, cpu, or cuda."),
+    ] = "auto",
+    timeout_seconds: Annotated[
+        float,
+        typer.Option("--timeout", min=0.001, help="Maximum evaluator wall time."),
+    ] = 300.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = run_capability_v1(
+            path,
+            model_id=model,
+            python_executable=python_executable,
+            device=device,
+            timeout_seconds=timeout_seconds,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json({"ok": True, **view.to_dict()})
+        return
+
+    console.print("[bold]FRONTIERWRIGHT CAPABILITY v1[/bold]")
+    console.print(f"Model: {view.model_id}")
+    console.print(f"Bundle: {view.bundle_id}@{view.bundle_version}")
+    console.print(f"Bundle hash: {view.bundle_hash}")
+    console.print(f"Scale hash: {view.scale_hash}")
+    console.print(f"Receipt: {view.receipt_id}")
+    console.print(f"Replayed: {'YES' if view.replayed else 'NO'}")
+    for axis in ("general", "reasoning", "math", "coding"):
+        value = view.stats.get(axis)
+        console.print(f"{axis.title():<10} {value if value is not None else '?'}")
 
 
 @evaluation_app.command("packs")

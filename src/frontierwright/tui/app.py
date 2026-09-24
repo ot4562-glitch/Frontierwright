@@ -13,6 +13,7 @@ from textual.widgets import Footer, Header, Input, Static, TabbedContent, TabPan
 
 from frontierwright.data import DatasetClassification, DatasetRole
 from frontierwright.domain import ModelOrigin
+from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.i18n import tr
@@ -44,6 +45,7 @@ from frontierwright.service import (
     get_status,
     get_tokenizers_view,
     import_local_model,
+    initialize_project,
     promote_candidate,
     reconcile_training_run,
     reject_candidate,
@@ -789,6 +791,15 @@ class FrontierwrightApp(App[None]):
         return sys.executable
 
     def _action_items(self) -> list[ActionItem]:
+        if not self.view.initialized:
+            return [
+                ActionItem(
+                    "initialize_project",
+                    "Create Frontierwright project",
+                    "Choose character name, origin, edition, and UI language.",
+                )
+            ]
+
         items = [
             ActionItem(
                 "detect_resources",
@@ -885,6 +896,26 @@ class FrontierwrightApp(App[None]):
     def _action_center_result(self, action_id: str | None) -> None:
         if action_id is None:
             return
+        if action_id == "initialize_project":
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="CREATE FRONTIERWRIGHT PROJECT",
+                    description=(
+                        "Academy usually starts ZERO; Studio uses IMPORTED_LOCAL; "
+                        "Lab uses INTERNAL_LAB. Profiles can change later without "
+                        "rewriting lineage."
+                    ),
+                    fields=[
+                        FormField("name", "Character / project name", "My Model"),
+                        FormField("origin", "Origin", "ZERO"),
+                        FormField("edition", "Edition", "ACADEMY"),
+                        FormField("language", "UI language (en/ko)", self.language),
+                    ],
+                ),
+                self._submit_initialize_project,
+            )
+            return
+
         if action_id == "detect_resources":
             try:
                 detect_resources(self.root)
@@ -1075,6 +1106,26 @@ class FrontierwrightApp(App[None]):
                 ),
                 self._submit_candidate_evaluation,
             )
+
+    def _submit_initialize_project(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            language = values["language"].lower()
+            if language not in {"en", "ko"}:
+                raise ValueError("UI language must be en or ko.")
+            view = initialize_project(
+                self.root,
+                name=values["name"] or "My Model",
+                origin=ModelOrigin(values["origin"].upper()),
+                language=language,
+                edition_profile=EditionProfile(values["edition"].upper()),
+            )
+            self.language = view.language
+            self._refresh_all()
+            self.notify(f"Frontierwright project created: {view.project_name}")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
 
     def _submit_add_dataset(self, values: dict[str, str] | None) -> None:
         if values is None:

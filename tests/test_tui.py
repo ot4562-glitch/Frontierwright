@@ -280,3 +280,36 @@ def test_tui_action_center_exposes_academy_birth_after_pretrain_data(
     action_ids = {item.action_id for item in app._action_items()}
     assert "birth_tokenizer" in action_ids
     assert "birth_zero" in action_ids
+
+
+async def test_tui_can_initialize_academy_project_from_uninitialized_directory(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "new-project"
+    app = FrontierwrightApp(
+        view=get_status(project),
+        root=project,
+        language="en",
+    )
+
+    async with app.run_test(size=(140, 50)) as pilot:
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, ActionCenterScreen)
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, WorkflowFormScreen)
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert not isinstance(app.screen, WorkflowFormScreen)
+        assert app.view.initialized is True
+        assert app.view.origin == "ZERO"
+        assert app.view.edition_profile == "ACADEMY"
+
+    status = get_status(project)
+    assert status.initialized is True
+    assert status.project_name == "My Model"
+    assert status.origin == "ZERO"
+    assert status.edition_profile == "ACADEMY"

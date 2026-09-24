@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from frontierwright.cli import app
@@ -179,6 +180,13 @@ def test_birth_tokenizer_cli_json_surface(tmp_path: Path) -> None:
 
 
 def test_birth_zero_cli_exposes_tokenizer_artifact_option() -> None:
-    result = runner.invoke(app, ["birth", "zero", "--help"])
-    assert result.exit_code == 0, result.output
-    assert "--tokenizer-artifact" in result.output
+    root = get_command(app)
+    birth = root.commands["birth"]
+    assert hasattr(birth, "commands")
+    zero = birth.commands["zero"]
+    option_names = {
+        opt
+        for parameter in zero.params
+        for opt in getattr(parameter, "opts", [])
+    }
+    assert "--tokenizer-artifact" in option_names

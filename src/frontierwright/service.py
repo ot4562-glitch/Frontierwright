@@ -597,6 +597,24 @@ def get_status(root: Path) -> StatusView:
     )
 
 
+def initialize_project(
+    root: Path,
+    *,
+    name: str,
+    origin: ModelOrigin,
+    language: str = "en",
+    edition_profile: EditionProfile | None = None,
+) -> StatusView:
+    registry = Registry(root)
+    registry.initialize(
+        name,
+        origin,
+        language=language,
+        edition_profile=edition_profile,
+    )
+    return get_status(root)
+
+
 def set_project_edition(root: Path, edition: EditionProfile) -> StatusView:
     registry = Registry(root)
     if not registry.exists:
@@ -2480,6 +2498,331 @@ def ingest_stats(
     registry.activate_capability_profile(receipt, scale, stats)
     return get_stats_view(root, receipt.model_id)
 
+
+
+def _capability_v1_run_view(
+    root: Path,
+    receipt: EvaluationReceipt,
+    *,
+    replayed: bool,
+) -> CapabilityV1RunView:
+    stats_view = get_stats_view(root, receipt.model_id)
+    raw_axis_results = receipt.conditions.get("axis_results", [])
+    axis_results = (
+        [dict(item) for item in raw_axis_results if isinstance(item, dict)]
+        if isinstance(raw_axis_results, list)
+        else []
+    )
+    return CapabilityV1RunView(
+        bundle_hash=capability_v1_bundle_hash(),
+        scale_id=CAPABILITY_V1_SCALE.scale_id,
+        scale_version=CAPABILITY_V1_SCALE.scale_version,
+        scale_hash=CAPABILITY_V1_SCALE.sha256,
+        model_id=receipt.model_id,
+        model_fingerprint=receipt.model_fingerprint,
+        receipt_id=receipt.receipt_id,
+        receipt_sha256=receipt.sha256,
+        replayed=replayed,
+        task_counts=capability_v1_task_counts(),
+        axis_results=axis_results,
+        stats=dict(stats_view.stats),
+    )
+
+
+def run_capability_v1(
+    root: Path,
+    *,
+    model_id: str | None = None,
+    python_executable: str,
+    device: str = "auto",
+    timeout_seconds: float = 300.0,
+) -> CapabilityV1RunView:
+    """Run the frozen Frontierwright Capability v1 bundle and activate its stats."""
+
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before capability evaluation.",
+            10,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Capability evaluator Python executable must be nonempty.",
+            2,
+        )
+    if device not in {"auto", "cpu", "cuda"}:
+        raise FrontierwrightError(
+            "EVALUATION_CONFIG_INVALID",
+            "device must be auto, cpu, or cuda.",
+            2,
+        )
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
+        raise FrontierwrightError(
+            "EVALUATION_CONFIG_INVALID",
+            "timeout_seconds must be a positive finite number.",
+            2,
+        )
+
+    state = registry.read()
+    if model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "A current champion or explicit --model is required for capability evaluation.",
+                12,
+            )
+        model = state.champion.model
+    else:
+        model = registry.get_model(model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+
+    bundle_hash = capability_v1_bundle_hash()
+    task_counts = capability_v1_task_counts()
+    identity_payload: dict[str, object] = {
+        "schema_version": 1,
+        "bundle_id": CAPABILITY_V1_BUNDLE_ID,
+        "bundle_version": CAPABILITY_V1_BUNDLE_VERSION,
+        "bundle_hash": bundle_hash,
+        "scale_hash": CAPABILITY_V1_SCALE.sha256,
+        "scoring": CAPABILITY_V1_SCORING,
+        "model_id": model.model_id,
+        "model_fingerprint": model.fingerprint,
+        "config": {"device": device},
+    }
+    identity_digest = hashlib.sha256(
+        json.dumps(
+            identity_payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt_id = f"receipt-cap-v1-{identity_digest[:32]}"
+
+    existing = registry.get_evaluation_receipt(receipt_id)
+    if existing is not None:
+        receipt = _receipt_from_registry_row(existing)
+        expected = {
+            "bundle_id": CAPABILITY_V1_BUNDLE_ID,
+            "bundle_version": CAPABILITY_V1_BUNDLE_VERSION,
+            "bundle_hash": bundle_hash,
+            "scale_id": CAPABILITY_V1_SCALE.scale_id,
+            "scale_version": CAPABILITY_V1_SCALE.scale_version,
+            "scale_hash": CAPABILITY_V1_SCALE.sha256,
+            "scoring": CAPABILITY_V1_SCORING,
+            "task_counts": task_counts,
+            "config": {"device": device},
+        }
+        if not (
+            receipt.model_id == model.model_id
+            and receipt.model_fingerprint == model.fingerprint
+            and receipt.evaluator_id == CAPABILITY_V1_EVALUATOR_ID
+            and receipt.evaluator_version == CAPABILITY_V1_EVALUATOR_VERSION
+            and all(receipt.conditions.get(key) == value for key, value in expected.items())
+        ):
+            raise FrontierwrightError(
+                "EVALUATION_RECEIPT_CONFLICT",
+                "Capability v1 receipt identity is occupied by different evidence.",
+                13,
+            )
+        stats = apply_scale(receipt, CAPABILITY_V1_SCALE)
+        profile = registry.get_active_capability_profile(model.model_id)
+        if not (
+            profile is not None
+            and profile.get("receipt_id") == receipt.receipt_id
+            and profile.get("scale_hash") == CAPABILITY_V1_SCALE.sha256
+        ):
+            registry.activate_capability_profile(receipt, CAPABILITY_V1_SCALE, stats)
+        return _capability_v1_run_view(root, receipt, replayed=True)
+
+    request_path = (
+        registry.state_dir
+        / "evaluations"
+        / "requests"
+        / f"{receipt_id}.json"
+    )
+    request: dict[str, object] = {
+        "schema_version": 1,
+        "backend_id": REFERENCE_BACKEND_ID,
+        "operation": "capability_v1",
+        "model_source_path": model.checkpoint,
+        "config": {"device": device},
+    }
+    _write_state_json(request_path, request)
+    result = run_structured_command(
+        (
+            python_executable,
+            "-m",
+            "frontierwright.reference_backend",
+            "{request_json}",
+        ),
+        environment_overrides={"PYTHONUNBUFFERED": "1"},
+        request_path=request_path,
+        timeout_seconds=float(timeout_seconds),
+    )
+    if result.get("operation") != "capability_v1":
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Capability evaluator did not return a capability_v1 result.",
+            14,
+        )
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Capability evaluator metrics must be an object.",
+            14,
+        )
+    required_identity = {
+        "bundle_id": CAPABILITY_V1_BUNDLE_ID,
+        "bundle_version": CAPABILITY_V1_BUNDLE_VERSION,
+        "bundle_hash": bundle_hash,
+        "scoring": CAPABILITY_V1_SCORING,
+        "task_counts": task_counts,
+    }
+    if any(metrics.get(key) != value for key, value in required_identity.items()):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Capability evaluator bundle/scoring identity does not match frozen v1.",
+            14,
+        )
+    axes_raw = metrics.get("axes")
+    if not isinstance(axes_raw, list):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Capability evaluator axes must be a list.",
+            14,
+        )
+
+    axis_results: list[dict[str, object]] = []
+    measurements: list[RawMeasurement] = []
+    seen_axes: set[str] = set()
+    for raw in axes_raw:
+        if not isinstance(raw, dict):
+            raise FrontierwrightError(
+                "EVALUATION_RESULT_INVALID",
+                "Capability axis result must be an object.",
+                14,
+            )
+        axis = raw.get("axis")
+        task_id = raw.get("task_id")
+        task_version = raw.get("task_version")
+        accuracy = raw.get("accuracy")
+        correct = raw.get("correct")
+        total = raw.get("total")
+        margin = raw.get("mean_correct_margin_nats")
+        if (
+            not isinstance(axis, str)
+            or axis not in task_counts
+            or axis in seen_axes
+            or task_id != f"{CAPABILITY_V1_BUNDLE_ID}.{axis}"
+            or task_version != CAPABILITY_V1_BUNDLE_VERSION
+            or isinstance(accuracy, bool)
+            or not isinstance(accuracy, (int, float))
+            or not math.isfinite(float(accuracy))
+            or not 0.0 <= float(accuracy) <= 1.0
+            or isinstance(correct, bool)
+            or not isinstance(correct, int)
+            or isinstance(total, bool)
+            or not isinstance(total, int)
+            or total != task_counts[axis]
+            or not 0 <= correct <= total
+            or abs(float(accuracy) - (correct / total)) > 1e-12
+            or isinstance(margin, bool)
+            or not isinstance(margin, (int, float))
+            or not math.isfinite(float(margin))
+        ):
+            raise FrontierwrightError(
+                "EVALUATION_RESULT_INVALID",
+                f"Capability axis result is invalid for {axis!r}.",
+                14,
+            )
+        seen_axes.add(axis)
+        normalized = {
+            "axis": axis,
+            "task_id": task_id,
+            "task_version": task_version,
+            "accuracy": float(accuracy),
+            "correct": correct,
+            "total": total,
+            "mean_correct_margin_nats": float(margin),
+        }
+        axis_results.append(normalized)
+        measurements.extend(
+            (
+                RawMeasurement(
+                    task_id=str(task_id),
+                    task_version=str(task_version),
+                    metric="accuracy",
+                    value=float(accuracy),
+                    higher_is_better=True,
+                ),
+                RawMeasurement(
+                    task_id=str(task_id),
+                    task_version=str(task_version),
+                    metric="mean_correct_margin_nats",
+                    value=float(margin),
+                    higher_is_better=True,
+                ),
+            )
+        )
+    if seen_axes != set(task_counts):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Capability evaluator did not return all four frozen axes.",
+            14,
+        )
+    axis_results.sort(key=lambda item: str(item["axis"]))
+
+    python_version = metrics.get("python_version")
+    torch_version = metrics.get("torch_version")
+    if not isinstance(python_version, str) or not isinstance(torch_version, str):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Capability evaluator must report Python and PyTorch versions.",
+            14,
+        )
+    conditions: dict[str, object] = {
+        "bundle_id": CAPABILITY_V1_BUNDLE_ID,
+        "bundle_version": CAPABILITY_V1_BUNDLE_VERSION,
+        "bundle_hash": bundle_hash,
+        "scale_id": CAPABILITY_V1_SCALE.scale_id,
+        "scale_version": CAPABILITY_V1_SCALE.scale_version,
+        "scale_hash": CAPABILITY_V1_SCALE.sha256,
+        "scoring": CAPABILITY_V1_SCORING,
+        "task_counts": task_counts,
+        "axis_results": axis_results,
+        "config": {"device": device},
+        "backend_id": metrics.get("backend_id"),
+        "preset": metrics.get("preset"),
+        "device": metrics.get("device"),
+        "parameter_count": metrics.get("parameter_count"),
+        "tokenizer_fingerprint": metrics.get("tokenizer_fingerprint"),
+        "elapsed_seconds": metrics.get("elapsed_seconds"),
+        "python_version": python_version,
+        "torch_version": torch_version,
+    }
+    receipt = EvaluationReceipt(
+        receipt_id=receipt_id,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        evaluator_id=CAPABILITY_V1_EVALUATOR_ID,
+        evaluator_version=CAPABILITY_V1_EVALUATOR_VERSION,
+        conditions=conditions,
+        measurements=tuple(measurements),
+    )
+    registry.store_evaluation_receipt(receipt, provenance="GENERATED")
+    stats = apply_scale(receipt, CAPABILITY_V1_SCALE)
+    registry.activate_capability_profile(receipt, CAPABILITY_V1_SCALE, stats)
+    return _capability_v1_run_view(root, receipt, replayed=False)
 
 def get_evaluation_packs() -> list[dict[str, object]]:
     return [descriptor.to_dict() for descriptor in BUILTIN_EVALUATION_PACKS]
