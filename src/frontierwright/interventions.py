@@ -106,6 +106,15 @@ class ArtifactTransformInterventionPlugin:
 
 
 @dataclass(frozen=True)
+class OperationInterventionPlugin:
+    descriptor: InterventionDescriptor
+
+    def __post_init__(self) -> None:
+        if self.descriptor.surface is not InterventionSurface.OPERATION:
+            raise ValueError("Operation intervention must use OPERATION surface")
+
+
+@dataclass(frozen=True)
 class BuiltinTrainingInterventionPlugin:
     descriptor: InterventionDescriptor
     path_plugin: TrainingPathPlugin
@@ -215,6 +224,16 @@ BUILTIN_INTERVENTION_PLUGINS: tuple[InterventionPlugin, ...] = (
             version="1",
             provider="frontierwright",
             surface=InterventionSurface.ARTIFACT_TRANSFORM,
+        )
+    ),
+    OperationInterventionPlugin(
+        descriptor=InterventionDescriptor(
+            intervention_id="frontierwright.operate.portable-export",
+            family=InterventionFamily.OPERATE,
+            title="Portable model export",
+            version="1",
+            provider="frontierwright",
+            surface=InterventionSurface.OPERATION,
         )
     ),
 )

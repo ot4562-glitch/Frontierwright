@@ -63,6 +63,7 @@ from frontierwright.execution import (
     run_calibration_backend,
     run_structured_command,
 )
+from frontierwright.exporting import publish_portable_export, verify_portable_export
 from frontierwright.interventions import (
     assess_training_interventions,
     intervention_by_id,
@@ -376,6 +377,44 @@ class QuantizeView:
     model_format: str | None = None
     trainable: bool | None = None
     metrics: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ExportView:
+    schema_version: int = 1
+    intervention_id: str = "frontierwright.operate.portable-export"
+    intervention_version: str = "1"
+    export_id: str | None = None
+    replayed: bool = False
+    model_id: str | None = None
+    model_fingerprint: str | None = None
+    model_format: str | None = None
+    trainable: bool | None = None
+    destination: str | None = None
+    model_path: str | None = None
+    manifest_path: str | None = None
+    manifest_sha256: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ExportVerifyView:
+    schema_version: int = 1
+    valid: bool = True
+    export_id: str | None = None
+    model_fingerprint: str | None = None
+    model_format: str | None = None
+    trainable: bool | None = None
+    destination: str | None = None
+    model_path: str | None = None
+    manifest_path: str | None = None
+    manifest_sha256: str | None = None
+    authenticity: str = "NOT_SIGNED"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -1396,6 +1435,141 @@ def quantize_reference_model(
         candidate_model_id=candidate_model_id,
         source_model_id=source.model_id,
         replayed=False,
+    )
+
+
+def _portable_capability_evidence(
+    profile: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if profile is None:
+        return None
+    keys = (
+        "profile_id",
+        "scale_id",
+        "scale_version",
+        "scale_hash",
+        "receipt_id",
+        "receipt_sha256",
+        "evaluator_id",
+        "evaluator_version",
+        "stats",
+        "measurements",
+    )
+    return {key: profile.get(key) for key in keys}
+
+
+def export_champion_bundle(
+    root: Path,
+    destination: Path,
+) -> ExportView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before exporting a model.",
+            10,
+        )
+
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required before export.",
+            12,
+        )
+    model = state.champion.model
+    _verify_model_artifact_integrity(registry, model.model_id)
+
+    descriptor = inspect_local_model(Path(model.checkpoint))
+    if descriptor.fingerprint != model.fingerprint:
+        raise FrontierwrightError(
+            "ARTIFACT_TAMPERED",
+            "Current champion bytes no longer match the registered fingerprint.",
+            13,
+        )
+
+    intervention = intervention_by_id("frontierwright.operate.portable-export")
+    if intervention is None:
+        raise FrontierwrightError(
+            "INTERVENTION_NOT_FOUND",
+            "Built-in portable export intervention is unavailable.",
+            4,
+        )
+
+    artifact = registry.get_model_artifact(model.model_id)
+    history_evidence: dict[str, object] | None = None
+    if artifact is not None:
+        history_evidence = {
+            "confidence": artifact.get("evidence_confidence"),
+            "evidence_files": artifact.get("evidence_files", []),
+            "reason": artifact.get("evidence_reason"),
+        }
+
+    lineage: list[dict[str, object]] = []
+    for edge in registry.get_model_lineage(model.model_id):
+        lineage.append(
+            {
+                "parent_model_id": edge.get("parent_model_id"),
+                "relation": edge.get("relation"),
+                "ordinal": edge.get("ordinal"),
+                "details": edge.get("details", {}),
+            }
+        )
+
+    profile = registry.get_active_capability_profile(model.model_id)
+    provenance: dict[str, object] = {
+        "project": {
+            "project_id": state.project.get("project_id"),
+            "name": state.project.get("name"),
+            "edition_profile": state.project.get("edition_profile"),
+            "language": state.project.get("language"),
+        },
+        "model": {
+            "model_id": model.model_id,
+            "identity_id": model.identity_id,
+            "origin": model.origin.value,
+            "model_format": model.model_format.value,
+            "trainable": model.trainable,
+            "fingerprint": model.fingerprint,
+            "parent_model_id": model.parent_model_id,
+        },
+        "history_evidence": history_evidence,
+        "lineage": lineage,
+        "capability_evidence": _portable_capability_evidence(profile),
+    }
+
+    bundle = publish_portable_export(
+        destination,
+        descriptor=descriptor,
+        provenance=provenance,
+    )
+    return ExportView(
+        export_id=bundle.export_id,
+        replayed=bundle.replayed,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        model_format=bundle.descriptor.model_format.value,
+        trainable=bundle.descriptor.trainable,
+        destination=str(bundle.destination),
+        model_path=str(bundle.model_path),
+        manifest_path=str(bundle.manifest_path),
+        manifest_sha256=bundle.manifest_sha256,
+    )
+
+
+def verify_export_bundle(destination: Path) -> ExportVerifyView:
+    verified = verify_portable_export(destination)
+    return ExportVerifyView(
+        valid=True,
+        export_id=verified.export_id,
+        model_fingerprint=verified.descriptor.fingerprint,
+        model_format=verified.descriptor.model_format.value,
+        trainable=verified.descriptor.trainable,
+        destination=str(verified.destination),
+        model_path=str(verified.model_path),
+        manifest_path=str(verified.manifest_path),
+        manifest_sha256=verified.manifest_sha256,
+        authenticity="NOT_SIGNED",
     )
 
 

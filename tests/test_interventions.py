@@ -128,6 +128,14 @@ def test_linear_merge_is_builtin_evolve_artifact_transform() -> None:
     assert item.training_path_id is None
 
 
+def test_portable_export_is_builtin_operate_intervention() -> None:
+    item = intervention_by_id("frontierwright.operate.portable-export")
+    assert item is not None
+    assert item.family is InterventionFamily.OPERATE
+    assert item.surface is InterventionSurface.OPERATION
+    assert item.training_path_id is None
+
+
 def test_dpo_is_a_builtin_align_training_intervention() -> None:
     item = intervention_for_training_path(TrainingPathId.DPO)
     assert item.intervention_id == "frontierwright.align.dpo"

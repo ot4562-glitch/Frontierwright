@@ -34,6 +34,8 @@ from frontierwright.service import (
     DataView,
     EvaluationCompareView,
     EvaluationRunView,
+    ExportVerifyView,
+    ExportView,
     HistoryView,
     InterventionsView,
     LabAdaptersView,
@@ -55,6 +57,7 @@ from frontierwright.service import (
     detect_resources,
     disconnect_lab_adapter,
     execute_training_plan,
+    export_champion_bundle,
     get_birth_view,
     get_build_view,
     get_candidates_view,
@@ -84,6 +87,7 @@ from frontierwright.service import (
     set_build_intent,
     set_build_targets,
     set_project_edition,
+    verify_export_bundle,
 )
 
 app = typer.Typer(
@@ -102,6 +106,7 @@ backend_app = typer.Typer(help="Inspect and configure training backends.")
 birth_app = typer.Typer(help="Materialize and inspect zero-model birth state.")
 evolve_app = typer.Typer(help="Evolve models through artifact transforms.")
 optimize_app = typer.Typer(help="Optimize model artifacts for deployment/inference.")
+operate_app = typer.Typer(help="Export and operate accepted model artifacts.")
 lab_app = typer.Typer(help="Connect and inspect controlled private Lab infrastructure.")
 lab_adapters_app = typer.Typer(help="Manage Lab adapter manifests.")
 lab_app.add_typer(lab_adapters_app, name="adapters")
@@ -116,6 +121,7 @@ app.add_typer(backend_app, name="backend")
 app.add_typer(birth_app, name="birth")
 app.add_typer(evolve_app, name="evolve")
 app.add_typer(optimize_app, name="optimize")
+app.add_typer(operate_app, name="operate")
 app.add_typer(lab_app, name="lab")
 
 console = Console()
@@ -210,6 +216,14 @@ def _merge_payload(view: MergeView) -> dict[str, object]:
 
 
 def _quantize_payload(view: QuantizeView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _export_payload(view: ExportView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _export_verify_payload(view: ExportVerifyView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -561,6 +575,32 @@ def _print_quantize(view: QuantizeView) -> None:
         console.print(f"Tensor storage ratio: {float(ratio):.3f}")
     if view.checkpoint:
         console.print(f"Checkpoint: {view.checkpoint}")
+
+
+def _print_export(view: ExportView) -> None:
+    console.print("[bold]PORTABLE EXPORT[/bold]")
+    console.print(f"Export: {view.export_id}")
+    console.print(f"Model: {view.model_id}")
+    console.print(f"Format: {view.model_format}")
+    console.print(f"Trainable: {'YES' if view.trainable else 'NO'}")
+    console.print(f"Fingerprint: {view.model_fingerprint}")
+    console.print(f"Replay: {'YES' if view.replayed else 'NO'}")
+    if view.destination:
+        console.print(f"Destination: {view.destination}")
+    if view.manifest_sha256:
+        console.print(f"Manifest: {view.manifest_sha256}")
+
+
+def _print_export_verify(view: ExportVerifyView) -> None:
+    console.print("[bold]PORTABLE EXPORT VERIFY[/bold]")
+    console.print(f"Valid: {'YES' if view.valid else 'NO'}")
+    console.print(f"Export: {view.export_id}")
+    console.print(f"Format: {view.model_format}")
+    console.print(f"Trainable: {'YES' if view.trainable else 'NO'}")
+    console.print(f"Fingerprint: {view.model_fingerprint}")
+    console.print(f"Authenticity: {view.authenticity}")
+    if view.manifest_sha256:
+        console.print(f"Manifest: {view.manifest_sha256}")
 
 
 def _print_compare(view: CompareView) -> None:
@@ -1030,6 +1070,55 @@ def optimize_quantize(
         "\nQuantization created a PENDING optimized-model candidate. "
         "Evaluate and compare it before promotion."
     )
+
+
+
+
+@operate_app.command("export")
+def operate_export(
+    destination: Annotated[
+        Path,
+        typer.Argument(help="New directory for the portable Frontierwright export bundle."),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = export_champion_bundle(path, destination)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_export_payload(view))
+        return
+    _print_export(view)
+
+
+@operate_app.command("verify")
+def operate_verify(
+    destination: Annotated[
+        Path,
+        typer.Argument(help="Portable Frontierwright export bundle directory."),
+    ],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = verify_export_bundle(destination)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_export_verify_payload(view))
+        return
+    _print_export_verify(view)
 
 
 @app.command("import")
