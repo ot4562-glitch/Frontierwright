@@ -25,6 +25,7 @@ from frontierwright.recipes import (
     TEXT_LINES_PLUGIN_ID,
 )
 from frontierwright.reference_backend import backend_spec_payload
+from frontierwright.reference_tokenizer import DEFAULT_MAX_TRAINING_BYTES
 from frontierwright.registry import Registry
 from frontierwright.service import (
     BirthView,
@@ -49,6 +50,8 @@ from frontierwright.service import (
     RunView,
     StatsView,
     StatusView,
+    TokenizersView,
+    TokenizerView,
     add_local_dataset,
     birth_zero_model,
     calibrate_training_plan,
@@ -76,6 +79,7 @@ from frontierwright.service import (
     get_run_view,
     get_stats_view,
     get_status,
+    get_tokenizers_view,
     import_local_model,
     ingest_stats,
     merge_reference_models,
@@ -91,6 +95,7 @@ from frontierwright.service import (
     set_build_intent,
     set_build_targets,
     set_project_edition,
+    train_project_tokenizer,
     verify_export_bundle,
 )
 
@@ -162,6 +167,14 @@ def _status_payload(view: StatusView) -> dict[str, object]:
 
 
 def _birth_payload(view: BirthView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _tokenizer_payload(view: TokenizerView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _tokenizers_payload(view: TokenizersView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -716,6 +729,32 @@ def _print_status(view: StatusView) -> None:
         console.print(f"{axis.title():10} {value if value is not None else '?'}")
 
 
+def _print_tokenizer(view: TokenizerView) -> None:
+    console.print("[bold]TRAINABLE TOKENIZER[/bold]")
+    console.print(f"Artifact: {view.artifact_id}")
+    console.print(f"Fingerprint: {view.fingerprint}")
+    console.print(f"Source dataset: {view.source_dataset_id}")
+    console.print(f"Vocabulary: {view.vocab_size} / requested {view.requested_vocab_size}")
+    console.print(f"Merges: {view.merge_count}")
+    console.print(f"Training bytes: {view.training_bytes}")
+    console.print(f"Replay: {'YES' if view.replayed else 'NO'}")
+    if view.path:
+        console.print(f"Artifact: {view.path}")
+
+
+def _print_tokenizers(view: TokenizersView) -> None:
+    if not view.tokenizers:
+        console.print("No trained tokenizer artifacts.")
+        return
+    console.print("[bold]TRAINABLE TOKENIZERS[/bold]")
+    for item in view.tokenizers:
+        console.print(
+            f"{item.get('artifact_id')} · vocab={item.get('vocab_size')} · "
+            f"source={item.get('source_dataset_id')}"
+        )
+        console.print(f"  Fingerprint: {item.get('fingerprint')}")
+
+
 def _print_birth(view: BirthView) -> None:
     if not view.born:
         console.print("No materialized zero-model root.")
@@ -963,6 +1002,75 @@ def birth_show(
         _emit_json(_birth_payload(view))
         return
     _print_birth(view)
+
+
+@birth_app.command("tokenizer")
+def birth_tokenizer(
+    dataset_id: Annotated[
+        str,
+        typer.Argument(help="Registered PRETRAIN dataset ID used to learn the tokenizer."),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    vocab_size: Annotated[
+        int,
+        typer.Option(
+            "--vocab-size",
+            min=256,
+            max=65536,
+            help="Requested byte-BPE vocabulary size.",
+        ),
+    ] = 512,
+    max_training_bytes: Annotated[
+        int,
+        typer.Option(
+            "--max-training-bytes",
+            min=1,
+            help="Maximum source bytes used to learn merge rules.",
+        ),
+    ] = DEFAULT_MAX_TRAINING_BYTES,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = train_project_tokenizer(
+            path,
+            dataset_id=dataset_id,
+            vocab_size=vocab_size,
+            max_training_bytes=max_training_bytes,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_tokenizer_payload(view))
+        return
+    _print_tokenizer(view)
+
+
+@birth_app.command("tokenizers")
+def birth_tokenizers(
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = get_tokenizers_view(path)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_tokenizers_payload(view))
+        return
+    _print_tokenizers(view)
 
 
 @birth_app.command("zero")

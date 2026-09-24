@@ -93,6 +93,14 @@ from frontierwright.recipes import (
     data_preparation_plugin,
 )
 from frontierwright.reference_backend import PRESETS, REFERENCE_BACKEND_ID
+from frontierwright.reference_tokenizer import (
+    DEFAULT_MAX_TRAINING_BYTES,
+    TokenizerArtifact,
+    load_tokenizer_payload,
+    read_training_bytes,
+    tokenizer_fingerprint,
+    write_tokenizer_artifact,
+)
 from frontierwright.registry import ProjectState, Registry
 from frontierwright.resources import detect_local_resources
 
@@ -141,6 +149,36 @@ class BirthView:
     backend_id: str | None = None
     parameter_count: int | None = None
     runtime: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TokenizerView:
+    schema_version: int = 1
+    intervention_id: str = "frontierwright.birth.train-tokenizer"
+    intervention_version: str = "1"
+    artifact_id: str | None = None
+    fingerprint: str | None = None
+    path: str | None = None
+    source_dataset_id: str | None = None
+    source_dataset_fingerprint: str | None = None
+    requested_vocab_size: int | None = None
+    vocab_size: int | None = None
+    max_training_bytes: int | None = None
+    training_bytes: int | None = None
+    merge_count: int | None = None
+    replayed: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TokenizersView:
+    schema_version: int = 1
+    tokenizers: list[dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -659,6 +697,195 @@ def get_birth_view(root: Path) -> BirthView:
         ),
         runtime=dict(runtime_map),
     )
+
+
+def _tokenizer_view_from_record(
+    record: dict[str, object],
+    *,
+    replayed: bool,
+) -> TokenizerView:
+    path = Path(str(record["path"])).expanduser().resolve()
+    payload = load_tokenizer_payload(path)
+    fingerprint = tokenizer_fingerprint(payload)
+    if fingerprint != str(record["fingerprint"]):
+        raise FrontierwrightError(
+            "TOKENIZER_ARTIFACT_TAMPERED",
+            "Tokenizer artifact bytes no longer match the registry fingerprint.",
+            13,
+        )
+    merges = payload.get("merges")
+    if not isinstance(merges, list):
+        raise FrontierwrightError(
+            "TOKENIZER_ARTIFACT_INVALID",
+            "Tokenizer artifact merges must be a list.",
+            13,
+        )
+    numeric_fields: dict[str, int] = {}
+    for key in (
+        "requested_vocab_size",
+        "vocab_size",
+        "max_training_bytes",
+        "training_bytes",
+    ):
+        value = record.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise FrontierwrightError(
+                "TOKENIZER_REGISTRY_INVALID",
+                f"Tokenizer registry field {key} must be a positive integer.",
+                4,
+            )
+        numeric_fields[key] = value
+
+    return TokenizerView(
+        artifact_id=str(record["artifact_id"]),
+        fingerprint=str(record["fingerprint"]),
+        path=str(path),
+        source_dataset_id=str(record["source_dataset_id"]),
+        source_dataset_fingerprint=str(record["source_dataset_fingerprint"]),
+        requested_vocab_size=numeric_fields["requested_vocab_size"],
+        vocab_size=numeric_fields["vocab_size"],
+        max_training_bytes=numeric_fields["max_training_bytes"],
+        training_bytes=numeric_fields["training_bytes"],
+        merge_count=len(merges),
+        replayed=replayed,
+    )
+
+
+def get_tokenizers_view(root: Path) -> TokenizersView:
+    registry = Registry(root)
+    if not registry.exists:
+        return TokenizersView()
+    items = [
+        _tokenizer_view_from_record(record, replayed=True).to_dict()
+        for record in registry.list_tokenizer_artifacts()
+    ]
+    return TokenizersView(tokenizers=items)
+
+
+def train_project_tokenizer(
+    root: Path,
+    *,
+    dataset_id: str,
+    vocab_size: int = 512,
+    max_training_bytes: int = DEFAULT_MAX_TRAINING_BYTES,
+) -> TokenizerView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a ZERO-origin Frontierwright project before tokenizer birth.",
+            10,
+        )
+    state = registry.read()
+    if ModelOrigin(state.project["origin"]) is not ModelOrigin.ZERO:
+        raise FrontierwrightError(
+            "TOKENIZER_BIRTH_ORIGIN_MISMATCH",
+            "Tokenizer birth is only valid for ZERO-origin projects.",
+            13,
+        )
+    if state.champion is not None:
+        raise FrontierwrightError(
+            "TOKENIZER_AFTER_MODEL_BIRTH",
+            "Train/select the tokenizer before materializing the zero-model root.",
+            13,
+        )
+
+    dataset = next(
+        (item for item in state.datasets if item["dataset_id"] == dataset_id),
+        None,
+    )
+    if dataset is None:
+        raise FrontierwrightError(
+            "TOKENIZER_SOURCE_DATASET_NOT_FOUND",
+            "Tokenizer source dataset is not active in this project.",
+            12,
+        )
+    if dataset["role"] != DatasetRole.PRETRAIN.value:
+        raise FrontierwrightError(
+            "TOKENIZER_SOURCE_ROLE_INVALID",
+            "Tokenizer birth requires a PRETRAIN dataset.",
+            12,
+        )
+
+    intervention = intervention_by_id("frontierwright.birth.train-tokenizer")
+    if intervention is None:
+        raise FrontierwrightError(
+            "INTERVENTION_NOT_FOUND",
+            "Built-in tokenizer birth intervention is unavailable.",
+            4,
+        )
+
+    source_path = Path(str(dataset["source_path"])).expanduser().resolve()
+    descriptor = inspect_local_dataset(source_path)
+    source_fingerprint = str(dataset["fingerprint"])
+    if descriptor.fingerprint != source_fingerprint:
+        raise FrontierwrightError(
+            "TOKENIZER_SOURCE_DATASET_DRIFT",
+            "Tokenizer source dataset bytes no longer match the registered fingerprint.",
+            13,
+        )
+
+    corpus = read_training_bytes(
+        source_path,
+        max_training_bytes=max_training_bytes,
+    )
+    tokenizers_root = registry.state_dir / "tokenizers"
+    staging_root = tokenizers_root / ".staging" / uuid4().hex
+    staging_root.mkdir(parents=True, exist_ok=False)
+    try:
+        staged = write_tokenizer_artifact(
+            staging_root,
+            source_dataset_id=dataset_id,
+            source_dataset_fingerprint=source_fingerprint,
+            requested_vocab_size=vocab_size,
+            max_training_bytes=max_training_bytes,
+            corpus=corpus,
+        )
+        existing = registry.get_tokenizer_artifact(staged.artifact_id)
+        if existing is not None:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            return _tokenizer_view_from_record(existing, replayed=True)
+
+        final_root = tokenizers_root / staged.artifact_id
+        final_path = final_root / "tokenizer.json"
+        if final_root.exists():
+            payload = load_tokenizer_payload(final_path)
+            if tokenizer_fingerprint(payload) != staged.fingerprint:
+                raise FrontierwrightError(
+                    "TOKENIZER_ARTIFACT_CONFLICT",
+                    "Managed tokenizer destination contains different bytes.",
+                    13,
+                )
+            shutil.rmtree(staging_root, ignore_errors=True)
+        else:
+            final_root.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staging_root, final_root)
+
+        final_artifact = TokenizerArtifact(
+            artifact_id=staged.artifact_id,
+            fingerprint=staged.fingerprint,
+            path=final_path.resolve(),
+            source_dataset_id=staged.source_dataset_id,
+            source_dataset_fingerprint=staged.source_dataset_fingerprint,
+            requested_vocab_size=staged.requested_vocab_size,
+            vocab_size=staged.vocab_size,
+            max_training_bytes=staged.max_training_bytes,
+            training_bytes=staged.training_bytes,
+            merges=staged.merges,
+        )
+        registry.register_tokenizer_artifact(final_artifact)
+        record = registry.get_tokenizer_artifact(final_artifact.artifact_id)
+        if record is None:
+            raise FrontierwrightError(
+                "TOKENIZER_REGISTRY_ERROR",
+                "Tokenizer artifact was not persisted in the registry.",
+                4,
+            )
+        return _tokenizer_view_from_record(record, replayed=False)
+    except Exception:
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+        raise
 
 
 def birth_zero_model(

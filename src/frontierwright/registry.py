@@ -56,9 +56,10 @@ from frontierwright.recipes import (
     SNAPSHOT_COPY_PLUGIN_ID,
     DataPreparationRecipe,
 )
+from frontierwright.reference_tokenizer import TokenizerArtifact
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -284,6 +285,18 @@ CREATE TABLE model_births (
     seed INTEGER NOT NULL CHECK (seed >= 0),
     backend_id TEXT NOT NULL,
     runtime_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE tokenizer_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL UNIQUE,
+    source_dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
+    source_dataset_fingerprint TEXT NOT NULL,
+    requested_vocab_size INTEGER NOT NULL CHECK (requested_vocab_size >= 256),
+    vocab_size INTEGER NOT NULL CHECK (vocab_size >= 256),
+    max_training_bytes INTEGER NOT NULL CHECK (max_training_bytes > 0),
+    training_bytes INTEGER NOT NULL CHECK (training_bytes > 0),
+    path TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 CREATE TABLE lab_adapters (
@@ -1045,6 +1058,33 @@ WHERE parent_model_id IS NOT NULL;
                 )
                 connection.commit()
                 version = 19
+
+            if version == 19:
+                connection.executescript(
+                    """
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL UNIQUE,
+    source_dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
+    source_dataset_fingerprint TEXT NOT NULL,
+    requested_vocab_size INTEGER NOT NULL CHECK (requested_vocab_size >= 256),
+    vocab_size INTEGER NOT NULL CHECK (vocab_size >= 256),
+    max_training_bytes INTEGER NOT NULL CHECK (max_training_bytes > 0),
+    training_bytes INTEGER NOT NULL CHECK (training_bytes > 0),
+    path TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+                )
+                connection.execute("PRAGMA user_version = 20")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 19, "to_version": 20},
+                )
+                connection.commit()
+                version = 20
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -2763,6 +2803,82 @@ WHERE parent_model_id IS NOT NULL;
             if row is None:
                 raise FrontierwrightError("RUN_NOT_FOUND", "Run does not exist.", 3)
             return self._decode_run_row(row)
+
+    def register_tokenizer_artifact(self, artifact: TokenizerArtifact) -> str:
+        with self.connect(write=True) as connection:
+            source = connection.execute(
+                "SELECT fingerprint, active FROM datasets WHERE dataset_id = ?",
+                (artifact.source_dataset_id,),
+            ).fetchone()
+            if source is None or int(source["active"]) != 1:
+                raise FrontierwrightError(
+                    "TOKENIZER_SOURCE_DATASET_NOT_FOUND",
+                    "Tokenizer source dataset is not active in this project.",
+                    12,
+                )
+            if str(source["fingerprint"]) != artifact.source_dataset_fingerprint:
+                raise FrontierwrightError(
+                    "TOKENIZER_SOURCE_DATASET_DRIFT",
+                    "Tokenizer source dataset fingerprint does not match the registry.",
+                    13,
+                )
+
+            existing = connection.execute(
+                "SELECT artifact_id FROM tokenizer_artifacts WHERE fingerprint = ?",
+                (artifact.fingerprint,),
+            ).fetchone()
+            if existing is not None:
+                return str(existing["artifact_id"])
+
+            connection.execute(
+                "INSERT INTO tokenizer_artifacts ("
+                "artifact_id, fingerprint, source_dataset_id, source_dataset_fingerprint, "
+                "requested_vocab_size, vocab_size, max_training_bytes, training_bytes, "
+                "path, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    artifact.artifact_id,
+                    artifact.fingerprint,
+                    artifact.source_dataset_id,
+                    artifact.source_dataset_fingerprint,
+                    artifact.requested_vocab_size,
+                    artifact.vocab_size,
+                    artifact.max_training_bytes,
+                    artifact.training_bytes,
+                    str(artifact.path),
+                    timestamp(),
+                ),
+            )
+            self.event(
+                connection,
+                "TOKENIZER_TRAINED",
+                {
+                    "artifact_id": artifact.artifact_id,
+                    "fingerprint": artifact.fingerprint,
+                    "source_dataset_id": artifact.source_dataset_id,
+                    "source_dataset_fingerprint": artifact.source_dataset_fingerprint,
+                    "requested_vocab_size": artifact.requested_vocab_size,
+                    "vocab_size": artifact.vocab_size,
+                    "training_bytes": artifact.training_bytes,
+                },
+            )
+            return artifact.artifact_id
+
+    def get_tokenizer_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tokenizer_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def list_tokenizer_artifacts(self) -> tuple[dict[str, Any], ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM tokenizer_artifacts ORDER BY created_at, artifact_id"
+            ).fetchall()
+            return tuple(dict(row) for row in rows)
+
 
     def register_dataset(
         self,

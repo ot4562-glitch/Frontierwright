@@ -164,6 +164,16 @@ BUILTIN_INTERVENTION_PLUGINS: tuple[InterventionPlugin, ...] = (
             surface=InterventionSurface.BIRTH,
         )
     ),
+    BirthInterventionPlugin(
+        descriptor=InterventionDescriptor(
+            intervention_id="frontierwright.birth.train-tokenizer",
+            family=InterventionFamily.BIRTH,
+            title="Train tokenizer artifact",
+            version="1",
+            provider="frontierwright",
+            surface=InterventionSurface.BIRTH,
+        )
+    ),
     _training_plugin(
         intervention_id="frontierwright.learn.pretrain",
         family=InterventionFamily.LEARN,

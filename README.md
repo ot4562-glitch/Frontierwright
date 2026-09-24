@@ -82,7 +82,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v19, including persisted edition profiles, zero-model birth provenance, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, Lab adapter manifests, durable run-usage receipts, preference-dataset role support, and multi-parent model lineage edges;
+- automatic registry migration through schema v20, including persisted edition profiles, zero-model birth provenance, trainable tokenizer artifacts, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, Lab adapter manifests, durable run-usage receipts, preference-dataset role support, and multi-parent model lineage edges;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
@@ -125,6 +125,7 @@ Implemented now:
 - `frontierwright interventions --json` exposes stable intervention ID/provider/version/family/surface metadata to automation;
 - the five v1 training paths remain registered built-in interventions; post-v1 built-ins now include `frontierwright.align.dpo`, `frontierwright.evolve.distill`, the EVOLVE artifact transform `frontierwright.evolve.linear-merge`, the OPTIMIZE artifact transform `frontierwright.optimize.symmetric-int8`, and OPERATE operations for portable export and reference-model generation; the list is not the permanent top-level ontology;
 - factual path prerequisite evaluation using current model trainability, local data inventory, resources, birth state, and history confidence;
+- Academy tokenizer birth via `frontierwright birth tokenizer DATASET_ID`, training deterministic byte-level BPE merge rules from an exact registered PRETRAIN dataset fingerprint, publishing an immutable managed tokenizer artifact with replay semantics, and blocking dataset drift or tokenizer changes after model birth;
 - Academy zero-model birth via `frontierwright birth zero`, with deterministic `zero-8m` / `zero-25m` root checkpoint materialization, exact fingerprinting, runtime provenance, and idempotent repeated birth requests;
 - from-scratch pretraining now requires and pins a materialized zero-model birth root instead of silently reinitializing weights;
 - hard-missing prerequisites show `LOCKED`; calibrated accepted plans can project `READY` only after pinned model/data/backend/resource checks;
@@ -166,7 +167,7 @@ Not implemented yet:
 - an official shipped Frontierwright Capability v1 benchmark/task/anchor bundle and its official capability runner; the generic raw evaluation-pack runner exists, but no official Capability v1 scale is claimed yet;
 - broad arbitrary-Hugging-Face production adapters; the built-in QLoRA path is intentionally a narrow Frontierwright-reference implementation rather than a claim of arbitrary-architecture compatibility;
 - live output-storage quota enforcement during backend execution, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
-- public dataset discovery/download adapters, trainable tokenizer artifacts beyond the built-in byte vocabulary, and richer tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
+- public dataset discovery/download adapters, binding trained tokenizer artifacts into zero-model architecture/training/inference, and richer tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
 - remote/server/Slurm executor implementations and concrete private Lab adapters;
 - stronger executor-boundary attestation beyond the current adapter-declared trust contract.
 
