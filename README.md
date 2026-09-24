@@ -212,11 +212,13 @@ The rc2 development line is already moving beyond stock-model selection:
   normalization scale for every metric they want combined. Missing evidence makes the
   result INCOMPLETE; Frontierwright never invents cross-unit conversion or hides the
   underlying Pareto trade-off.
-- **External evidence adapters** can import exact-version lm-evaluation-harness, LightEval, and vLLM
-  benchmark receipts without automatically turning arbitrary external scores into
-  Frontierwright stats. Workload language/domain/task coverage becomes PASS only through
-  an explicit binding to exact stored receipt task/version/metric identities; Frontierwright
-  never infers coverage from benchmark names.
+- **External evidence adapters** can import exact-version lm-evaluation-harness, LightEval,
+  vLLM, and framework-neutral evaluation manifests without automatically turning arbitrary
+  external scores into Frontierwright stats. Generic manifests must pin exact model
+  fingerprint, evaluator/version, task/version/metric identity, value, metric direction,
+  and may preserve sample count, standard error, and confidence intervals. Workload
+  language/domain/task coverage becomes PASS only through an explicit binding to exact
+  stored receipt identities; Frontierwright never infers coverage from benchmark names.
 - **Real RL foundations** include a rollout/reward/policy-optimization contract and a
   reference verifier-driven policy-gradient path; DPO remains correctly labeled as
   preference optimization.

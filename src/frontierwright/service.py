@@ -61,6 +61,7 @@ from frontierwright.evaluations import (
 )
 from frontierwright.evaluator_adapters import (
     ExternalEvaluationImport,
+    import_external_evaluation_manifest,
     import_lighteval_results,
     import_lm_eval_results,
 )
@@ -3195,6 +3196,40 @@ def import_lm_eval_evidence(
         model_id=model.model_id,
         model_fingerprint=model.fingerprint,
         harness_version=harness_version,
+    )
+    registry.store_evaluation_receipt(imported.receipt, provenance="IMPORTED")
+    return imported
+
+
+def import_external_evaluation_evidence(
+    root: Path,
+    *,
+    manifest_path: Path,
+    model_id: str | None,
+) -> ExternalEvaluationImport:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before importing evaluation evidence.",
+            10,
+        )
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "Specify --model or establish a Champion before importing evaluation evidence.",
+                12,
+            )
+        target_model_id = state.champion.model.model_id
+    model = registry.get_model(target_model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+    imported = import_external_evaluation_manifest(
+        manifest_path,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
     )
     registry.store_evaluation_receipt(imported.receipt, provenance="IMPORTED")
     return imported

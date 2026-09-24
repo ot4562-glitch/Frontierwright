@@ -509,3 +509,263 @@ def import_lighteval_results(
         measurement_count=len(measurements),
         stderr_count=sum(len(item) for item in stderr.values()),
     )
+
+
+GENERIC_EVAL_ADAPTER_ID = "frontierwright.evaluator.manifest-import"
+GENERIC_EVAL_ADAPTER_VERSION = "1"
+
+
+def _strict_nonempty_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_INVALID",
+            f"{label} must be a nonempty string.",
+            2,
+        )
+    return value.strip()
+
+
+def import_external_evaluation_manifest(
+    path: Path,
+    *,
+    model_id: str,
+    model_fingerprint: str,
+) -> ExternalEvaluationImport:
+    """Import one framework-neutral, explicit raw-evaluation evidence manifest.
+
+    The manifest is intentionally strict: evaluator identity, exact model fingerprint,
+    task/version/metric identity, value, and metric direction are all explicit. Nothing
+    is inferred from task or metric names.
+    """
+
+    try:
+        raw_bytes = path.read_bytes()
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_INVALID",
+            "External evaluation manifest must be readable UTF-8 JSON.",
+            2,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_INVALID",
+            "External evaluation manifest root must be an object.",
+            2,
+        )
+    if payload.get("schema_version") != 1:
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_SCHEMA_UNSUPPORTED",
+            "External evaluation manifest schema_version must be 1.",
+            2,
+        )
+
+    evaluator = payload.get("evaluator")
+    if not isinstance(evaluator, dict):
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_INVALID",
+            "External evaluation manifest evaluator must be an object.",
+            2,
+        )
+    evaluator_id = _strict_nonempty_string(evaluator.get("id"), "evaluator.id")
+    evaluator_version = _strict_nonempty_string(evaluator.get("version"), "evaluator.version")
+    declared_fingerprint = _strict_nonempty_string(
+        payload.get("model_fingerprint"), "model_fingerprint"
+    )
+    if declared_fingerprint != model_fingerprint:
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_MODEL_MISMATCH",
+            "External evaluation manifest model fingerprint does not match the target model.",
+            12,
+        )
+    declared_model_id = payload.get("model_id")
+    if declared_model_id is not None:
+        if not isinstance(declared_model_id, str) or declared_model_id != model_id:
+            raise FrontierwrightError(
+                "EXTERNAL_EVALUATION_MODEL_MISMATCH",
+                "External evaluation manifest model_id does not match the target model.",
+                12,
+            )
+
+    raw_measurements = payload.get("measurements")
+    if not isinstance(raw_measurements, list) or not raw_measurements:
+        raise FrontierwrightError(
+            "EXTERNAL_EVALUATION_EMPTY",
+            "External evaluation manifest must contain at least one measurement.",
+            2,
+        )
+
+    measurements: list[RawMeasurement] = []
+    uncertainty: dict[str, dict[str, object]] = {}
+    seen: set[tuple[str, str, str]] = set()
+    task_ids: set[tuple[str, str]] = set()
+    for index, raw in enumerate(raw_measurements):
+        if not isinstance(raw, dict):
+            raise FrontierwrightError(
+                "EXTERNAL_EVALUATION_INVALID",
+                f"measurements[{index}] must be an object.",
+                2,
+            )
+        task_id = _strict_nonempty_string(raw.get("task_id"), f"measurements[{index}].task_id")
+        task_version = _strict_nonempty_string(
+            raw.get("task_version"), f"measurements[{index}].task_version"
+        )
+        metric = _strict_nonempty_string(raw.get("metric"), f"measurements[{index}].metric")
+        direction = raw.get("higher_is_better")
+        if not isinstance(direction, bool):
+            raise FrontierwrightError(
+                "EXTERNAL_EVALUATION_DIRECTION_UNKNOWN",
+                f"measurements[{index}].higher_is_better must be explicit boolean evidence.",
+                2,
+            )
+        raw_value = raw.get("value")
+        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+            raise FrontierwrightError(
+                "EXTERNAL_EVALUATION_INVALID",
+                f"measurements[{index}].value must be numeric.",
+                2,
+            )
+        value = float(raw_value)
+        if not math.isfinite(value):
+            raise FrontierwrightError(
+                "EXTERNAL_EVALUATION_INVALID",
+                f"measurements[{index}].value must be finite.",
+                2,
+            )
+        key = (task_id, task_version, metric)
+        if key in seen:
+            raise FrontierwrightError(
+                "EXTERNAL_EVALUATION_DUPLICATE",
+                f"Duplicate task/version/metric identity: {task_id}/{task_version}/{metric}.",
+                2,
+            )
+        seen.add(key)
+        task_ids.add((task_id, task_version))
+        measurements.append(
+            RawMeasurement(
+                task_id=task_id,
+                task_version=task_version,
+                metric=metric,
+                value=value,
+                higher_is_better=direction,
+            )
+        )
+
+        stats: dict[str, object] = {}
+        stderr = raw.get("stderr")
+        if stderr is not None:
+            if isinstance(stderr, bool) or not isinstance(stderr, (int, float)):
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_INVALID",
+                    f"measurements[{index}].stderr must be numeric when present.",
+                    2,
+                )
+            stderr_value = float(stderr)
+            if not math.isfinite(stderr_value) or stderr_value < 0:
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_INVALID",
+                    f"measurements[{index}].stderr must be finite and nonnegative.",
+                    2,
+                )
+            stats["stderr"] = stderr_value
+        sample_count = raw.get("sample_count")
+        if sample_count is not None:
+            if (
+                isinstance(sample_count, bool)
+                or not isinstance(sample_count, int)
+                or sample_count <= 0
+            ):
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_INVALID",
+                    f"measurements[{index}].sample_count must be a positive integer.",
+                    2,
+                )
+            stats["sample_count"] = sample_count
+        confidence_interval = raw.get("confidence_interval")
+        if confidence_interval is not None:
+            if (
+                not isinstance(confidence_interval, list)
+                or len(confidence_interval) != 2
+                or any(
+                    isinstance(value_item, bool)
+                    or not isinstance(value_item, (int, float))
+                    or not math.isfinite(float(value_item))
+                    for value_item in confidence_interval
+                )
+            ):
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_INVALID",
+                    f"measurements[{index}].confidence_interval must be [finite lower, upper].",
+                    2,
+                )
+            lower = float(confidence_interval[0])
+            upper = float(confidence_interval[1])
+            if lower > upper:
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_INVALID",
+                    f"measurements[{index}].confidence_interval lower exceeds upper.",
+                    2,
+                )
+            stats["confidence_interval"] = [lower, upper]
+        if stats:
+            selector = json.dumps(
+                {"task_id": task_id, "task_version": task_version, "metric": metric},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            uncertainty[selector] = stats
+
+    source_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    source = payload.get("source")
+    source_metadata = dict(source) if isinstance(source, dict) else {}
+    allowed_conditions = payload.get("conditions")
+    conditions = dict(allowed_conditions) if isinstance(allowed_conditions, dict) else {}
+    conditions.update(
+        {
+            "adapter_id": GENERIC_EVAL_ADAPTER_ID,
+            "adapter_version": GENERIC_EVAL_ADAPTER_VERSION,
+            "source_format": "frontierwright.external-evaluation-manifest-v1",
+            "source_sha256": source_sha256,
+            "source_filename": path.name,
+            "source": source_metadata,
+            "measurement_uncertainty": uncertainty,
+            "privacy_note": (
+                "The manifest is explicitly imported by the user. Prefer aggregate evidence; "
+                "do not embed private prompts/responses unless the project boundary permits it."
+            ),
+        }
+    )
+    identity = json.dumps(
+        {
+            "adapter_id": GENERIC_EVAL_ADAPTER_ID,
+            "adapter_version": GENERIC_EVAL_ADAPTER_VERSION,
+            "source_sha256": source_sha256,
+            "model_id": model_id,
+            "model_fingerprint": model_fingerprint,
+            "evaluator_id": evaluator_id,
+            "evaluator_version": evaluator_version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    receipt_id = "receipt-external-" + hashlib.sha256(identity).hexdigest()[:32]
+    receipt = EvaluationReceipt(
+        receipt_id=receipt_id,
+        model_id=model_id,
+        model_fingerprint=model_fingerprint,
+        evaluator_id=evaluator_id,
+        evaluator_version=evaluator_version,
+        conditions=conditions,
+        measurements=tuple(measurements),
+    )
+    return ExternalEvaluationImport(
+        adapter_id=GENERIC_EVAL_ADAPTER_ID,
+        adapter_version=GENERIC_EVAL_ADAPTER_VERSION,
+        source_sha256=source_sha256,
+        evaluator_id=evaluator_id,
+        evaluator_version=evaluator_version,
+        receipt=receipt,
+        task_count=len(task_ids),
+        measurement_count=len(measurements),
+        stderr_count=sum(1 for value in uncertainty.values() if "stderr" in value),
+    )

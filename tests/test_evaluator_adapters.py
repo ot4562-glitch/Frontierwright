@@ -315,3 +315,208 @@ def test_lighteval_import_requires_direction_metadata(tmp_path: Path) -> None:
     assert result.exit_code == 2
     payload = json.loads(result.stdout)
     assert payload["error"]["code"] == "EXTERNAL_EVALUATION_DIRECTION_UNKNOWN"
+
+
+def write_generic_eval_manifest(
+    path: Path,
+    *,
+    model_id: str,
+    model_fingerprint: str,
+) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "evaluator": {
+                    "id": "example.execution-code-eval",
+                    "version": "2026-09-25@abc123",
+                },
+                "model_id": model_id,
+                "model_fingerprint": model_fingerprint,
+                "source": {
+                    "suite": "private-code-eval",
+                    "revision": "abc123",
+                    "execution_boundary": "CONTROLLED_PRIVATE",
+                },
+                "conditions": {
+                    "sandbox": "container-v3",
+                    "timeout_seconds": 5,
+                },
+                "measurements": [
+                    {
+                        "task_id": "private-code-eval:python",
+                        "task_version": "2026-09-25",
+                        "metric": "pass_rate",
+                        "value": 0.81,
+                        "higher_is_better": True,
+                        "stderr": 0.025,
+                        "sample_count": 200,
+                        "confidence_interval": [0.76, 0.86],
+                    },
+                    {
+                        "task_id": "private-code-eval:python",
+                        "task_version": "2026-09-25",
+                        "metric": "mean_runtime_seconds",
+                        "value": 0.14,
+                        "higher_is_better": False,
+                        "sample_count": 200,
+                    },
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_cli_import_generic_manifest_preserves_explicit_uncertainty_and_direction(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    registry, model = setup_project(project)
+    manifest = write_generic_eval_manifest(
+        tmp_path / "external-eval.json",
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+    )
+
+    first = runner.invoke(
+        app,
+        [
+            "eval",
+            "import-manifest",
+            str(manifest),
+            "--path",
+            str(project),
+            "--model",
+            model.model_id,
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert first.exit_code == 0, first.output
+    payload = json.loads(first.stdout)
+    assert payload["evaluator_id"] == "example.execution-code-eval"
+    assert payload["evaluator_version"] == "2026-09-25@abc123"
+    assert payload["task_count"] == 1
+    assert payload["measurement_count"] == 2
+    assert payload["stderr_count"] == 1
+    assert payload["capability_stats_activated"] is False
+
+    receipt = registry.get_evaluation_receipt(payload["receipt_id"])
+    assert receipt is not None
+    assert receipt["conditions"]["source"]["execution_boundary"] == "CONTROLLED_PRIVATE"
+    assert receipt["conditions"]["sandbox"] == "container-v3"
+    measurements = {item["metric"]: item for item in receipt["measurements"]}
+    assert measurements["pass_rate"]["higher_is_better"] is True
+    assert measurements["mean_runtime_seconds"]["higher_is_better"] is False
+
+    uncertainty = receipt["conditions"]["measurement_uncertainty"]
+    pass_selector = json.dumps(
+        {
+            "task_id": "private-code-eval:python",
+            "task_version": "2026-09-25",
+            "metric": "pass_rate",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert uncertainty[pass_selector] == {
+        "stderr": 0.025,
+        "sample_count": 200,
+        "confidence_interval": [0.76, 0.86],
+    }
+
+    second = runner.invoke(
+        app,
+        [
+            "eval",
+            "import-manifest",
+            str(manifest),
+            "--path",
+            str(project),
+            "--model",
+            model.model_id,
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert second.exit_code == 0, second.output
+    assert json.loads(second.stdout)["receipt_id"] == payload["receipt_id"]
+    assert get_stats_view(project, model.model_id).measured is False
+
+
+def test_generic_manifest_rejects_wrong_model_fingerprint(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _, model = setup_project(project)
+    manifest = write_generic_eval_manifest(
+        tmp_path / "wrong-model.json",
+        model_id=model.model_id,
+        model_fingerprint="sha256:not-the-target-model",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "import-manifest",
+            str(manifest),
+            "--path",
+            str(project),
+            "--model",
+            model.model_id,
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 12
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "EXTERNAL_EVALUATION_MODEL_MISMATCH"
+
+
+def test_generic_manifest_requires_explicit_metric_direction(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _, model = setup_project(project)
+    manifest = tmp_path / "missing-direction.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "evaluator": {"id": "custom.eval", "version": "1"},
+                "model_id": model.model_id,
+                "model_fingerprint": model.fingerprint,
+                "measurements": [
+                    {
+                        "task_id": "task",
+                        "task_version": "1",
+                        "metric": "score",
+                        "value": 0.5,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "import-manifest",
+            str(manifest),
+            "--path",
+            str(project),
+            "--model",
+            model.model_id,
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "EXTERNAL_EVALUATION_DIRECTION_UNKNOWN"
