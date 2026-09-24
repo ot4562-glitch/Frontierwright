@@ -593,10 +593,25 @@ def assess_workload_fit(
             )
         )
 
-    statuses = {item.status for item in constraints}
+    # Coverage answers only "did we measure the declared workload surface?" It does
+    # not establish that the model performs well on that surface. Keep coverage visible
+    # as evidence, but exclude it from the requirement-satisfaction verdict until the
+    # Workload Profile declares an explicit measurable threshold for that evidence.
+    decision_constraints = [
+        item for item in constraints if item.key != "evaluation.workload_coverage"
+    ]
+    statuses = {item.status for item in decision_constraints}
     if WorkloadConstraintStatus.FAIL in statuses:
         overall = WorkloadConstraintStatus.FAIL
-    elif constraints and statuses == {WorkloadConstraintStatus.PASS}:
+    elif WorkloadConstraintStatus.UNKNOWN in statuses:
+        overall = WorkloadConstraintStatus.UNKNOWN
+    elif needs_workload_eval:
+        # Exact coverage can prove that the declared language/domain/task surface was
+        # measured, but the current Workload Profile has no threshold contract for
+        # those bound metrics. Do not turn coverage plus generic capability into a
+        # user-workload success claim.
+        overall = WorkloadConstraintStatus.UNKNOWN
+    elif decision_constraints and statuses == {WorkloadConstraintStatus.PASS}:
         overall = WorkloadConstraintStatus.PASS
     else:
         overall = WorkloadConstraintStatus.UNKNOWN

@@ -2240,6 +2240,13 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     "ORDER BY created_at DESC LIMIT 1",
                     (model_id,),
                 ).fetchone()
+                workload_profile = connection.execute(
+                    "SELECT profile_id, profile_hash FROM workload_profiles "
+                    "WHERE active = 1 ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+                latest_event = connection.execute(
+                    "SELECT sequence FROM events ORDER BY sequence DESC LIMIT 1"
+                ).fetchone()
                 actual_state: dict[str, str | None] = {
                     "champion_id": (
                         str(champion_id) if champion_id is not None else None
@@ -2256,6 +2263,19 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                         str(candidate_profile["profile_id"])
                         if candidate_profile is not None
                         else None
+                    ),
+                    "workload_profile_id": (
+                        str(workload_profile["profile_id"])
+                        if workload_profile is not None
+                        else None
+                    ),
+                    "workload_profile_hash": (
+                        str(workload_profile["profile_hash"])
+                        if workload_profile is not None
+                        else None
+                    ),
+                    "latest_event_sequence": (
+                        str(latest_event["sequence"]) if latest_event is not None else None
                     ),
                 }
                 for key, expected in expected_state.items():

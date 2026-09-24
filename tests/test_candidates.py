@@ -470,11 +470,122 @@ def test_compare_includes_workload_regressions_and_measured_pareto_tradeoffs(
     assert utility["status"] == "COMPLETE"
     assert utility["relation"] == "CANDIDATE_PREFERRED"
     assert utility["utility_delta"] == pytest.approx(1.5)
+    assert view.promotion_eligible is False
+    assert any(
+        item["code"] == "WORKLOAD_REQUIREMENT_FAILED"
+        and item["workload_key"] == "capability.general"
+        for item in view.promotion_blockers
+    )
+    with pytest.raises(
+        FrontierwrightError, match="mandatory workload requirement capability.general"
+    ):
+        promote_candidate(project, candidate.model_id)
     contributions = {item["metric_key"]: item for item in utility["contributions"]}
     assert contributions["capability.general"]["contribution"] == pytest.approx(-1.0)
     assert contributions["capability.coding"]["contribution"] == pytest.approx(2.0)
     assert contributions["serving.latency_p50"]["contribution"] == pytest.approx(1.0)
     assert contributions["resource.peak_vram"]["contribution"] == pytest.approx(-0.5)
+
+
+def test_workload_unknown_blocks_promotion_until_evidence_exists(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+    set_workload_profile(
+        project,
+        WorkloadProfile(
+            name="Latency contract",
+            privacy=DatasetClassification.PUBLIC,
+            max_latency_seconds=0.5,
+        ),
+    )
+
+    view = compare_candidate(project, candidate.model_id)
+    assert view.promotion_eligible is False
+    assert any(
+        item["code"] == "WORKLOAD_REQUIREMENT_UNMEASURED"
+        and item["workload_key"] == "serving.latency_p50"
+        for item in view.promotion_blockers
+    )
+    with pytest.raises(
+        FrontierwrightError, match="lacks evidence for mandatory workload requirement"
+    ):
+        promote_candidate(project, candidate.model_id)
+
+
+def test_passing_workload_requirements_allow_promotion_and_persist_gate(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+    workload = set_workload_profile(
+        project,
+        WorkloadProfile(
+            name="Coding floor",
+            privacy=DatasetClassification.PUBLIC,
+            critical_floors={"coding": 135.0},
+        ),
+    )
+
+    view = compare_candidate(project, candidate.model_id)
+    assert view.promotion_eligible is True
+    gate = view.workload_comparison["promotion_gate"]
+    assert gate["eligible"] is True
+    assert gate["workload_profile_hash"] == workload.profile_hash
+
+    promoted = promote_candidate(project, candidate.model_id)
+    assert promoted.champion_model_id == candidate.model_id
+    event = next(
+        item for item in reversed(registry.read().history) if item["kind"] == "CANDIDATE_PROMOTED"
+    )
+    persisted_gate = event["details"]["workload_gate"]
+    assert persisted_gate["eligible"] is True
+    assert persisted_gate["workload_profile_hash"] == workload.profile_hash
+    assert isinstance(persisted_gate["gate_digest"], str)
+
+
+def test_promotion_transaction_rejects_workload_profile_change_after_gate(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+    first = set_workload_profile(
+        project,
+        WorkloadProfile(
+            name="First contract",
+            privacy=DatasetClassification.PUBLIC,
+            critical_floors={"coding": 130.0},
+        ),
+    )
+    state = registry.read()
+    champion_profile = registry.get_active_capability_profile(champion.model_id)
+    candidate_profile = registry.get_active_capability_profile(candidate.model_id)
+    assert champion_profile is not None
+    assert candidate_profile is not None
+    latest_sequence = str(state.history[-1]["sequence"])
+    expected_state = {
+        "champion_id": champion.model_id,
+        "build_updated_at": None,
+        "champion_profile_id": str(champion_profile["profile_id"]),
+        "candidate_profile_id": str(candidate_profile["profile_id"]),
+        "workload_profile_id": first.profile_id,
+        "workload_profile_hash": first.profile_hash,
+        "latest_event_sequence": latest_sequence,
+    }
+
+    set_workload_profile(
+        project,
+        WorkloadProfile(
+            name="Changed contract",
+            privacy=DatasetClassification.PUBLIC,
+            critical_floors={"coding": 150.0},
+        ),
+    )
+
+    with pytest.raises(FrontierwrightError, match="changed after the promotion gate"):
+        registry.promote_candidate(candidate.model_id, expected_state=expected_state)
 
 
 def activate_capability_fixture(

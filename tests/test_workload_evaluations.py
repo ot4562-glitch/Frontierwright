@@ -129,7 +129,7 @@ def _manifest(
     return path
 
 
-def test_exact_external_eval_binding_completes_workload_coverage_and_is_idempotent(
+def test_exact_external_eval_binding_completes_coverage_without_claiming_workload_success(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
@@ -153,7 +153,11 @@ def test_exact_external_eval_binding_completes_workload_coverage_and_is_idempote
 
     assert first == second
     fit = get_workload_fit(project)
-    assert fit.overall_status == "PASS"
+    assert fit.overall_status == "UNKNOWN"
+    coverage_constraint = next(
+        item for item in fit.constraints if item["key"] == "evaluation.workload_coverage"
+    )
+    assert coverage_constraint["status"] == "PASS"
     assert fit.workload_evaluation_coverage == {
         "complete": True,
         "profile_hash": workload.profile_hash,

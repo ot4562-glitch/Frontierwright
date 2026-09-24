@@ -7679,6 +7679,88 @@ def _candidate_build_constraints(
     return constraints
 
 
+def _workload_promotion_gate(
+    view: WorkloadFitView,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Build the workload-scoped promotion gate from measurable requirements.
+
+    Workload-evaluation coverage is evidence completeness, not a success threshold. It
+    remains in the snapshot for later claim qualification but never becomes a PASS
+    requirement by itself.
+    """
+
+    mandatory_constraints = [
+        dict(item) for item in view.constraints if item.get("key") != "evaluation.workload_coverage"
+    ]
+    blockers: list[dict[str, object]] = []
+    if view.configured:
+        for item in mandatory_constraints:
+            status = str(item.get("status") or "UNKNOWN")
+            if status == "PASS":
+                continue
+            key = str(item.get("key") or "unknown")
+            if status == "FAIL":
+                blockers.append(
+                    {
+                        "code": "WORKLOAD_REQUIREMENT_FAILED",
+                        "message": (
+                            f"Candidate fails mandatory workload requirement {key}; "
+                            "change the candidate or explicit workload contract before promotion."
+                        ),
+                        "workload_key": key,
+                        "workload_status": status,
+                        "override": None,
+                    }
+                )
+            else:
+                blockers.append(
+                    {
+                        "code": "WORKLOAD_REQUIREMENT_UNMEASURED",
+                        "message": (
+                            f"Candidate lacks evidence for mandatory workload requirement {key}; "
+                            "measure it before promotion."
+                        ),
+                        "workload_key": key,
+                        "workload_status": status,
+                        "override": None,
+                    }
+                )
+
+    snapshot: dict[str, object] = {
+        "configured": view.configured,
+        "workload_profile_id": view.workload_profile_id,
+        "workload_profile_hash": view.workload_profile_hash,
+        "model_id": view.model_id,
+        "model_fingerprint": view.model_fingerprint,
+        "overall_status": view.overall_status,
+        "mandatory_constraints": mandatory_constraints,
+        "workload_evaluation_coverage": dict(view.workload_evaluation_coverage),
+        "eligible": not blockers,
+        "note": (
+            "Only explicit measurable workload requirements gate promotion. "
+            "Coverage proves measurement completeness, not workload success."
+        ),
+    }
+    encoded = json.dumps(
+        snapshot,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    snapshot["gate_digest"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return blockers, snapshot
+
+
+def _latest_history_sequence(state: ProjectState) -> str | None:
+    if not state.history:
+        return None
+    sequence = state.history[-1].get("sequence")
+    if isinstance(sequence, int) and not isinstance(sequence, bool):
+        return str(sequence)
+    return None
+
+
 def _promotion_blockers(
     *,
     candidate_status: CandidateStatus,
@@ -8275,6 +8357,8 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
 
     champion_workload = get_workload_fit(root, state.champion.model.model_id)
     candidate_workload = get_workload_fit(root, candidate.model.model_id)
+    workload_blockers, workload_gate = _workload_promotion_gate(candidate_workload)
+    promotion_blockers.extend(workload_blockers)
     champion_constraints = {
         str(item.get("key")): item
         for item in champion_workload.constraints
@@ -8310,9 +8394,10 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
         "champion": champion_workload.to_dict(),
         "candidate": candidate_workload.to_dict(),
         "regressions": workload_regressions,
+        "promotion_gate": workload_gate,
         "note": (
-            "Workload fit remains constraint-by-constraint evidence; no synthetic utility "
-            "score is used for promotion decisions."
+            "Explicit measurable workload requirements gate promotion. Workload-evaluation "
+            "coverage remains separate evidence of what was measured, not proof of success."
         ),
     }
     pareto = _candidate_pareto_evidence(
@@ -8383,6 +8468,7 @@ def promote_candidate(
 ) -> StatusView:
     registry = Registry(root)
     state = registry.read()
+    gate_history_sequence = _latest_history_sequence(state)
     if state.champion is None:
         raise FrontierwrightError(
             "NO_CHAMPION_MODEL",
@@ -8404,6 +8490,9 @@ def promote_candidate(
         build=state.build_state,
         constraints=constraints,
     )
+    candidate_workload = get_workload_fit(root, candidate_model_id)
+    workload_blockers, workload_gate = _workload_promotion_gate(candidate_workload)
+    blockers.extend(workload_blockers)
 
     overridden: list[dict[str, object]] = []
     unresolved: list[dict[str, object]] = []
@@ -8424,9 +8513,30 @@ def promote_candidate(
             13,
         )
 
+    final_gate_state = registry.read()
+    if _latest_history_sequence(final_gate_state) != gate_history_sequence:
+        raise FrontierwrightError(
+            "PROMOTION_STATE_CHANGED",
+            "Project evidence changed while the workload promotion gate was "
+            "evaluated; compare again.",
+            13,
+        )
+
     build_updated_at = (
         str(state.build_state["updated_at"])
         if state.build_state is not None and isinstance(state.build_state.get("updated_at"), str)
+        else None
+    )
+    workload_profile_id = (
+        str(state.workload_profile["profile_id"])
+        if state.workload_profile is not None
+        and isinstance(state.workload_profile.get("profile_id"), str)
+        else None
+    )
+    workload_profile_hash = (
+        str(state.workload_profile["profile_hash"])
+        if state.workload_profile is not None
+        and isinstance(state.workload_profile.get("profile_hash"), str)
         else None
     )
     expected_state = {
@@ -8434,11 +8544,15 @@ def promote_candidate(
         "build_updated_at": build_updated_at,
         "champion_profile_id": champion_stats.profile_id,
         "candidate_profile_id": candidate_stats.profile_id,
+        "workload_profile_id": workload_profile_id,
+        "workload_profile_hash": workload_profile_hash,
+        "latest_event_sequence": gate_history_sequence,
     }
     decision_details: dict[str, object] = {
         "gate_default_eligible": not blockers,
         "allow_unmeasured": allow_unmeasured,
         "allow_build_violations": allow_build_violations,
+        "workload_gate": workload_gate,
         "overridden_blockers": [
             {
                 "code": item.get("code"),
