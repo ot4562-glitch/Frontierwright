@@ -265,3 +265,22 @@ throughput across repeated runs and distinguishes client-visible TTFT, request T
 measurement points. Frontierwright therefore stores serving-condition identity and now
 composes client latency evidence with server VRAM/RSS receipts only when exact model
 fingerprint, runtime/version, execution boundary and condition hash match.
+
+## Paired model-regression evidence — 2026-09-25
+
+When Champion and Candidate answer the same frozen binary-scored items, the observations
+are paired rather than independent proportions. Frontierwright Capability v1 evaluator
+evidence schema v2 therefore persists item-level correctness and uses the exact two-sided
+McNemar/binomial test on discordant correct-to-wrong and wrong-to-correct flips.
+
+References consulted:
+- McNemar exact-test guidance for paired classifier predictions (mlxtend documentation);
+- NVIDIA NeMo Evaluator regression-analysis documentation, which likewise describes LLM
+  regressions using paired improvement/regression flips and exact McNemar evidence.
+
+Engineering rules:
+- use exact rather than asymptotic inference for the small per-axis item counts;
+- report improvement and regression flip counts, not only p-values;
+- never equate non-significance with model equivalence;
+- never make promotion automatic from a statistical test alone; workload floors, raw
+  trade-offs, runtime/resource evidence and explicit user intent remain separate evidence.

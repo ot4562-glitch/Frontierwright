@@ -94,7 +94,10 @@ actual model artifact.
 Capability v1 is deliberately a small frozen local microbenchmark, not a claim of
 general intelligence. Frontierwright exposes the **sample count and 95% Wilson
 uncertainty interval** with each axis so a 16-item estimate is not presented with
-fake precision.
+fake precision. New v2 evaluator receipts also retain same-item correctness/margin
+evidence. Candidate comparison reports improvement/regression flips and an exact
+two-sided McNemar test; this is diagnostic evidence, never an automatic promotion rule,
+and a non-significant result is treated as inconclusive rather than proof of equivalence.
 
 Resource evidence similarly distinguishes:
 

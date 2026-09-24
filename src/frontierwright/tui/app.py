@@ -117,6 +117,41 @@ def _compare_text(view: CompareView) -> str:
             f"{str(candidate) if candidate is not None else '?':>9}  "
             f"{delta_text:>5}"
         )
+    paired = view.paired_capability_evidence
+    if paired.get("available") is True:
+        lines.extend(["", "PAIRED CAPABILITY ITEMS"])
+        axes = paired.get("axes")
+        if isinstance(axes, dict):
+            for axis in ("general", "reasoning", "math", "coding"):
+                evidence = axes.get(axis)
+                if not isinstance(evidence, dict):
+                    continue
+                p_value = evidence.get("p_value_two_sided")
+                p_text = (
+                    f"{float(p_value):.4g}"
+                    if isinstance(p_value, (int, float)) and not isinstance(p_value, bool)
+                    else "?"
+                )
+                detect = (
+                    "detectable@0.05"
+                    if evidence.get("statistically_detectable_at_0_05") is True
+                    else "inconclusive"
+                )
+                lines.append(
+                    f"{axis.title():10} flips +{evidence.get('improvements', '?')} "
+                    f"/-{evidence.get('regressions', '?')} · exact p={p_text} · {detect}"
+                )
+        overall = paired.get("overall")
+        if isinstance(overall, dict):
+            lines.append(
+                f"Overall    flips +{overall.get('improvements', '?')} "
+                f"/-{overall.get('regressions', '?')} · paired same-item evidence"
+            )
+    elif paired:
+        reason = paired.get("reason")
+        if reason:
+            lines.extend(["", "PAIRED CAPABILITY ITEMS", f"Unavailable: {reason}"])
+
     if view.raw_evaluation_comparisons:
         lines.extend(["", "RAW EVALUATION"])
         for evidence in view.raw_evaluation_comparisons:

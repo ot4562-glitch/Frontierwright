@@ -20,7 +20,7 @@ from frontierwright.evaluations import AxisScale, CapabilityScale, ScaleTask
 CAPABILITY_V1_BUNDLE_ID = "frontierwright.capability.v1"
 CAPABILITY_V1_BUNDLE_VERSION = "1"
 CAPABILITY_V1_EVALUATOR_ID = "frontierwright.capability-v1-reference-evaluator"
-CAPABILITY_V1_EVALUATOR_VERSION = "1"
+CAPABILITY_V1_EVALUATOR_VERSION = "2"
 CAPABILITY_V1_SCORING = "mean-conditional-logprob-v1"
 CAPABILITY_V1_UNCERTAINTY_METHOD = "wilson-score-95-v1"
 CAPABILITY_V1_CONFIDENCE_LEVEL = 0.95
@@ -504,10 +504,7 @@ CAPABILITY_V1_TASKS: tuple[CapabilityTask, ...] = (
 )
 
 
-
-def capability_v1_uncertainty(
-    correct: int, total: int
-) -> dict[str, object]:
+def capability_v1_uncertainty(correct: int, total: int) -> dict[str, object]:
     """Return a 95% Wilson interval for raw accuracy and the frozen v1 display scale.
 
     Capability v1 has only 16 items per axis. Returning a point estimate without an
@@ -528,11 +525,7 @@ def capability_v1_uncertainty(
     z2 = z * z
     denominator = 1.0 + z2 / total
     center = (p + z2 / (2.0 * total)) / denominator
-    half = (
-        z
-        * math.sqrt((p * (1.0 - p) + z2 / (4.0 * total)) / total)
-        / denominator
-    )
+    half = z * math.sqrt((p * (1.0 - p) + z2 / (4.0 * total)) / total) / denominator
     lower = max(0.0, center - half)
     upper = min(1.0, center + half)
     return {
@@ -544,6 +537,69 @@ def capability_v1_uncertainty(
         "accuracy_upper": upper,
         "stat_lower": 200.0 * lower,
         "stat_upper": 200.0 * upper,
+    }
+
+
+def exact_mcnemar_paired_binary(
+    champion: tuple[bool, ...], candidate: tuple[bool, ...]
+) -> dict[str, object]:
+    """Exact two-sided McNemar evidence for paired binary item outcomes.
+
+    This is descriptive/statistical evidence, not an automatic promotion rule. For the
+    small Capability v1 axes, the exact binomial form avoids an asymptotic chi-square
+    approximation.
+    """
+
+    if not champion or len(champion) != len(candidate):
+        raise ValueError("paired binary samples must be nonempty and equal length")
+    both_correct = 0
+    regressions = 0
+    improvements = 0
+    both_wrong = 0
+    for before, after in zip(champion, candidate, strict=True):
+        if not isinstance(before, bool) or not isinstance(after, bool):
+            raise ValueError("paired binary samples must contain booleans")
+        if before and after:
+            both_correct += 1
+        elif before and not after:
+            regressions += 1
+        elif not before and after:
+            improvements += 1
+        else:
+            both_wrong += 1
+
+    discordant = regressions + improvements
+    if discordant == 0:
+        p_value = 1.0
+    else:
+        lower = min(regressions, improvements)
+        tail_numerator = sum(math.comb(discordant, k) for k in range(lower + 1))
+        p_value = min(1.0, 2.0 * tail_numerator / (2**discordant))
+
+    if improvements > regressions:
+        direction = "MORE_IMPROVEMENTS"
+    elif regressions > improvements:
+        direction = "MORE_REGRESSIONS"
+    else:
+        direction = "BALANCED"
+
+    total = len(champion)
+    return {
+        "method": "mcnemar-exact-binomial-two-sided-v1",
+        "sample_size": total,
+        "both_correct": both_correct,
+        "regressions": regressions,
+        "improvements": improvements,
+        "both_wrong": both_wrong,
+        "discordant": discordant,
+        "net_accuracy_delta": (improvements - regressions) / total,
+        "direction": direction,
+        "p_value_two_sided": p_value,
+        "statistically_detectable_at_0_05": p_value < 0.05,
+        "note": (
+            "Paired exact evidence on the same frozen items. A non-significant result is "
+            "inconclusive, not proof that the models are equivalent."
+        ),
     }
 
 
@@ -608,10 +664,6 @@ def capability_v1_scale() -> CapabilityScale:
 CAPABILITY_V1_SCALE = capability_v1_scale()
 
 if capability_v1_bundle_hash() != CAPABILITY_V1_FROZEN_BUNDLE_SHA256:
-    raise RuntimeError(
-        "Capability v1 task bundle changed without an explicit version/hash update"
-    )
+    raise RuntimeError("Capability v1 task bundle changed without an explicit version/hash update")
 if CAPABILITY_V1_SCALE.sha256 != CAPABILITY_V1_FROZEN_SCALE_SHA256:
-    raise RuntimeError(
-        "Capability v1 scale changed without an explicit version/hash update"
-    )
+    raise RuntimeError("Capability v1 scale changed without an explicit version/hash update")

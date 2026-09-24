@@ -11,6 +11,7 @@ from frontierwright.capability_v1 import (
     CAPABILITY_V1_BUNDLE_ID,
     CAPABILITY_V1_BUNDLE_VERSION,
     CAPABILITY_V1_SCORING,
+    CAPABILITY_V1_TASKS,
     capability_v1_bundle_hash,
     capability_v1_task_counts,
 )
@@ -157,6 +158,7 @@ def _fake_reference_command(
     if operation == "capability_v1":
         task_counts = capability_v1_task_counts()
         axes = []
+        item_results = []
         for axis in ("general", "reasoning", "math", "coding"):
             total = task_counts[axis]
             correct = total // 2
@@ -171,6 +173,16 @@ def _fake_reference_command(
                     "mean_correct_margin_nats": 0.1,
                 }
             )
+            axis_tasks = [task for task in CAPABILITY_V1_TASKS if task.axis.value.lower() == axis]
+            for index, task in enumerate(axis_tasks):
+                item_results.append(
+                    {
+                        "item_id": task.item_id,
+                        "axis": axis,
+                        "correct": index < correct,
+                        "correct_margin_nats": 0.1,
+                    }
+                )
         return {
             "schema_version": 1,
             "ok": True,
@@ -183,6 +195,7 @@ def _fake_reference_command(
                 "scoring": CAPABILITY_V1_SCORING,
                 "task_counts": task_counts,
                 "axes": axes,
+                "item_results": item_results,
                 "preset": "zero-8m",
                 "device": "cpu",
                 "parameter_count": 8_000_000,

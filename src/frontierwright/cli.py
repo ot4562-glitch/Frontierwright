@@ -854,6 +854,39 @@ def _print_compare(view: CompareView) -> None:
             f"{candidate if candidate is not None else '?':>9}   "
             f"{delta_text:>5}"
         )
+    paired = view.paired_capability_evidence
+    if paired.get("available") is True:
+        console.print("")
+        console.print("PAIRED CAPABILITY ITEMS")
+        axes = paired.get("axes")
+        if isinstance(axes, dict):
+            for axis in ("general", "reasoning", "math", "coding"):
+                evidence = axes.get(axis)
+                if not isinstance(evidence, dict):
+                    continue
+                p_value = evidence.get("p_value_two_sided")
+                p_text = (
+                    f"{float(p_value):.4g}"
+                    if isinstance(p_value, (int, float)) and not isinstance(p_value, bool)
+                    else "?"
+                )
+                detect = (
+                    "detectable@0.05"
+                    if evidence.get("statistically_detectable_at_0_05") is True
+                    else "inconclusive"
+                )
+                console.print(
+                    f"  {axis}: flips +{evidence.get('improvements', '?')} "
+                    f"/-{evidence.get('regressions', '?')} · exact p={p_text} · {detect}"
+                )
+        console.print(
+            "  Exact paired evidence is diagnostic only; promotion remains an explicit "
+            "workload/build decision."
+        )
+    elif paired.get("reason"):
+        console.print("")
+        console.print(f"PAIRED CAPABILITY ITEMS: unavailable · {paired.get('reason')}")
+
     if view.raw_evaluation_comparisons:
         console.print("")
         console.print("RAW EVALUATION")

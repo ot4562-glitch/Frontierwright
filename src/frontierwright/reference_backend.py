@@ -2091,6 +2091,7 @@ def _capability_v1(request: dict[str, Any]) -> dict[str, object]:
     per_axis: dict[str, _CapabilityAxisAccumulator] = {
         axis: _CapabilityAxisAccumulator() for axis in capability_v1_task_counts()
     }
+    item_results: list[dict[str, object]] = []
     start = time.perf_counter()
     with torch.no_grad():
         for task in CAPABILITY_V1_TASKS:
@@ -2119,9 +2120,19 @@ def _capability_v1(request: dict[str, Any]) -> dict[str, object]:
             axis_key = task.axis.value.lower()
             bucket = per_axis[axis_key]
             bucket.total += 1
-            if prediction == task.correct_index:
+            is_correct = prediction == task.correct_index
+            if is_correct:
                 bucket.correct += 1
-            bucket.margins.append(correct_score - best_wrong)
+            correct_margin = float(correct_score - best_wrong)
+            bucket.margins.append(correct_margin)
+            item_results.append(
+                {
+                    "item_id": task.item_id,
+                    "axis": axis_key,
+                    "correct": is_correct,
+                    "correct_margin_nats": correct_margin,
+                }
+            )
     if device == "cuda":
         torch.cuda.synchronize()
     elapsed = max(time.perf_counter() - start, 1e-9)
@@ -2160,6 +2171,7 @@ def _capability_v1(request: dict[str, Any]) -> dict[str, object]:
             "preset": preset.name,
             "device": device,
             "axes": axis_results,
+            "item_results": item_results,
             "task_counts": expected_counts,
             "elapsed_seconds": elapsed,
             "parameter_count": _parameter_count(model),

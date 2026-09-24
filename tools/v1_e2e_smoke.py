@@ -241,8 +241,7 @@ def main() -> int:
         )
         root_stats = root_capability.get("stats")
         if not isinstance(root_stats, dict) or any(
-            root_stats.get(axis) is None
-            for axis in ("general", "reasoning", "math", "coding")
+            root_stats.get(axis) is None for axis in ("general", "reasoning", "math", "coding")
         ):
             raise RuntimeError(f"birth root did not reach measured state: {root_capability!r}")
 
@@ -364,8 +363,7 @@ def main() -> int:
         )
         candidate_stats = candidate_capability.get("stats")
         if not isinstance(candidate_stats, dict) or any(
-            candidate_stats.get(axis) is None
-            for axis in ("general", "reasoning", "math", "coding")
+            candidate_stats.get(axis) is None for axis in ("general", "reasoning", "math", "coding")
         ):
             raise RuntimeError(
                 f"candidate did not receive Capability v1 stats: {candidate_capability!r}"
@@ -382,6 +380,19 @@ def main() -> int:
         )
         if comparison.get("candidate_model_id") != candidate_model_id:
             raise RuntimeError(f"candidate compare identity mismatch: {comparison!r}")
+        paired = comparison.get("paired_capability_evidence")
+        if not isinstance(paired, dict) or paired.get("available") is not True:
+            raise RuntimeError(
+                f"candidate compare did not expose paired Capability v1 evidence: {comparison!r}"
+            )
+        axes = paired.get("axes")
+        if not isinstance(axes, dict) or set(axes) != {
+            "general",
+            "reasoning",
+            "math",
+            "coding",
+        }:
+            raise RuntimeError(f"paired axis evidence is incomplete: {paired!r}")
 
         promoted = _json(
             [
@@ -412,9 +423,7 @@ def main() -> int:
             "CANDIDATE_PROMOTED",
         }
         if not required_kinds.issubset(kinds):
-            raise RuntimeError(
-                f"history is missing lifecycle evidence: {required_kinds - kinds!r}"
-            )
+            raise RuntimeError(f"history is missing lifecycle evidence: {required_kinds - kinds!r}")
 
         print(
             json.dumps(

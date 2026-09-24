@@ -18,6 +18,7 @@ from frontierwright.capability_v1 import (
     capability_v1_bundle_hash,
     capability_v1_task_counts,
     capability_v1_uncertainty,
+    exact_mcnemar_paired_binary,
 )
 from frontierwright.cli import app
 from frontierwright.domain import Axis, ModelOrigin
@@ -42,9 +43,7 @@ def make_reference_model(root: Path) -> Path:
         json.dumps(
             {
                 "model_type": "frontierwright_byte_causal_lm",
-                "frontierwright_reference_backend": (
-                    "frontierwright-reference-pytorch-v1"
-                ),
+                "frontierwright_reference_backend": ("frontierwright-reference-pytorch-v1"),
                 "preset": "zero-8m",
             }
         ),
@@ -86,6 +85,7 @@ def fake_capability_result(
         "coding": (16, 0.41),
     }
     axes = []
+    item_results = []
     for axis in ("general", "reasoning", "math", "coding"):
         correct, margin = values[axis]
         axes.append(
@@ -99,6 +99,16 @@ def fake_capability_result(
                 "mean_correct_margin_nats": margin,
             }
         )
+        axis_tasks = [task for task in CAPABILITY_V1_TASKS if task.axis.value.lower() == axis]
+        for index, task in enumerate(axis_tasks):
+            item_results.append(
+                {
+                    "item_id": task.item_id,
+                    "axis": axis,
+                    "correct": index < correct,
+                    "correct_margin_nats": margin,
+                }
+            )
     return {
         "schema_version": 1,
         "ok": True,
@@ -112,6 +122,7 @@ def fake_capability_result(
             "preset": "zero-8m",
             "device": "cpu",
             "axes": axes,
+            "item_results": item_results,
             "task_counts": capability_v1_task_counts(),
             "elapsed_seconds": 1.0,
             "parameter_count": 7_521_280,
@@ -120,8 +131,6 @@ def fake_capability_result(
             "torch_version": "2.14.0+cpu",
         },
     }
-
-
 
 
 def test_capability_v1_exposes_uncertainty_instead_of_fake_precision() -> None:
@@ -135,6 +144,32 @@ def test_capability_v1_exposes_uncertainty_instead_of_fake_precision() -> None:
     assert float(uncertainty["accuracy_upper"]) > 0.5
     assert float(uncertainty["stat_lower"]) < 100.0
     assert float(uncertainty["stat_upper"]) > 100.0
+
+
+def test_exact_mcnemar_uses_paired_item_flips_without_claiming_equivalence() -> None:
+    champion = (False,) * 8 + (True,) * 8
+    candidate = (True,) * 8 + (True,) * 8
+
+    evidence = exact_mcnemar_paired_binary(champion, candidate)
+
+    assert evidence["improvements"] == 8
+    assert evidence["regressions"] == 0
+    assert evidence["discordant"] == 8
+    assert evidence["net_accuracy_delta"] == pytest.approx(0.5)
+    assert evidence["p_value_two_sided"] == pytest.approx(0.0078125)
+    assert evidence["statistically_detectable_at_0_05"] is True
+    assert evidence["direction"] == "MORE_IMPROVEMENTS"
+
+    balanced = exact_mcnemar_paired_binary(
+        (True, True, False, False),
+        (False, True, True, False),
+    )
+    assert balanced["improvements"] == 1
+    assert balanced["regressions"] == 1
+    assert balanced["p_value_two_sided"] == 1.0
+    assert balanced["statistically_detectable_at_0_05"] is False
+    assert "inconclusive" in str(balanced["note"]).lower()
+
 
 def test_capability_v1_bundle_is_frozen_and_balanced() -> None:
     assert len(CAPABILITY_V1_TASKS) == 64
@@ -248,10 +283,9 @@ def test_capability_v1_generates_receipt_activates_stats_and_replays(
     stored = Registry(project).get_evaluation_receipt(first.receipt_id)
     assert stored is not None
     assert len(stored["measurements"]) == 8
+    assert len(stored["conditions"]["item_results"]) == 64
     assert stored["conditions"]["bundle_hash"] == capability_v1_bundle_hash()
     assert stored["conditions"]["scale_hash"] == CAPABILITY_V1_SCALE.sha256
-
-
 
 
 def test_capability_v1_preflight_is_side_effect_free_and_predicts_replay(
@@ -271,9 +305,7 @@ def test_capability_v1_preflight_is_side_effect_free_and_predicts_replay(
     assert preview.would_replay is False
     assert preview.details["receipt_id"] is not None
     assert registry.get_evaluation_receipt(str(preview.details["receipt_id"])) is None
-    assert registry.get_active_capability_profile(
-        str(preview.details["model_id"])
-    ) is None
+    assert registry.get_active_capability_profile(str(preview.details["model_id"])) is None
 
     monkeypatch.setattr(
         service_module,
@@ -329,6 +361,7 @@ def test_capability_v1_cli_dry_run_does_not_execute_backend(
     assert payload["action"] == "eval-capability-v1"
     assert payload["ready"] is True
     assert payload["would_replay"] is False
+
 
 def test_capability_v1_rejects_bundle_identity_drift(
     tmp_path: Path,

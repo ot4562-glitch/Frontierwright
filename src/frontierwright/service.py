@@ -10,6 +10,7 @@ import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 from frontierwright.artifact_store import (
@@ -24,9 +25,11 @@ from frontierwright.capability_v1 import (
     CAPABILITY_V1_EVALUATOR_VERSION,
     CAPABILITY_V1_SCALE,
     CAPABILITY_V1_SCORING,
+    CAPABILITY_V1_TASKS,
     capability_v1_bundle_hash,
     capability_v1_task_counts,
     capability_v1_uncertainty,
+    exact_mcnemar_paired_binary,
 )
 from frontierwright.data import (
     DatasetClassification,
@@ -628,6 +631,7 @@ class CompareView:
     promotion_blockers: list[dict[str, object]] = field(default_factory=list)
     build_scale_hash: str | None = None
     raw_evaluation_comparisons: list[dict[str, object]] = field(default_factory=list)
+    paired_capability_evidence: dict[str, object] = field(default_factory=dict)
     workload_comparison: dict[str, object] = field(default_factory=dict)
     pareto: dict[str, object] = field(default_factory=dict)
     run: dict[str, object] | None = None
@@ -3509,6 +3513,9 @@ def preflight_capability_v1(
         "bundle_hash": bundle_hash,
         "scale_hash": CAPABILITY_V1_SCALE.sha256,
         "scoring": CAPABILITY_V1_SCORING,
+        "evaluator_id": CAPABILITY_V1_EVALUATOR_ID,
+        "evaluator_version": CAPABILITY_V1_EVALUATOR_VERSION,
+        "evidence_schema_version": 2,
         "model_id": model.model_id,
         "model_fingerprint": model.fingerprint,
         "config": config,
@@ -3535,6 +3542,7 @@ def preflight_capability_v1(
             "scale_version": CAPABILITY_V1_SCALE.scale_version,
             "scale_hash": CAPABILITY_V1_SCALE.sha256,
             "scoring": CAPABILITY_V1_SCORING,
+            "evidence_schema_version": 2,
             "task_counts": task_counts,
             "config": config,
         }
@@ -3633,6 +3641,9 @@ def run_capability_v1(
         "bundle_hash": bundle_hash,
         "scale_hash": CAPABILITY_V1_SCALE.sha256,
         "scoring": CAPABILITY_V1_SCORING,
+        "evaluator_id": CAPABILITY_V1_EVALUATOR_ID,
+        "evaluator_version": CAPABILITY_V1_EVALUATOR_VERSION,
+        "evidence_schema_version": 2,
         "model_id": model.model_id,
         "model_fingerprint": model.fingerprint,
         "config": {"device": device},
@@ -3659,6 +3670,7 @@ def run_capability_v1(
             "scale_version": CAPABILITY_V1_SCALE.scale_version,
             "scale_hash": CAPABILITY_V1_SCALE.sha256,
             "scoring": CAPABILITY_V1_SCORING,
+            "evidence_schema_version": 2,
             "task_counts": task_counts,
             "config": {"device": device},
         }
@@ -3819,6 +3831,78 @@ def run_capability_v1(
         )
     axis_results.sort(key=lambda item: str(item["axis"]))
 
+    items_raw = metrics.get("item_results")
+    if not isinstance(items_raw, list):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Capability evaluator must return per-item paired evidence.",
+            14,
+        )
+    expected_items = {task.item_id: task.axis.value.lower() for task in CAPABILITY_V1_TASKS}
+    seen_items: set[str] = set()
+    normalized_items_by_id: dict[str, dict[str, object]] = {}
+    for raw in items_raw:
+        if not isinstance(raw, dict):
+            raise FrontierwrightError(
+                "EVALUATION_RESULT_INVALID",
+                "Capability item result must be an object.",
+                14,
+            )
+        item_id = raw.get("item_id")
+        axis = raw.get("axis")
+        correct = raw.get("correct")
+        margin = raw.get("correct_margin_nats")
+        if (
+            not isinstance(item_id, str)
+            or item_id not in expected_items
+            or item_id in seen_items
+            or axis != expected_items.get(item_id)
+            or not isinstance(correct, bool)
+            or isinstance(margin, bool)
+            or not isinstance(margin, (int, float))
+            or not math.isfinite(float(margin))
+        ):
+            raise FrontierwrightError(
+                "EVALUATION_RESULT_INVALID",
+                f"Capability item result is invalid for {item_id!r}.",
+                14,
+            )
+        seen_items.add(item_id)
+        normalized_items_by_id[item_id] = {
+            "item_id": item_id,
+            "axis": axis,
+            "correct": correct,
+            "correct_margin_nats": float(margin),
+        }
+    if seen_items != set(expected_items):
+        raise FrontierwrightError(
+            "EVALUATION_RESULT_INVALID",
+            "Capability evaluator did not return all 64 frozen item results exactly once.",
+            14,
+        )
+
+    normalized_items = [normalized_items_by_id[task.item_id] for task in CAPABILITY_V1_TASKS]
+    axis_summary = {str(item["axis"]): item for item in axis_results}
+    for axis, total in task_counts.items():
+        axis_items = [item for item in normalized_items if item["axis"] == axis]
+        correct_count = sum(1 for item in axis_items if item["correct"] is True)
+        mean_margin = (
+            sum(float(cast(int | float, item["correct_margin_nats"])) for item in axis_items)
+            / total
+        )
+        summary = axis_summary[axis]
+        summary_margin = float(cast(int | float, summary["mean_correct_margin_nats"]))
+        if (
+            len(axis_items) != total
+            or summary.get("correct") != correct_count
+            or abs(summary_margin - mean_margin) > 1e-9
+        ):
+            raise FrontierwrightError(
+                "EVALUATION_RESULT_INVALID",
+                f"Capability item evidence does not reproduce aggregate axis {axis!r}.",
+                14,
+            )
+
     python_version = metrics.get("python_version")
     torch_version = metrics.get("torch_version")
     if not isinstance(python_version, str) or not isinstance(torch_version, str):
@@ -3835,8 +3919,10 @@ def run_capability_v1(
         "scale_version": CAPABILITY_V1_SCALE.scale_version,
         "scale_hash": CAPABILITY_V1_SCALE.sha256,
         "scoring": CAPABILITY_V1_SCORING,
+        "evidence_schema_version": 2,
         "task_counts": task_counts,
         "axis_results": axis_results,
+        "item_results": normalized_items,
         "config": {"device": device},
         "backend_id": metrics.get("backend_id"),
         "preset": metrics.get("preset"),
@@ -7545,6 +7631,109 @@ def _promotion_blockers(
     return blockers
 
 
+def _paired_capability_evidence(
+    registry: Registry,
+    *,
+    champion_model_id: str,
+    candidate_model_id: str,
+) -> dict[str, object]:
+    def item_evidence(model_id: str) -> tuple[str, dict[str, dict[str, object]]] | None:
+        profile = registry.get_active_capability_profile(model_id)
+        if profile is None or not isinstance(profile.get("receipt_id"), str):
+            return None
+        row = registry.get_evaluation_receipt(str(profile["receipt_id"]))
+        if row is None:
+            return None
+        receipt = _receipt_from_registry_row(row)
+        if (
+            receipt.evaluator_id != CAPABILITY_V1_EVALUATOR_ID
+            or receipt.conditions.get("bundle_hash") != capability_v1_bundle_hash()
+        ):
+            return None
+        raw_items = receipt.conditions.get("item_results")
+        if not isinstance(raw_items, list):
+            return None
+        items: dict[str, dict[str, object]] = {}
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                return None
+            item_id = raw.get("item_id")
+            axis = raw.get("axis")
+            correct = raw.get("correct")
+            if (
+                not isinstance(item_id, str)
+                or not isinstance(axis, str)
+                or not isinstance(correct, bool)
+                or item_id in items
+            ):
+                return None
+            items[item_id] = dict(raw)
+        if len(items) != len(CAPABILITY_V1_TASKS):
+            return None
+        return receipt.receipt_id, items
+
+    champion = item_evidence(champion_model_id)
+    candidate = item_evidence(candidate_model_id)
+    if champion is None or candidate is None:
+        return {
+            "available": False,
+            "method": "mcnemar-exact-binomial-two-sided-v1",
+            "reason": (
+                "Per-item Capability v1 evidence is unavailable for at least one model. "
+                "Older aggregate-only receipts remain valid but cannot support paired flips."
+            ),
+        }
+    champion_receipt_id, champion_items = champion
+    candidate_receipt_id, candidate_items = candidate
+    expected_ids = [task.item_id for task in CAPABILITY_V1_TASKS]
+    if set(champion_items) != set(expected_ids) or set(candidate_items) != set(expected_ids):
+        return {
+            "available": False,
+            "method": "mcnemar-exact-binomial-two-sided-v1",
+            "reason": "Champion and candidate do not expose the same frozen item set.",
+        }
+
+    axes: dict[str, object] = {}
+    overall_before: list[bool] = []
+    overall_after: list[bool] = []
+    for axis in ("general", "reasoning", "math", "coding"):
+        axis_ids = [task.item_id for task in CAPABILITY_V1_TASKS if task.axis.value.lower() == axis]
+        before = tuple(bool(champion_items[item_id]["correct"]) for item_id in axis_ids)
+        after = tuple(bool(candidate_items[item_id]["correct"]) for item_id in axis_ids)
+        evidence = exact_mcnemar_paired_binary(before, after)
+        improvement_ids = [
+            item_id
+            for item_id, old, new in zip(axis_ids, before, after, strict=True)
+            if not old and new
+        ]
+        regression_ids = [
+            item_id
+            for item_id, old, new in zip(axis_ids, before, after, strict=True)
+            if old and not new
+        ]
+        axes[axis] = {
+            **evidence,
+            "improvement_item_ids": improvement_ids,
+            "regression_item_ids": regression_ids,
+        }
+        overall_before.extend(before)
+        overall_after.extend(after)
+
+    overall = exact_mcnemar_paired_binary(tuple(overall_before), tuple(overall_after))
+    return {
+        "available": True,
+        "method": "mcnemar-exact-binomial-two-sided-v1",
+        "champion_receipt_id": champion_receipt_id,
+        "candidate_receipt_id": candidate_receipt_id,
+        "overall": overall,
+        "axes": axes,
+        "note": (
+            "Same-item correct/incorrect flips are paired. Statistical detectability is "
+            "evidence about change, not an automatic promotion rule or proof of equivalence."
+        ),
+    }
+
+
 def _candidate_pareto_evidence(
     registry: Registry,
     *,
@@ -7879,6 +8068,11 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
             else None
         ),
         raw_evaluation_comparisons=_stored_raw_evaluation_comparisons(
+            registry,
+            champion_model_id=state.champion.model.model_id,
+            candidate_model_id=candidate.model.model_id,
+        ),
+        paired_capability_evidence=_paired_capability_evidence(
             registry,
             champion_model_id=state.champion.model.model_id,
             candidate_model_id=candidate.model.model_id,

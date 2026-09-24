@@ -9,6 +9,7 @@ from frontierwright.capability_v1 import (
     CAPABILITY_V1_BUNDLE_VERSION,
     CAPABILITY_V1_SCALE,
     CAPABILITY_V1_SCORING,
+    CAPABILITY_V1_TASKS,
     capability_v1_bundle_hash,
     capability_v1_task_counts,
 )
@@ -56,6 +57,43 @@ def test_candidate_compare_keeps_keyboard_shortcuts_visible() -> None:
     assert "R Reject" in rendered
     assert "Esc Back" in rendered
     assert "[P]" not in rendered
+
+
+def test_candidate_compare_shows_paired_item_flip_evidence() -> None:
+    view = CompareView(
+        champion_model_id="champion",
+        candidate_model_id="candidate",
+        candidate_status="PENDING",
+        scale_comparable=True,
+        champion_stats={"general": 50.0, "math": 50.0},
+        candidate_stats={"general": 75.0, "math": 37.5},
+        deltas={"general": 25.0, "math": -12.5},
+        paired_capability_evidence={
+            "available": True,
+            "method": "mcnemar-exact-binomial-two-sided-v1",
+            "axes": {
+                "general": {
+                    "improvements": 4,
+                    "regressions": 0,
+                    "p_value_two_sided": 0.125,
+                    "statistically_detectable_at_0_05": False,
+                },
+                "math": {
+                    "improvements": 0,
+                    "regressions": 2,
+                    "p_value_two_sided": 0.5,
+                    "statistically_detectable_at_0_05": False,
+                },
+            },
+            "overall": {"improvements": 4, "regressions": 2},
+        },
+    )
+
+    rendered = _compare_text(view)
+    assert "PAIRED CAPABILITY ITEMS" in rendered
+    assert "General    flips +4 /-0 · exact p=0.125 · inconclusive" in rendered
+    assert "Math       flips +0 /-2 · exact p=0.5 · inconclusive" in rendered
+    assert "Overall    flips +4 /-2 · paired same-item evidence" in rendered
 
 
 def test_candidate_compare_shows_pareto_and_explicit_user_utility_together() -> None:
@@ -631,6 +669,7 @@ async def test_tui_keyboard_measures_selected_candidate_capability(
         request = __import__("json").loads(request_path.read_text(encoding="utf-8"))
         assert request["operation"] == "capability_v1"
         axes = []
+        item_results = []
         for axis in ("general", "reasoning", "math", "coding"):
             axes.append(
                 {
@@ -643,6 +682,16 @@ async def test_tui_keyboard_measures_selected_candidate_capability(
                     "mean_correct_margin_nats": 0.1,
                 }
             )
+            axis_tasks = [task for task in CAPABILITY_V1_TASKS if task.axis.value.lower() == axis]
+            for index, task in enumerate(axis_tasks):
+                item_results.append(
+                    {
+                        "item_id": task.item_id,
+                        "axis": axis,
+                        "correct": index < 8,
+                        "correct_margin_nats": 0.1,
+                    }
+                )
         return {
             "schema_version": 1,
             "ok": True,
@@ -656,6 +705,7 @@ async def test_tui_keyboard_measures_selected_candidate_capability(
                 "preset": "zero-8m",
                 "device": "cpu",
                 "axes": axes,
+                "item_results": item_results,
                 "task_counts": capability_v1_task_counts(),
                 "elapsed_seconds": 0.1,
                 "parameter_count": 1,

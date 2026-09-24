@@ -3,9 +3,19 @@ from pathlib import Path
 
 import pytest
 
+from frontierwright.capability_v1 import (
+    CAPABILITY_V1_BUNDLE_ID,
+    CAPABILITY_V1_BUNDLE_VERSION,
+    CAPABILITY_V1_EVALUATOR_ID,
+    CAPABILITY_V1_EVALUATOR_VERSION,
+    CAPABILITY_V1_SCALE,
+    CAPABILITY_V1_TASKS,
+    capability_v1_bundle_hash,
+)
 from frontierwright.data import DatasetClassification
 from frontierwright.domain import ModelOrigin, ModelState
 from frontierwright.errors import FrontierwrightError
+from frontierwright.evaluations import EvaluationReceipt, RawMeasurement, apply_scale
 from frontierwright.registry import Registry
 from frontierwright.service import (
     compare_candidate,
@@ -465,3 +475,92 @@ def test_compare_includes_workload_regressions_and_measured_pareto_tradeoffs(
     assert contributions["capability.coding"]["contribution"] == pytest.approx(2.0)
     assert contributions["serving.latency_p50"]["contribution"] == pytest.approx(1.0)
     assert contributions["resource.peak_vram"]["contribution"] == pytest.approx(-0.5)
+
+
+def activate_capability_fixture(
+    registry: Registry,
+    model: ModelState,
+    *,
+    correct_by_axis: dict[str, int],
+    receipt_id: str,
+) -> None:
+    item_results: list[dict[str, object]] = []
+    measurements: list[RawMeasurement] = []
+    for axis in ("general", "reasoning", "math", "coding"):
+        tasks = [task for task in CAPABILITY_V1_TASKS if task.axis.value.lower() == axis]
+        correct = correct_by_axis[axis]
+        for index, task in enumerate(tasks):
+            item_results.append(
+                {
+                    "item_id": task.item_id,
+                    "axis": axis,
+                    "correct": index < correct,
+                    "correct_margin_nats": 0.1 if index < correct else -0.1,
+                }
+            )
+        measurements.append(
+            RawMeasurement(
+                task_id=f"{CAPABILITY_V1_BUNDLE_ID}.{axis}",
+                task_version=CAPABILITY_V1_BUNDLE_VERSION,
+                metric="accuracy",
+                value=correct / len(tasks),
+                higher_is_better=True,
+            )
+        )
+    receipt = EvaluationReceipt(
+        receipt_id=receipt_id,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        evaluator_id=CAPABILITY_V1_EVALUATOR_ID,
+        evaluator_version=CAPABILITY_V1_EVALUATOR_VERSION,
+        conditions={
+            "bundle_hash": capability_v1_bundle_hash(),
+            "evidence_schema_version": 2,
+            "item_results": item_results,
+        },
+        measurements=tuple(measurements),
+    )
+    registry.activate_capability_profile(
+        receipt,
+        CAPABILITY_V1_SCALE,
+        apply_scale(receipt, CAPABILITY_V1_SCALE),
+    )
+
+
+def test_compare_exposes_same_item_paired_capability_flips(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = create_project(project)
+    activate_capability_fixture(
+        registry,
+        champion,
+        correct_by_axis={"general": 8, "reasoning": 8, "math": 8, "coding": 8},
+        receipt_id="cap-champion-v2",
+    )
+    activate_capability_fixture(
+        registry,
+        candidate,
+        correct_by_axis={"general": 12, "reasoning": 10, "math": 6, "coding": 8},
+        receipt_id="cap-candidate-v2",
+    )
+
+    view = compare_candidate(project, candidate.model_id)
+
+    assert view.scale_comparable is True
+    paired = view.paired_capability_evidence
+    assert paired["available"] is True
+    axes = paired["axes"]
+    assert isinstance(axes, dict)
+    general = axes["general"]
+    math = axes["math"]
+    assert general["improvements"] == 4
+    assert general["regressions"] == 0
+    assert len(general["improvement_item_ids"]) == 4
+    assert math["improvements"] == 0
+    assert math["regressions"] == 2
+    assert len(math["regression_item_ids"]) == 2
+    assert view.deltas["general"] == pytest.approx(50.0)
+    assert view.deltas["math"] == pytest.approx(-25.0)
+    overall = paired["overall"]
+    assert overall["improvements"] == 6
+    assert overall["regressions"] == 2
+    assert paired["method"] == "mcnemar-exact-binomial-two-sided-v1"
