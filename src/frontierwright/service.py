@@ -126,6 +126,13 @@ from frontierwright.registry import ProjectState, Registry
 from frontierwright.resources import detect_local_resources
 from frontierwright.rl import RLExperimentSpec, rl_spec_from_config
 from frontierwright.serving_adapters import VLLMServingImport, import_vllm_bench_serve
+from frontierwright.workload_evaluations import (
+    WORKLOAD_EVAL_BINDING_KIND,
+    WorkloadEvaluationBinding,
+    aggregate_workload_evaluation_coverage,
+    bind_manifest_to_receipt,
+    load_workload_evaluation_manifest,
+)
 from frontierwright.workloads import (
     ParetoDirection,
     ParetoMetricInput,
@@ -262,6 +269,7 @@ class WorkloadFitView:
     overall_status: str = "NOT_CONFIGURED"
     counts: dict[str, int] = field(default_factory=dict)
     constraints: list[dict[str, object]] = field(default_factory=list)
+    workload_evaluation_coverage: dict[str, object] = field(default_factory=dict)
     synthetic_utility_score: None = None
     note: str | None = None
 
@@ -3190,6 +3198,103 @@ def import_lm_eval_evidence(
     return imported
 
 
+def bind_workload_evaluation(
+    root: Path,
+    *,
+    manifest_path: Path,
+    model_id: str | None = None,
+) -> WorkloadEvaluationBinding:
+    """Bind exact stored evaluation measurements to explicit workload requirements."""
+
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before binding workload evaluation evidence.",
+            10,
+        )
+    stored_workload = registry.get_active_workload_profile()
+    if stored_workload is None:
+        raise FrontierwrightError(
+            "WORKLOAD_NOT_CONFIGURED",
+            "Define a Workload Profile before binding workload evaluation evidence.",
+            12,
+        )
+    profile_hash = stored_workload.get("profile_hash")
+    if not isinstance(profile_hash, str) or not profile_hash:
+        raise FrontierwrightError(
+            "REGISTRY_ERROR",
+            "Active Workload Profile is missing its identity hash.",
+            4,
+        )
+
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "Specify --model or establish a Champion before binding workload evidence.",
+                12,
+            )
+        target_model_id = state.champion.model.model_id
+    model = registry.get_model(target_model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+
+    manifest = load_workload_evaluation_manifest(manifest_path)
+    receipt = registry.get_evaluation_receipt(manifest.receipt_id)
+    if receipt is None:
+        raise FrontierwrightError(
+            "EVALUATION_RECEIPT_NOT_FOUND",
+            f"Evaluation receipt does not exist: {manifest.receipt_id}",
+            3,
+        )
+    binding = bind_manifest_to_receipt(
+        manifest,
+        active_profile_hash=profile_hash,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        receipt=receipt,
+    )
+    payload = binding.to_payload()
+    for event in state.history:
+        if event.get("kind") != WORKLOAD_EVAL_BINDING_KIND:
+            continue
+        details = event.get("details")
+        if isinstance(details, dict) and details.get("binding_id") == binding.binding_id:
+            if details != payload:
+                raise FrontierwrightError(
+                    "WORKLOAD_EVALUATION_BINDING_CONFLICT",
+                    "Binding identity already exists with different evidence.",
+                    13,
+                )
+            return binding
+    registry.record_event(WORKLOAD_EVAL_BINDING_KIND, payload)
+    return binding
+
+
+def _workload_eval_coverage_from_state(
+    profile: WorkloadProfile,
+    *,
+    profile_hash: str,
+    model_id: str,
+    state: ProjectState,
+) -> dict[str, object]:
+    bindings: list[dict[str, object]] = []
+    for event in state.history:
+        if event.get("kind") != WORKLOAD_EVAL_BINDING_KIND:
+            continue
+        details = event.get("details")
+        if isinstance(details, dict):
+            bindings.append(dict(details))
+    return aggregate_workload_evaluation_coverage(
+        profile,
+        profile_hash=profile_hash,
+        model_id=model_id,
+        binding_payloads=bindings,
+    ).to_payload()
+
+
 def ingest_stats(
     root: Path,
     *,
@@ -4901,6 +5006,13 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
     model = registry.get_model(target_model_id)
     stats = get_stats_view(root, target_model_id).stats
     model_fit = _latest_model_fit_from_state(state, target_model_id)
+    profile_hash = str(stored.get("profile_hash"))
+    workload_evaluation_coverage = _workload_eval_coverage_from_state(
+        profile,
+        profile_hash=profile_hash,
+        model_id=target_model_id,
+        state=state,
+    )
     raw_context_length = model_fit.get("context_length")
     supported_context_tokens = (
         raw_context_length
@@ -4914,7 +5026,9 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
         capability_stats=stats,
         inference_metrics=model_fit,
         supported_context_tokens=supported_context_tokens,
-        workload_eval_coverage=None,
+        workload_eval_coverage=(
+            True if workload_evaluation_coverage.get("complete") is True else None
+        ),
         serving_boundary=(
             str(model_fit["execution_boundary"])
             if isinstance(model_fit.get("execution_boundary"), str)
@@ -4941,6 +5055,7 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
             if isinstance(constraints, list)
             else []
         ),
+        workload_evaluation_coverage=workload_evaluation_coverage,
         note=str(payload.get("note")) if payload.get("note") else None,
     )
 

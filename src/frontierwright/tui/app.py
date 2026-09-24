@@ -1159,6 +1159,31 @@ class FrontierwrightApp(App[None]):
         elif fit.note:
             lines.append(fit.note)
 
+        coverage = fit.workload_evaluation_coverage
+        if coverage:
+            lines.extend(["", "WORKLOAD EVALUATION COVERAGE"])
+            lines.append("COMPLETE" if coverage.get("complete") is True else "INCOMPLETE")
+            covered = coverage.get("covered")
+            missing = coverage.get("missing")
+            for kind in ("languages", "domains", "tasks"):
+                if isinstance(covered, dict):
+                    values = covered.get(kind)
+                    if isinstance(values, list) and values:
+                        lines.append(f"  ✓ {kind}: " + ", ".join(str(item) for item in values))
+                if isinstance(missing, dict):
+                    values = missing.get(kind)
+                    if isinstance(values, list) and values:
+                        lines.append(
+                            f"  ? missing {kind}: " + ", ".join(str(item) for item in values)
+                        )
+            if edition is EditionProfile.LAB:
+                receipt_ids = coverage.get("receipt_ids")
+                binding_ids = coverage.get("binding_ids")
+                if isinstance(receipt_ids, list) and receipt_ids:
+                    lines.append("  Receipts: " + ", ".join(str(item) for item in receipt_ids))
+                if isinstance(binding_ids, list) and binding_ids:
+                    lines.append("  Bindings: " + ", ".join(str(item) for item in binding_ids))
+
         if edition is EditionProfile.STUDIO:
             lines.extend(
                 [

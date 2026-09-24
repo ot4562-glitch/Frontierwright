@@ -56,6 +56,7 @@ from frontierwright.service import (
     WorkloadFitView,
     WorkloadView,
     add_local_dataset,
+    bind_workload_evaluation,
     birth_zero_model,
     calibrate_training_plan,
     compare_candidate,
@@ -479,6 +480,22 @@ def _print_workload_fit(view: WorkloadFitView) -> None:
         )
         if item.get("reason"):
             console.print(f"  {item['reason']}")
+    coverage = view.workload_evaluation_coverage
+    if coverage:
+        console.print("Workload evaluation coverage:")
+        receipt_ids = coverage.get("receipt_ids")
+        receipt_count = len(receipt_ids) if isinstance(receipt_ids, list) else 0
+        console.print(
+            "  "
+            + ("COMPLETE" if coverage.get("complete") is True else "INCOMPLETE")
+            + f" · receipts={receipt_count}"
+        )
+        missing = coverage.get("missing")
+        if isinstance(missing, dict):
+            for kind in ("languages", "domains", "tasks"):
+                values = missing.get(kind)
+                if isinstance(values, list) and values:
+                    console.print(f"  Missing {kind}: " + ", ".join(str(x) for x in values))
     if view.note:
         console.print(view.note)
 
@@ -1985,6 +2002,61 @@ def workload_fit(
         _emit_json(_workload_fit_payload(view))
         return
     _print_workload_fit(view)
+
+
+@workload_app.command("bind-eval")
+def workload_bind_eval(
+    manifest: Annotated[
+        Path,
+        typer.Argument(
+            help=(
+                "Workload-evaluation binding manifest JSON. It must reference exact stored "
+                "receipt task/version/metric identities; task names are never inferred."
+            )
+        ),
+    ],
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        binding = bind_workload_evaluation(
+            path,
+            manifest_path=manifest,
+            model_id=model,
+        )
+        fit = get_workload_fit(path, model)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    payload = {
+        "ok": True,
+        **binding.to_payload(),
+        "workload_evaluation_coverage": fit.workload_evaluation_coverage,
+        "workload_fit_status": fit.overall_status,
+    }
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print("[bold]WORKLOAD EVALUATION EVIDENCE BOUND[/bold]")
+    console.print(f"Model: {binding.model_id}")
+    console.print(f"Receipt: {binding.receipt_id}")
+    console.print(f"Evaluator: {binding.evaluator_id}@{binding.evaluator_version}")
+    console.print(f"Binding: {binding.binding_id}")
+    coverage = fit.workload_evaluation_coverage
+    console.print("Coverage: " + ("COMPLETE" if coverage.get("complete") is True else "INCOMPLETE"))
+    missing = coverage.get("missing")
+    if isinstance(missing, dict):
+        for kind in ("languages", "domains", "tasks"):
+            values = missing.get(kind)
+            if isinstance(values, list) and values:
+                console.print(f"Missing {kind}: " + ", ".join(str(x) for x in values))
 
 
 @workload_app.command("set")

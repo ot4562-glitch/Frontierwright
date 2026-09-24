@@ -211,14 +211,16 @@ The rc2 development line is already moving beyond stock-model selection:
   underlying Pareto trade-off.
 - **External evidence adapters** can import exact-version lm-evaluation-harness and vLLM
   benchmark receipts without automatically turning arbitrary external scores into
-  Frontierwright stats.
+  Frontierwright stats. Workload language/domain/task coverage becomes PASS only through
+  an explicit binding to exact stored receipt task/version/metric identities; Frontierwright
+  never infers coverage from benchmark names.
 - **Real RL foundations** include a rollout/reward/policy-optimization contract and a
   reference verifier-driven policy-gradient path; DPO remains correctly labeled as
   preference optimization.
 
-The next major layers are workload-specific evaluation coverage, broader evaluator and
-serving adapters, hardware-fit descendants with measured runtime effects, scalable Lab
-training/RL executors, and the continual use → failure/reward → intervention loop.
+The next major layers are broader evaluator and serving adapters, hardware-fit descendants
+with measured runtime effects, scalable Lab training/RL executors, and the continual
+use → failure/reward → intervention loop.
 
 ---
 
