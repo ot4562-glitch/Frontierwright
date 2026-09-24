@@ -16,7 +16,13 @@ from frontierwright.service import (
     get_status,
 )
 from frontierwright.tui import FrontierwrightApp
-from frontierwright.tui.app import CandidateScreen, HelpScreen, _compare_text
+from frontierwright.tui.app import (
+    ActionCenterScreen,
+    CandidateScreen,
+    HelpScreen,
+    WorkflowFormScreen,
+    _compare_text,
+)
 
 
 def test_candidate_compare_text_includes_stored_raw_evaluation() -> None:
@@ -195,3 +201,82 @@ async def test_tui_candidate_keyboard_selection_and_compare_modal(tmp_path: Path
         await pilot.press("k")
         await pilot.pause()
         assert app.candidate_index == 0
+
+
+async def test_tui_action_center_sets_build_intent_through_shared_service(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    Registry(project).initialize("NOVA", ModelOrigin.ZERO)
+
+    app = FrontierwrightApp(
+        view=get_status(project),
+        resources=get_resource_view(project),
+        build=get_build_view(project),
+        data=get_data_view(project),
+        paths=get_paths_view(project),
+        candidates=get_candidates_view(project),
+        history=get_history_view(project),
+        root=project,
+        language="en",
+    )
+
+    async with app.run_test(size=(140, 50)) as pilot:
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, ActionCenterScreen)
+
+        # Detect resources -> Register dataset -> Set build intent.
+        await pilot.press("j")
+        await pilot.press("j")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, WorkflowFormScreen)
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert not isinstance(app.screen, WorkflowFormScreen)
+
+    build = get_build_view(project)
+    assert build.configured is True
+    assert build.archetype == "Balanced"
+    assert build.priorities == {
+        "coding": 1,
+        "general": 1,
+        "math": 1,
+        "reasoning": 1,
+    }
+
+
+def test_tui_action_center_exposes_academy_birth_after_pretrain_data(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    Registry(project).initialize("NOVA", ModelOrigin.ZERO)
+    source = tmp_path / "pretrain.txt"
+    source.write_text("frontierwright academy\n" * 10, encoding="utf-8")
+
+    from frontierwright.data import DatasetRole
+    from frontierwright.service import add_local_dataset
+
+    add_local_dataset(
+        project,
+        source,
+        name="Pretrain",
+        role=DatasetRole.PRETRAIN,
+    )
+
+    app = FrontierwrightApp(
+        view=get_status(project),
+        resources=get_resource_view(project),
+        build=get_build_view(project),
+        data=get_data_view(project),
+        paths=get_paths_view(project),
+        candidates=get_candidates_view(project),
+        history=get_history_view(project),
+        root=project,
+        language="en",
+    )
+    action_ids = {item.action_id for item in app._action_items()}
+    assert "birth_tokenizer" in action_ids
+    assert "birth_zero" in action_ids

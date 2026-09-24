@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import json
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Static, TabbedContent, TabPane
+from textual.widgets import Footer, Header, Input, Static, TabbedContent, TabPane
 
+from frontierwright.data import DatasetClassification, DatasetRole
+from frontierwright.domain import ModelOrigin
 from frontierwright.errors import FrontierwrightError
+from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.i18n import tr
+from frontierwright.paths import TrainingPathId
+from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.service import (
     BuildView,
     CandidateView,
@@ -19,7 +27,14 @@ from frontierwright.service import (
     PathsView,
     ResourceView,
     StatusView,
+    add_local_dataset,
+    birth_zero_model,
+    calibrate_training_plan,
     compare_candidate,
+    compare_candidate_evaluation,
+    create_training_plan,
+    detect_resources,
+    execute_training_plan,
     get_build_view,
     get_candidates_view,
     get_data_view,
@@ -27,8 +42,13 @@ from frontierwright.service import (
     get_paths_view,
     get_resource_view,
     get_status,
+    get_tokenizers_view,
+    import_local_model,
     promote_candidate,
+    reconcile_training_run,
     reject_candidate,
+    set_build_intent,
+    train_project_tokenizer,
 )
 
 TAB_KEYS = (
@@ -161,6 +181,160 @@ class CandidateScreen(ModalScreen[str | None]):
         self.dismiss("reject")
 
 
+
+
+@dataclass(frozen=True)
+class ActionItem:
+    action_id: str
+    title: str
+    description: str
+
+
+@dataclass(frozen=True)
+class FormField:
+    key: str
+    label: str
+    default: str = ""
+    placeholder: str = ""
+
+
+class ActionCenterScreen(ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("escape", "cancel", "Back"),
+        Binding("j", "next_item", "Next"),
+        Binding("down", "next_item", "Next", show=False),
+        Binding("k", "previous_item", "Prev"),
+        Binding("up", "previous_item", "Prev", show=False),
+        Binding("enter", "choose", "Choose"),
+    ]
+
+    def __init__(self, items: list[ActionItem]) -> None:
+        super().__init__()
+        self.items = items
+        self.index = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="action-dialog"):
+            yield Static(self._text(), id="action-list")
+
+    def _text(self) -> str:
+        lines = [
+            "ACTION CENTER",
+            "",
+            "Every action below uses the same Frontierwright core as CLI/JSON.",
+            "",
+        ]
+        for index, item in enumerate(self.items):
+            marker = ">" if index == self.index else " "
+            lines.append(f"{marker} {item.title}")
+            lines.append(f"    {item.description}")
+        lines.extend(["", "j/k or ↑/↓ select · Enter choose · Esc back"])
+        return "\n".join(lines)
+
+    def _refresh(self) -> None:
+        self.query_one("#action-list", Static).update(self._text())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_next_item(self) -> None:
+        if not self.items:
+            return
+        self.index = (self.index + 1) % len(self.items)
+        self._refresh()
+
+    def action_previous_item(self) -> None:
+        if not self.items:
+            return
+        self.index = (self.index - 1) % len(self.items)
+        self._refresh()
+
+    def action_choose(self) -> None:
+        if not self.items:
+            self.dismiss(None)
+            return
+        self.dismiss(self.items[self.index].action_id)
+
+
+class WorkflowFormScreen(ModalScreen[dict[str, str] | None]):
+    BINDINGS = [
+        Binding("escape", "cancel", "Back"),
+        Binding("ctrl+s", "submit", "Submit"),
+    ]
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        description: str,
+        fields: list[FormField],
+    ) -> None:
+        super().__init__()
+        self.title_text = title
+        self.description = description
+        self.fields = fields
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="form-dialog"):
+            yield Static(
+                f"{self.title_text}\n\n{self.description}\n",
+                id="form-title",
+            )
+            for index, field in enumerate(self.fields):
+                yield Static(field.label)
+                yield Input(
+                    value=field.default,
+                    placeholder=field.placeholder,
+                    id=f"form-field-{index}",
+                )
+            yield Static(
+                "\nTab/Shift+Tab move · Ctrl+S submit · Esc cancel",
+                id="form-help",
+            )
+
+    def on_mount(self) -> None:
+        if self.fields:
+            self.query_one("#form-field-0", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_submit(self) -> None:
+        result: dict[str, str] = {}
+        for index, field in enumerate(self.fields):
+            result[field.key] = self.query_one(
+                f"#form-field-{index}",
+                Input,
+            ).value.strip()
+        self.dismiss(result)
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("y", "confirm", "Yes"),
+        Binding("enter", "confirm", "Yes"),
+        Binding("n", "cancel", "No"),
+        Binding("escape", "cancel", "No"),
+    ]
+
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__()
+        self.title_text = title
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            yield Static(
+                f"{self.title_text}\n\n{self.message}\n\n[Y/Enter] Confirm   [N/Esc] Cancel"
+            )
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class FrontierwrightApp(App[None]):
     """Keyboard-only human client over shared Frontierwright service views."""
 
@@ -169,7 +343,7 @@ class FrontierwrightApp(App[None]):
     #data-view, #history-view, #candidates-view {
         padding: 1 2;
     }
-    #help-dialog, #candidate-dialog {
+    #help-dialog, #candidate-dialog, #action-dialog, #form-dialog, #confirm-dialog {
         width: 88%;
         height: auto;
         max-height: 90%;
@@ -178,10 +352,14 @@ class FrontierwrightApp(App[None]):
         background: $surface;
         align: center middle;
     }
+    #form-dialog Input {
+        margin-bottom: 1;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
+        Binding("a", "action_center", "Actions"),
         Binding("?", "show_help", "Help"),
         Binding("escape", "back", "Back"),
         Binding("h", "previous_tab", "Prev"),
@@ -222,6 +400,7 @@ class FrontierwrightApp(App[None]):
         self.candidates = candidates or CandidateView()
         self.history = history or HistoryView()
         self.candidate_index = 0
+        self.last_run_id: str | None = None
         self.language = language
 
     def compose(self) -> ComposeResult:
@@ -525,6 +704,607 @@ class FrontierwrightApp(App[None]):
             self.notify(str(exc), severity="error")
             return
         self._refresh_all()
+
+
+    def _first_dataset_id(self, role: DatasetRole | None = None) -> str:
+        for item in self.data.datasets:
+            if role is not None and item.get("role") != role.value:
+                continue
+            dataset_id = item.get("dataset_id")
+            if isinstance(dataset_id, str):
+                return dataset_id
+        return ""
+
+    def _selected_candidate_model_id(self) -> str:
+        if not self.candidates.candidates:
+            return ""
+        index = min(self.candidate_index, len(self.candidates.candidates) - 1)
+        model_id = self.candidates.candidates[index].get("model_id")
+        return model_id if isinstance(model_id, str) else ""
+
+    def _first_plannable_path(self) -> str:
+        for item in self.paths.paths:
+            if item.get("availability") == "PLANNABLE":
+                path_id = item.get("path_id")
+                if isinstance(path_id, str):
+                    return path_id
+        return ""
+
+    def _first_ready_plan(self) -> str:
+        for item in self.paths.paths:
+            if item.get("availability") == "READY":
+                plan_id = item.get("ready_plan_id")
+                if isinstance(plan_id, str):
+                    return plan_id
+        return ""
+
+    def _default_dataset_for_path(self, path_id: str) -> str:
+        if path_id in {
+            TrainingPathId.FROM_SCRATCH_PRETRAINING.value,
+            TrainingPathId.CONTINUED_PRETRAINING.value,
+        }:
+            return self._first_dataset_id(DatasetRole.PRETRAIN)
+        if path_id in {
+            TrainingPathId.FULL_SFT.value,
+            TrainingPathId.LORA_SFT.value,
+            TrainingPathId.QLORA_SFT.value,
+        }:
+            return self._first_dataset_id(DatasetRole.SFT)
+        return self._first_dataset_id()
+
+    def _reference_backend_spec_path(self) -> Path:
+        return self.root / ".frontierwright" / "backends" / "reference-pytorch-v1.json"
+
+    def _write_reference_backend_spec(self, python_executable: str) -> Path:
+        output = self._reference_backend_spec_path()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = backend_spec_payload(python_executable)
+        output.write_text(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return output
+
+    def _reference_python_default(self) -> str:
+        spec_path = self._reference_backend_spec_path()
+        if spec_path.is_file():
+            try:
+                payload = json.loads(spec_path.read_text(encoding="utf-8"))
+                argv = payload.get("train_argv") if isinstance(payload, dict) else None
+                if (
+                    isinstance(argv, list)
+                    and argv
+                    and isinstance(argv[0], str)
+                    and argv[0]
+                ):
+                    return argv[0]
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+        return sys.executable
+
+    def _action_items(self) -> list[ActionItem]:
+        items = [
+            ActionItem(
+                "detect_resources",
+                "Detect local resources",
+                "Measure CPU/RAM/disk/GPU and refresh feasibility.",
+            ),
+            ActionItem(
+                "add_dataset",
+                "Register local dataset",
+                "Add PRETRAIN, SFT, or PREFERENCE data with an explicit classification.",
+            ),
+        ]
+        if self.build.mode == "INTENT":
+            items.append(
+                ActionItem(
+                    "build_intent",
+                    "Set build intent",
+                    "Choose an archetype and real capability priorities before stats exist.",
+                )
+            )
+
+        if self.view.champion_model_id is None:
+            if self.view.origin == ModelOrigin.ZERO.value:
+                if self._first_dataset_id(DatasetRole.PRETRAIN):
+                    items.append(
+                        ActionItem(
+                            "birth_tokenizer",
+                            "Train tokenizer",
+                            "Train and freeze a tokenizer artifact from registered PRETRAIN data.",
+                        )
+                    )
+                items.append(
+                    ActionItem(
+                        "birth_zero",
+                        "Birth zero model",
+                        "Materialize real initialized weights; training has not happened yet.",
+                    )
+                )
+            elif self.view.origin in {
+                ModelOrigin.IMPORTED_LOCAL.value,
+                ModelOrigin.INTERNAL_LAB.value,
+            }:
+                items.append(
+                    ActionItem(
+                        "import_model",
+                        "Import model",
+                        "Fingerprint and register an existing local/trainable checkpoint.",
+                    )
+                )
+
+        if self._first_plannable_path():
+            items.append(
+                ActionItem(
+                    "reference_plan",
+                    "Create + calibrate reference plan",
+                    "Pin model/data/config/resources, then run representative calibration.",
+                )
+            )
+
+        if self._first_ready_plan():
+            items.append(
+                ActionItem(
+                    "train_ready",
+                    "Dry-run + execute READY plan",
+                    "Revalidate the plan, dry-run it, then ask before real training.",
+                )
+            )
+
+        if self.last_run_id is not None:
+            items.append(
+                ActionItem(
+                    "reconcile_run",
+                    "Reconcile latest run",
+                    "Read durable executor evidence without launching duplicate training.",
+                )
+            )
+
+        if self.candidates.candidates and self.view.champion_model_id is not None:
+            items.append(
+                ActionItem(
+                    "evaluate_candidate",
+                    "Evaluate selected candidate vs champion",
+                    "Run the same raw evaluation pack on both exact model fingerprints.",
+                )
+            )
+        return items
+
+    def action_action_center(self) -> None:
+        self.push_screen(
+            ActionCenterScreen(self._action_items()),
+            self._action_center_result,
+        )
+
+    def _action_center_result(self, action_id: str | None) -> None:
+        if action_id is None:
+            return
+        if action_id == "detect_resources":
+            try:
+                detect_resources(self.root)
+                self._refresh_all()
+                self.notify("Resources detected.")
+            except FrontierwrightError as exc:
+                self.notify(str(exc), severity="error")
+            return
+
+        if action_id == "add_dataset":
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="REGISTER LOCAL DATASET",
+                    description=(
+                        "Nothing is uploaded. LOCAL_USER data defaults to PRIVATE. "
+                        "Role must be PRETRAIN, SFT, or PREFERENCE."
+                    ),
+                    fields=[
+                        FormField("source", "Source file/directory"),
+                        FormField("name", "Display name", "Training data"),
+                        FormField("role", "Role", "PRETRAIN"),
+                        FormField("classification", "Classification", "PRIVATE"),
+                    ],
+                ),
+                self._submit_add_dataset,
+            )
+            return
+
+        if action_id == "build_intent":
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="SET BUILD INTENT",
+                    description="Priorities are integer relative weights. They are not fake stats.",
+                    fields=[
+                        FormField("archetype", "Archetype", "Balanced"),
+                        FormField("general", "General priority", "1"),
+                        FormField("reasoning", "Reasoning priority", "1"),
+                        FormField("math", "Math priority", "1"),
+                        FormField("coding", "Coding priority", "1"),
+                    ],
+                ),
+                self._submit_build_intent,
+            )
+            return
+
+        if action_id == "birth_tokenizer":
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="TRAIN TOKENIZER",
+                    description="Tokenizer birth must happen before zero-model birth.",
+                    fields=[
+                        FormField(
+                            "dataset_id",
+                            "PRETRAIN dataset ID",
+                            self._first_dataset_id(DatasetRole.PRETRAIN),
+                        ),
+                        FormField("vocab_size", "Requested vocabulary size", "512"),
+                    ],
+                ),
+                self._submit_tokenizer_birth,
+            )
+            return
+
+        if action_id == "birth_zero":
+            tokenizers = get_tokenizers_view(self.root).tokenizers
+            tokenizer_id = ""
+            if tokenizers:
+                raw_id = tokenizers[-1].get("artifact_id")
+                tokenizer_id = raw_id if isinstance(raw_id, str) else ""
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="BIRTH ZERO MODEL",
+                    description=(
+                        "This materializes a real root checkpoint. Capability remains unmeasured."
+                    ),
+                    fields=[
+                        FormField("preset", "Preset", "zero-8m"),
+                        FormField("seed", "Initialization seed", "42"),
+                        FormField(
+                            "python",
+                            "Training Python executable",
+                            self._reference_python_default(),
+                        ),
+                        FormField(
+                            "tokenizer_artifact_id",
+                            "Tokenizer artifact ID (optional)",
+                            tokenizer_id,
+                        ),
+                    ],
+                ),
+                self._submit_zero_birth,
+            )
+            return
+
+        if action_id == "import_model":
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="IMPORT LOCAL MODEL",
+                    description=(
+                        "The model is fingerprinted from local bytes. "
+                        "History stays UNKNOWN/PARTIAL unless evidence is supplied."
+                    ),
+                    fields=[
+                        FormField("source", "Model directory/file"),
+                        FormField("history_manifest", "History manifest path (optional)"),
+                    ],
+                ),
+                self._submit_import_model,
+            )
+            return
+
+        if action_id == "reference_plan":
+            path_id = self._first_plannable_path()
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="CREATE + CALIBRATE REFERENCE PLAN",
+                    description=(
+                        "Creates an EXECUTE_SINGLE plan with max_runs=1, then calibrates "
+                        "the same reference workload. JSON config is pinned into plan identity."
+                    ),
+                    fields=[
+                        FormField("path_id", "Training path", path_id),
+                        FormField(
+                            "dataset_id",
+                            "Dataset ID",
+                            self._default_dataset_for_path(path_id),
+                        ),
+                        FormField(
+                            "python",
+                            "Training Python executable",
+                            self._reference_python_default(),
+                        ),
+                        FormField("config_json", "Backend config JSON", "{}"),
+                    ],
+                ),
+                self._submit_reference_plan,
+            )
+            return
+
+        if action_id == "train_ready":
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="TRAIN READY PLAN",
+                    description=(
+                        "Frontierwright first performs a dry-run. "
+                        "Actual execution requires a second confirmation."
+                    ),
+                    fields=[
+                        FormField("plan_id", "READY plan ID", self._first_ready_plan()),
+                        FormField(
+                            "python",
+                            "Training Python executable",
+                            self._reference_python_default(),
+                        ),
+                    ],
+                ),
+                self._submit_train_ready,
+            )
+            return
+
+        if action_id == "reconcile_run":
+            self._reconcile_latest_run()
+            return
+
+        if action_id == "evaluate_candidate":
+            model_id = self._selected_candidate_model_id()
+            self.push_screen(
+                WorkflowFormScreen(
+                    title="EVALUATE CANDIDATE VS CHAMPION",
+                    description=(
+                        "Runs the deterministic reference held-out LM pack on both models. "
+                        "Raw evidence never promotes a candidate automatically."
+                    ),
+                    fields=[
+                        FormField("candidate_model_id", "Candidate model ID", model_id),
+                        FormField(
+                            "dataset_id",
+                            "Evaluation dataset ID",
+                            self._first_dataset_id(),
+                        ),
+                        FormField(
+                            "python",
+                            "Evaluation Python executable",
+                            self._reference_python_default(),
+                        ),
+                        FormField("device", "Device (auto/cpu/cuda)", "auto"),
+                    ],
+                ),
+                self._submit_candidate_evaluation,
+            )
+
+    def _submit_add_dataset(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            source = Path(values["source"]).expanduser()
+            name = values["name"] or source.name or "Dataset"
+            role = DatasetRole(values["role"].upper())
+            classification = DatasetClassification(values["classification"].upper())
+            add_local_dataset(
+                self.root,
+                source,
+                name=name,
+                role=role,
+                classification=classification,
+            )
+            self._refresh_all()
+            self.notify(f"Dataset registered: {name}")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_build_intent(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            priorities = {
+                axis: int(values[axis])
+                for axis in ("general", "reasoning", "math", "coding")
+            }
+            set_build_intent(
+                self.root,
+                archetype=values["archetype"] or "Balanced",
+                priorities=priorities,
+            )
+            self._refresh_all()
+            self.notify("Build intent updated.")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_tokenizer_birth(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            view = train_project_tokenizer(
+                self.root,
+                dataset_id=values["dataset_id"],
+                vocab_size=int(values["vocab_size"]),
+            )
+            self._refresh_all()
+            self.notify(f"Tokenizer ready: {view.artifact_id}")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_zero_birth(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            tokenizer_id = values.get("tokenizer_artifact_id") or None
+            view = birth_zero_model(
+                self.root,
+                preset=values["preset"],
+                seed=int(values["seed"]),
+                python_executable=values["python"],
+                tokenizer_artifact_id=tokenizer_id,
+            )
+            self._refresh_all()
+            self.notify(f"Model born: {view.model_id}")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_import_model(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            if self.view.origin is None:
+                raise ValueError("Project origin is unknown.")
+            origin = ModelOrigin(self.view.origin)
+            manifest = values.get("history_manifest") or None
+            import_local_model(
+                self.root,
+                Path(values["source"]).expanduser(),
+                origin=origin,
+                history_manifest=Path(manifest).expanduser() if manifest else None,
+            )
+            self._refresh_all()
+            self.notify("Model imported.")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_reference_plan(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            config_raw = json.loads(values["config_json"] or "{}")
+            if not isinstance(config_raw, dict):
+                raise ValueError("Backend config JSON must be an object.")
+            config = {str(key): value for key, value in config_raw.items()}
+            python_executable = values["python"]
+            backend_spec = self._write_reference_backend_spec(python_executable)
+            plan = create_training_plan(
+                self.root,
+                path_id=TrainingPathId(values["path_id"]),
+                backend_spec_path=backend_spec,
+                dataset_id=values["dataset_id"] or None,
+                permission=PermissionLevel.EXECUTE_SINGLE,
+                budgets=HardBudgets(max_runs=1),
+                config=config,
+            )
+            if plan.plan_id is None:
+                raise FrontierwrightError(
+                    "PLAN_ID_MISSING",
+                    "Created plan does not expose a durable plan ID.",
+                    4,
+                )
+            calibrated = calibrate_training_plan(
+                self.root,
+                plan_id=plan.plan_id,
+                backend_spec_path=backend_spec,
+            )
+            self._refresh_all()
+            if calibrated.ready:
+                self.notify(f"Plan READY: {calibrated.plan_id}")
+            else:
+                blockers = "; ".join(calibrated.blockers) or "unknown blockers"
+                self.notify(f"Plan calibrated but not READY: {blockers}", severity="warning")
+        except (
+            FrontierwrightError,
+            KeyError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_train_ready(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            backend_spec = self._write_reference_backend_spec(values["python"])
+            dry_run = execute_training_plan(
+                self.root,
+                plan_id=values["plan_id"],
+                backend_spec_path=backend_spec,
+                dry_run=True,
+                rerun=False,
+            )
+            self.notify(f"Dry-run passed for {dry_run.plan_id}.")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.push_screen(
+            ConfirmScreen(
+                "EXECUTE TRAINING",
+                (
+                    "Create a real candidate now? "
+                    "The current Champion will remain unchanged until explicit promotion."
+                ),
+            ),
+            lambda confirmed: self._confirmed_train(values, confirmed),
+        )
+
+    def _confirmed_train(self, values: dict[str, str], confirmed: bool) -> None:
+        if not confirmed:
+            self.notify("Training cancelled.")
+            return
+        try:
+            backend_spec = self._write_reference_backend_spec(values["python"])
+            run = execute_training_plan(
+                self.root,
+                plan_id=values["plan_id"],
+                backend_spec_path=backend_spec,
+                dry_run=False,
+                rerun=False,
+            )
+            self.last_run_id = run.run_id
+            self._refresh_all()
+            self.notify(
+                f"Run {run.run_id}: {run.status}. "
+                "Use Actions → Reconcile latest run after the worker finishes."
+            )
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _reconcile_latest_run(self) -> None:
+        if self.last_run_id is None:
+            self.notify("No TUI-started run is available to reconcile.", severity="warning")
+            return
+        try:
+            run = reconcile_training_run(self.root, self.last_run_id)
+            self._refresh_all()
+            if run.status == "COMPLETED":
+                self.notify(f"Run completed. Candidate: {run.candidate_model_id}")
+            elif run.status == "RUNNING":
+                self.notify("Run is still active.")
+            else:
+                detail = run.error_message or run.error_code or run.status
+                self.notify(f"Run {run.status}: {detail}", severity="warning")
+        except FrontierwrightError as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_candidate_evaluation(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+        try:
+            comparison = compare_candidate_evaluation(
+                self.root,
+                candidate_model_id=values["candidate_model_id"],
+                pack_id="frontierwright.eval.reference-heldout-lm",
+                dataset_id=values["dataset_id"],
+                python_executable=values["python"],
+                device=values["device"] or "auto",
+            )
+            self._refresh_all()
+            self.notify(
+                "Raw evaluation complete."
+                if comparison.comparable
+                else f"Evaluation completed but is not comparable: {comparison.reason}"
+            )
+            compare = compare_candidate(
+                self.root,
+                values["candidate_model_id"],
+            )
+            self.push_screen(
+                CandidateScreen(compare),
+                lambda result: self._candidate_result(
+                    values["candidate_model_id"],
+                    result,
+                ),
+            )
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
 
     def action_show_help(self) -> None:
         self.push_screen(HelpScreen(self.language))
