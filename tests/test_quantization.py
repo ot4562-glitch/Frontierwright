@@ -210,6 +210,96 @@ def test_identical_quantization_replays_without_backend_rerun(
     assert second.replayed is True
 
 
+
+
+def test_quantized_candidate_runs_normal_raw_evaluation_compare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _, _ = setup_project(tmp_path)
+    dataset_root = tmp_path / "eval-data"
+    dataset_root.mkdir()
+    (dataset_root / "eval.txt").write_text(
+        "quantized evaluation corpus\n" * 50,
+        encoding="utf-8",
+    )
+    data_view = add_local_dataset(
+        project,
+        dataset_root,
+        name="Eval data",
+        role=DatasetRole.PRETRAIN,
+    )
+    dataset_id = str(data_view.datasets[0]["dataset_id"])
+
+    def backend(
+        argv_template: tuple[str, ...],
+        *,
+        environment_overrides: dict[str, str],
+        request_path: Path,
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        if request.get("operation") == "quantize":
+            return fake_quantize_backend(
+                argv_template,
+                environment_overrides=environment_overrides,
+                request_path=request_path,
+                timeout_seconds=timeout_seconds,
+            )
+        if request.get("operation") != "evaluate":
+            raise AssertionError(f"unexpected operation: {request.get('operation')}")
+        model_path = str(request["model_source_path"])
+        candidate = ".frontierwright" in model_path and "transforms" in model_path
+        cross_entropy = 1.1 if candidate else 1.0
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "operation": "evaluate",
+            "metrics": {
+                "backend_id": "frontierwright-reference-pytorch-v1",
+                "device": "cpu",
+                "cross_entropy_nats_per_token": cross_entropy,
+                "perplexity": math.exp(cross_entropy),
+                "tokens_evaluated": 64,
+                "windows_evaluated": 1,
+                "python_version": "fixture",
+                "torch_version": "fixture",
+                "parameter_count": 8_000_000,
+            },
+        }
+
+    monkeypatch.setattr(service_module, "run_structured_command", backend)
+
+    quantized = quantize_reference_model(
+        project,
+        python_executable="fixture-python",
+    )
+    assert quantized.candidate_model_id is not None
+
+    compared = compare_candidate_evaluation(
+        project,
+        candidate_model_id=quantized.candidate_model_id,
+        pack_id=REFERENCE_LM_PACK.pack_id,
+        dataset_id=dataset_id,
+        python_executable="fixture-python",
+        device="cpu",
+        batch_size=1,
+        max_batches=1,
+    )
+
+    assert compared.comparable is True
+    assert compared.champion_model_id is not None
+    assert compared.candidate_model_id == quantized.candidate_model_id
+    cross_entropy = next(
+        item
+        for item in compared.measurements
+        if item["metric"] == "cross_entropy_nats_per_token"
+    )
+    assert cross_entropy["champion_value"] == 1.0
+    assert cross_entropy["candidate_value"] == 1.1
+    assert cross_entropy["improvement_delta"] == pytest.approx(-0.1)
+
+
 def test_quantized_artifact_tampering_blocks_compare_and_promotion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
