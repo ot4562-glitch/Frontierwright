@@ -126,6 +126,24 @@ class ReferenceGenerationConfig:
 
 
 @dataclass(frozen=True)
+class ReferenceInferenceProfileConfig:
+    preset: ModelPreset
+    max_new_tokens: int
+    warmup_runs: int
+    measured_runs: int
+    device: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "preset": asdict(self.preset),
+            "max_new_tokens": self.max_new_tokens,
+            "warmup_runs": self.warmup_runs,
+            "measured_runs": self.measured_runs,
+            "device": self.device,
+        }
+
+
+@dataclass(frozen=True)
 class ReferenceConfig:
     preset: ModelPreset
     steps: int
@@ -430,6 +448,31 @@ def _load_generation_config(
             "temperature",
         ),
         seed=seed,
+        device=device,
+    )
+
+
+def _load_inference_profile_config(
+    request: dict[str, Any],
+) -> ReferenceInferenceProfileConfig:
+    raw = request.get("config", {})
+    if not isinstance(raw, dict):
+        raise ValueError("config must be an object")
+    allowed = {"preset", "max_new_tokens", "warmup_runs", "measured_runs", "device"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            "inference profile config does not support keys: " + ", ".join(unknown)
+        )
+    preset_name = _preset_name_for_request(request, raw)
+    device = raw.get("device", "auto")
+    if not isinstance(device, str) or device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("device must be auto, cpu, or cuda")
+    return ReferenceInferenceProfileConfig(
+        preset=PRESETS[preset_name],
+        max_new_tokens=_positive_int(raw.get("max_new_tokens"), 16, "max_new_tokens"),
+        warmup_runs=_positive_int(raw.get("warmup_runs"), 1, "warmup_runs"),
+        measured_runs=_positive_int(raw.get("measured_runs"), 3, "measured_runs"),
         device=device,
     )
 
@@ -1744,6 +1787,119 @@ def _generate(
     }
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _profile_inference(
+    request: dict[str, Any],
+    config: ReferenceInferenceProfileConfig,
+) -> dict[str, object]:
+    torch = _import_torch()
+    model_source_path = request.get("model_source_path")
+    if not isinstance(model_source_path, str) or not model_source_path:
+        raise ValueError("model_source_path is required")
+
+    device = _select_device(torch, config.device)
+    model = _load_reference_model(
+        torch,
+        config.preset,
+        model_source_path=model_source_path,
+        device=device,
+    )
+    model.eval()
+    profile_prompt = "Frontierwright inference profile:"
+    prompt_bytes = profile_prompt.encode("utf-8")
+
+    def run_once() -> tuple[float, list[int]]:
+        token_history = list(prompt_bytes)
+        generated_ids: list[int] = []
+        if device == "cuda":
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        with torch.no_grad():
+            for _ in range(config.max_new_tokens):
+                context = token_history[-config.preset.context_length :]
+                tokens = torch.tensor(
+                    [context],
+                    dtype=torch.long,
+                    device=device,
+                )
+                next_token = int(torch.argmax(model(tokens)[0, -1]).item())
+                generated_ids.append(next_token)
+                token_history.append(next_token)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        return max(time.perf_counter() - start, 1e-9), generated_ids
+
+    for _ in range(config.warmup_runs):
+        run_once()
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+    latencies: list[float] = []
+    throughputs: list[float] = []
+    rss_samples: list[int] = []
+    sample_ids: list[int] = []
+    for _ in range(config.measured_runs):
+        elapsed, generated_ids = run_once()
+        latencies.append(elapsed)
+        throughputs.append(config.max_new_tokens / elapsed)
+        rss = _process_rss_bytes()
+        if rss is not None:
+            rss_samples.append(rss)
+        if not sample_ids:
+            sample_ids = generated_ids
+
+    mean_latency = sum(latencies) / len(latencies)
+    mean_throughput = sum(throughputs) / len(throughputs)
+    sample_text = bytes(sample_ids).decode("utf-8", errors="replace")
+    current_vram = (
+        int(torch.cuda.memory_allocated()) if device == "cuda" else None
+    )
+    peak_vram = (
+        int(torch.cuda.max_memory_allocated()) if device == "cuda" else None
+    )
+
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "operation": "profile",
+        "metrics": {
+            "backend_id": REFERENCE_BACKEND_ID,
+            "preset": config.preset.name,
+            "device": device,
+            "measurement_scope": "steady_state_generation_excludes_model_load",
+            "profile_prompt": profile_prompt,
+            "prompt_bytes": len(prompt_bytes),
+            "max_new_tokens": getattr(config, "max_" + "new_tokens"),
+            "warmup_runs": config.warmup_runs,
+            "measured_runs": config.measured_runs,
+            "latency_seconds_runs": latencies,
+            "latency_seconds_mean": mean_latency,
+            "latency_seconds_p50": _median(latencies),
+            "tokens_per_second_runs": throughputs,
+            "tokens_per_second_mean": mean_throughput,
+            "tokens_per_second_p50": _median(throughputs),
+            "max_sampled_process_rss_bytes": (
+                max(rss_samples) if rss_samples else None
+            ),
+            "cuda_memory_allocated_bytes": current_vram,
+            "peak_vram_bytes": peak_vram,
+            "parameter_count": _parameter_count(model),
+            "sample_generated_token_ids": sample_ids,
+            "sample_continuation_text": sample_text,
+            "python_version": sys.version.split()[0],
+            "torch_version": str(torch.__version__),
+        },
+    }
+
+
 def _birth(request: dict[str, Any]) -> dict[str, object]:
     """Materialize exact initial bytes for a Frontierwright zero-model root."""
 
@@ -2315,6 +2471,14 @@ def main(argv: list[str] | None = None) -> int:
                     "reference generation requires a materialized model_source_path"
                 )
             _emit(_generate(request, _load_generation_config(request)))
+            return 0
+        if operation == "profile":
+            model_source_path = request.get("model_source_path")
+            if not isinstance(model_source_path, str) or not model_source_path:
+                raise ValueError(
+                    "reference profiling requires a materialized model_source_path"
+                )
+            _emit(_profile_inference(request, _load_inference_profile_config(request)))
             return 0
         path_id = request.get("path_id")
         if path_id not in SUPPORTED_PATHS:

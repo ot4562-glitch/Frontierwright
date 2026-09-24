@@ -439,6 +439,20 @@ class GenerationView:
 
 
 @dataclass(frozen=True)
+class InferenceProfileView:
+    schema_version: int = 1
+    intervention_id: str = "frontierwright.operate.profile-reference"
+    intervention_version: str = "1"
+    model_id: str | None = None
+    model_fingerprint: str | None = None
+    model_format: str | None = None
+    metrics: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class CompareView:
     schema_version: int = 1
     champion_model_id: str | None = None
@@ -1804,6 +1818,183 @@ def generate_reference_text(
         continuation_text=continuation,
         generated_text=generated_text,
         generated_token_ids=list(token_ids),
+        metrics=dict(metrics),
+    )
+
+
+def profile_reference_inference(
+    root: Path,
+    *,
+    python_executable: str,
+    max_new_tokens: int = 16,
+    warmup_runs: int = 1,
+    measured_runs: int = 3,
+    device: str = "auto",
+    timeout_seconds: float = 120.0,
+) -> InferenceProfileView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before inference profiling.",
+            10,
+        )
+    for label, value in (
+        ("max_new_tokens", max_new_tokens),
+        ("warmup_runs", warmup_runs),
+        ("measured_runs", measured_runs),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise FrontierwrightError(
+                "INFERENCE_PROFILE_CONFIG_INVALID",
+                f"{label} must be a positive integer.",
+                2,
+            )
+    if device not in {"auto", "cpu", "cuda"}:
+        raise FrontierwrightError(
+            "INFERENCE_PROFILE_CONFIG_INVALID",
+            "device must be auto, cpu, or cuda.",
+            2,
+        )
+    if timeout_seconds <= 0 or not math.isfinite(timeout_seconds):
+        raise FrontierwrightError(
+            "INVALID_TIMEOUT",
+            "Inference profile timeout must be finite and positive.",
+            2,
+        )
+    if not python_executable.strip():
+        raise FrontierwrightError(
+            "BACKEND_PYTHON_UNAVAILABLE",
+            "Inference profile Python executable must be nonempty.",
+            2,
+        )
+
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current champion is required before inference profiling.",
+            12,
+        )
+    model = state.champion.model
+    _verify_model_artifact_integrity(registry, model.model_id)
+    preset = _reference_model_preset(model)
+
+    intervention = intervention_by_id("frontierwright.operate.profile-reference")
+    if intervention is None:
+        raise FrontierwrightError(
+            "INTERVENTION_NOT_FOUND",
+            "Built-in reference inference profile intervention is unavailable.",
+            4,
+        )
+
+    operations_root = registry.state_dir / "operations"
+    request_path = operations_root / f"profile-{uuid4().hex}.json"
+    request: dict[str, object] = {
+        "schema_version": 1,
+        "backend_id": REFERENCE_BACKEND_ID,
+        "operation": "profile",
+        "model_source_path": str(Path(model.checkpoint).resolve()),
+        "config": {
+            "preset": preset,
+            "max_new_tokens": max_new_tokens,
+            "warmup_runs": warmup_runs,
+            "measured_runs": measured_runs,
+            "device": device,
+        },
+    }
+    _write_state_json(request_path, request)
+    try:
+        result = run_structured_command(
+            (
+                python_executable,
+                "-m",
+                "frontierwright.reference_backend",
+                "{request_json}",
+            ),
+            environment_overrides={"PYTHONUNBUFFERED": "1"},
+            request_path=request_path,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        request_path.unlink(missing_ok=True)
+        try:
+            operations_root.rmdir()
+        except OSError:
+            pass
+
+    metrics = result.get("metrics")
+    if result.get("operation") != "profile" or not isinstance(metrics, dict):
+        raise FrontierwrightError(
+            "INFERENCE_PROFILE_RESULT_INVALID",
+            "Inference profile backend returned invalid structured output.",
+            14,
+        )
+
+    required_numeric = (
+        "latency_seconds_mean",
+        "latency_seconds_p50",
+        "tokens_per_second_mean",
+        "tokens_per_second_p50",
+    )
+    for key in required_numeric:
+        metric_value = metrics.get(key)
+        if (
+            isinstance(metric_value, bool)
+            or not isinstance(metric_value, (int, float))
+            or not math.isfinite(float(metric_value))
+            or float(metric_value) <= 0
+        ):
+            raise FrontierwrightError(
+                "INFERENCE_PROFILE_RESULT_INVALID",
+                f"Inference profile metric {key} must be finite and positive.",
+                14,
+            )
+    for key in ("max_new_tokens", "warmup_runs", "measured_runs", "parameter_count"):
+        integer_metric_value = metrics.get(key)
+        if (
+            isinstance(integer_metric_value, bool)
+            or not isinstance(integer_metric_value, int)
+            or integer_metric_value <= 0
+        ):
+            raise FrontierwrightError(
+                "INFERENCE_PROFILE_RESULT_INVALID",
+                f"Inference profile metric {key} must be a positive integer.",
+                14,
+            )
+    if metrics.get("max_new_tokens") != max_new_tokens:
+        raise FrontierwrightError(
+            "INFERENCE_PROFILE_RESULT_INVALID",
+            "Inference profile result does not match the requested token count.",
+            14,
+        )
+
+    history_metrics = {
+        key: value
+        for key, value in metrics.items()
+        if key not in {"sample_generated_token_ids", "sample_continuation_text"}
+    }
+    registry.record_event(
+        "INFERENCE_PROFILE_MEASURED",
+        {
+            "intervention_id": intervention.intervention_id,
+            "intervention_version": intervention.version,
+            "model_id": model.model_id,
+            "model_fingerprint": model.fingerprint,
+            "config": {
+                "preset": preset,
+                "max_new_tokens": max_new_tokens,
+                "warmup_runs": warmup_runs,
+                "measured_runs": measured_runs,
+                "device": device,
+            },
+            "metrics": history_metrics,
+        },
+    )
+    return InferenceProfileView(
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        model_format=model.model_format.value,
         metrics=dict(metrics),
     )
 

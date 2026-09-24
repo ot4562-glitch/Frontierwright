@@ -246,6 +246,16 @@ BUILTIN_INTERVENTION_PLUGINS: tuple[InterventionPlugin, ...] = (
             surface=InterventionSurface.OPERATION,
         )
     ),
+    OperationInterventionPlugin(
+        descriptor=InterventionDescriptor(
+            intervention_id="frontierwright.operate.profile-reference",
+            family=InterventionFamily.OPERATE,
+            title="Reference inference profile",
+            version="1",
+            provider="frontierwright",
+            surface=InterventionSurface.OPERATION,
+        )
+    ),
 )
 
 BUILTIN_INTERVENTIONS: tuple[InterventionDescriptor, ...] = tuple(

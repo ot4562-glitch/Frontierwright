@@ -38,6 +38,7 @@ from frontierwright.service import (
     ExportView,
     GenerationView,
     HistoryView,
+    InferenceProfileView,
     InterventionsView,
     LabAdaptersView,
     MergeView,
@@ -80,6 +81,7 @@ from frontierwright.service import (
     merge_reference_models,
     prepare_dataset,
     prepare_dataset_mixture,
+    profile_reference_inference,
     promote_candidate,
     quantize_reference_model,
     reconcile_training_run,
@@ -230,6 +232,10 @@ def _export_verify_payload(view: ExportVerifyView) -> dict[str, object]:
 
 
 def _generation_payload(view: GenerationView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _inference_profile_payload(view: InferenceProfileView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -615,6 +621,22 @@ def _print_generation(view: GenerationView) -> None:
     console.print(f"Fingerprint: {view.model_fingerprint}")
     console.print("")
     console.print(view.generated_text)
+
+
+def _print_inference_profile(view: InferenceProfileView) -> None:
+    console.print("[bold]REFERENCE INFERENCE PROFILE[/bold]")
+    console.print(f"Model: {view.model_id} · {view.model_format}")
+    console.print(f"Fingerprint: {view.model_fingerprint}")
+    metrics = view.metrics
+    console.print(f"Device: {metrics.get('device')}")
+    latency = metrics.get("latency_seconds_p50")
+    throughput = metrics.get("tokens_per_second_p50")
+    if isinstance(latency, (int, float)) and not isinstance(latency, bool):
+        console.print(f"Latency p50: {float(latency):.6f}s")
+    if isinstance(throughput, (int, float)) and not isinstance(throughput, bool):
+        console.print(f"Throughput p50: {float(throughput):.3f} tokens/s")
+    console.print(f"Peak VRAM: {metrics.get('peak_vram_bytes')}")
+    console.print(f"Process RSS: {metrics.get('max_sampled_process_rss_bytes')}")
 
 
 def _print_compare(view: CompareView) -> None:
@@ -1192,6 +1214,62 @@ def operate_generate(
         _emit_json(_generation_payload(view))
         return
     _print_generation(view)
+
+
+@operate_app.command("profile")
+def operate_profile(
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    python_executable: Annotated[
+        str,
+        typer.Option(
+            "--python",
+            help="Python executable for the isolated PyTorch inference environment.",
+        ),
+    ] = sys.executable,
+    max_new_tokens: Annotated[
+        int,
+        typer.Option("--max-new-tokens", min=1, help="Generated tokens per measured run."),
+    ] = 16,
+    warmup_runs: Annotated[
+        int,
+        typer.Option("--warmup-runs", min=1, help="Unmeasured warmup generations."),
+    ] = 1,
+    measured_runs: Annotated[
+        int,
+        typer.Option("--runs", min=1, help="Measured generation runs."),
+    ] = 3,
+    device: Annotated[
+        str,
+        typer.Option("--device", help="auto, cpu, or cuda."),
+    ] = "auto",
+    timeout_seconds: Annotated[
+        float,
+        typer.Option("--timeout", help="Maximum profiling backend wall time in seconds."),
+    ] = 120.0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = profile_reference_inference(
+            path,
+            python_executable=python_executable,
+            max_new_tokens=max_new_tokens,
+            warmup_runs=warmup_runs,
+            measured_runs=measured_runs,
+            device=device,
+            timeout_seconds=timeout_seconds,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    if json_output:
+        _emit_json(_inference_profile_payload(view))
+        return
+    _print_inference_profile(view)
 
 
 @app.command("import")

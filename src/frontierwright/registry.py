@@ -1235,6 +1235,12 @@ WHERE parent_model_id IS NOT NULL;
             (kind, timestamp(), json.dumps(details, sort_keys=True, allow_nan=False)),
         )
 
+    def record_event(self, kind: str, details: dict[str, Any]) -> None:
+        if not kind.strip():
+            raise FrontierwrightError("EVENT_KIND_INVALID", "Event kind must be nonempty.", 2)
+        with self.connect(write=True) as connection:
+            self.event(connection, kind, details)
+
     @staticmethod
     def insert_model(connection: sqlite3.Connection, model: ModelState) -> None:
         connection.execute(
