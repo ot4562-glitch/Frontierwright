@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: Core / ${{ matrix.os }} / py${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install core + dev dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: python -m ruff check .
+      - name: mypy
+        run: python -m mypy src/frontierwright
+      - name: Tests
+        run: python -m pytest -q
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: Clean-wheel smoke
+        run: python tools/release_smoke.py
+
+  training:
+    name: Reference training smoke / ubuntu / py3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install training + dev dependencies
+        run: python -m pip install -e ".[train,dev]"
+      - name: Reference backend tests with PyTorch
+        run: python -m pytest tests/test_birth.py tests/test_reference_backend.py tests/test_evaluation_runner.py -q
