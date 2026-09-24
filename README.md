@@ -184,6 +184,17 @@ frontierwright resources detect --path .
 frontierwright play --path .
 ```
 
+Compare a stock/open baseline with any registered descendant even after the descendant
+has already become Champion:
+
+```bash
+frontierwright workload compare-models STOCK_MODEL_ID CUSTOM_MODEL_ID --path .
+```
+
+This comparison is not tied to Candidate status. It reuses the same capability, workload,
+serving/resource, artifact-size, paired-item, Pareto, and explicit user-utility evidence
+that Frontierwright has actually measured; missing dimensions remain UNKNOWN.
+
 AI agents and automation should use the non-interactive CLI/JSON contract instead of
 driving the TUI:
 

@@ -485,6 +485,28 @@ class RunView:
 
 
 @dataclass(frozen=True)
+class ModelComparisonView:
+    schema_version: int = 1
+    baseline_model_id: str | None = None
+    baseline_fingerprint: str | None = None
+    contender_model_id: str | None = None
+    contender_fingerprint: str | None = None
+    direct_descendant: bool = False
+    scale_comparable: bool = False
+    scale_reason: str | None = None
+    baseline_stats: dict[str, float | None] = field(default_factory=dict)
+    contender_stats: dict[str, float | None] = field(default_factory=dict)
+    deltas: dict[str, float | None] = field(default_factory=dict)
+    paired_capability_evidence: dict[str, object] = field(default_factory=dict)
+    raw_evaluation_comparisons: list[dict[str, object]] = field(default_factory=list)
+    workload_comparison: dict[str, object] = field(default_factory=dict)
+    pareto: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class ActionPreflightView:
     schema_version: int = 1
     action: str = ""
@@ -7931,6 +7953,138 @@ def _candidate_pareto_evidence(
             "Champion and Candidate inference profiles use comparable measured conditions."
         )
     return payload
+
+
+def compare_models(
+    root: Path,
+    baseline_model_id: str,
+    contender_model_id: str,
+) -> ModelComparisonView:
+    """Compare any two registered models without requiring Candidate status.
+
+    This is the durable stock-vs-descendant/user-fit comparison surface. It never
+    promotes either model and it never assumes that a descendant must be better.
+    """
+
+    if baseline_model_id == contender_model_id:
+        raise FrontierwrightError(
+            "MODEL_COMPARISON_IDENTICAL",
+            "Baseline and contender must be different model IDs.",
+            2,
+        )
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before comparing models.",
+            10,
+        )
+    baseline = registry.get_model(baseline_model_id)
+    contender = registry.get_model(contender_model_id)
+    _verify_model_artifact_integrity(registry, baseline.model_id)
+    _verify_model_artifact_integrity(registry, contender.model_id)
+
+    baseline_stats = get_stats_view(root, baseline.model_id)
+    contender_stats = get_stats_view(root, contender.model_id)
+    comparable = bool(
+        baseline_stats.measured
+        and contender_stats.measured
+        and baseline_stats.scale_hash is not None
+        and baseline_stats.scale_hash == contender_stats.scale_hash
+    )
+    if comparable:
+        scale_reason = "Baseline and contender use the same frozen capability scale."
+    elif not baseline_stats.measured or not contender_stats.measured:
+        scale_reason = "At least one model is not measured under a frozen capability scale."
+    else:
+        scale_reason = "Baseline and contender do not use the same frozen capability scale."
+
+    deltas = _empty_stats()
+    if comparable:
+        for axis in deltas:
+            before = baseline_stats.stats.get(axis)
+            after = contender_stats.stats.get(axis)
+            if before is not None and after is not None:
+                deltas[axis] = after - before
+
+    baseline_workload = get_workload_fit(root, baseline.model_id)
+    contender_workload = get_workload_fit(root, contender.model_id)
+    baseline_constraints = {
+        str(item.get("key")): item
+        for item in baseline_workload.constraints
+        if isinstance(item.get("key"), str)
+    }
+    contender_constraints = {
+        str(item.get("key")): item
+        for item in contender_workload.constraints
+        if isinstance(item.get("key"), str)
+    }
+    regressions: list[dict[str, object]] = []
+    improvements: list[dict[str, object]] = []
+    for key in sorted(set(baseline_constraints) & set(contender_constraints)):
+        baseline_constraint = baseline_constraints[key]
+        contender_constraint = contender_constraints[key]
+        baseline_status = baseline_constraint.get("status")
+        contender_status = contender_constraint.get("status")
+        item = {
+            "key": key,
+            "baseline_status": baseline_status,
+            "contender_status": contender_status,
+            "baseline_observed": baseline_constraint.get("observed"),
+            "contender_observed": contender_constraint.get("observed"),
+            "requirement": contender_constraint.get("requirement"),
+        }
+        if baseline_status == "PASS" and contender_status != "PASS":
+            regressions.append(item)
+        elif baseline_status != "PASS" and contender_status == "PASS":
+            improvements.append(item)
+
+    workload_comparison: dict[str, object] = {
+        "configured": baseline_workload.configured or contender_workload.configured,
+        "profile_id": contender_workload.workload_profile_id,
+        "profile_hash": contender_workload.workload_profile_hash,
+        "baseline": baseline_workload.to_dict(),
+        "contender": contender_workload.to_dict(),
+        "regressions": regressions,
+        "improvements": improvements,
+        "note": (
+            "The same active workload contract is applied to both models. Missing measured "
+            "evidence remains UNKNOWN rather than being estimated from model size."
+        ),
+    }
+
+    pareto = _candidate_pareto_evidence(
+        registry,
+        champion_model_id=baseline.model_id,
+        candidate_model_id=contender.model_id,
+        champion_stats=baseline_stats,
+        candidate_stats=contender_stats,
+        scale_comparable=comparable,
+    )
+    return ModelComparisonView(
+        baseline_model_id=baseline.model_id,
+        baseline_fingerprint=baseline.fingerprint,
+        contender_model_id=contender.model_id,
+        contender_fingerprint=contender.fingerprint,
+        direct_descendant=contender.parent_model_id == baseline.model_id,
+        scale_comparable=comparable,
+        scale_reason=scale_reason,
+        baseline_stats=baseline_stats.stats,
+        contender_stats=contender_stats.stats,
+        deltas=deltas,
+        paired_capability_evidence=_paired_capability_evidence(
+            registry,
+            champion_model_id=baseline.model_id,
+            candidate_model_id=contender.model_id,
+        ),
+        raw_evaluation_comparisons=_stored_raw_evaluation_comparisons(
+            registry,
+            champion_model_id=baseline.model_id,
+            candidate_model_id=contender.model_id,
+        ),
+        workload_comparison=workload_comparison,
+        pareto=pareto,
+    )
 
 
 def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:

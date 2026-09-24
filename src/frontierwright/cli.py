@@ -44,6 +44,7 @@ from frontierwright.service import (
     InterventionsView,
     LabAdaptersView,
     MergeView,
+    ModelComparisonView,
     PathsView,
     PlanView,
     QuantizeView,
@@ -61,6 +62,7 @@ from frontierwright.service import (
     calibrate_training_plan,
     compare_candidate,
     compare_candidate_evaluation,
+    compare_models,
     connect_lab_adapter,
     create_training_plan,
     detect_resources,
@@ -415,6 +417,81 @@ def _parse_float_assignments(items: list[str], label: str) -> dict[str, float]:
                 2,
             ) from exc
     return parsed
+
+
+def _print_model_comparison(view: ModelComparisonView) -> None:
+    console.print("[bold]MODEL FIT COMPARISON[/bold]")
+    console.print(f"Baseline:  {view.baseline_model_id}")
+    console.print(f"Contender: {view.contender_model_id}")
+    console.print(f"Direct descendant: {'YES' if view.direct_descendant else 'NO'}")
+    console.print(f"Capability comparable: {'YES' if view.scale_comparable else 'NO'}")
+    if view.scale_reason:
+        console.print(view.scale_reason)
+    console.print("")
+    console.print("AXIS        BASELINE   CONTENDER   DELTA")
+    for axis in ("general", "reasoning", "math", "coding"):
+        baseline = view.baseline_stats.get(axis)
+        contender = view.contender_stats.get(axis)
+        delta = view.deltas.get(axis)
+        delta_text = "?" if delta is None else f"{delta:+g}"
+        console.print(
+            f"{axis.title():10} "
+            f"{baseline if baseline is not None else '?':>8}   "
+            f"{contender if contender is not None else '?':>9}   "
+            f"{delta_text:>5}"
+        )
+
+    paired = view.paired_capability_evidence
+    if paired.get("available") is True:
+        console.print("")
+        console.print("PAIRED CAPABILITY ITEMS")
+        axes = paired.get("axes")
+        if isinstance(axes, dict):
+            for axis in ("general", "reasoning", "math", "coding"):
+                evidence = axes.get(axis)
+                if not isinstance(evidence, dict):
+                    continue
+                console.print(
+                    f"  {axis}: +{evidence.get('improvements', '?')} improvements / "
+                    f"-{evidence.get('regressions', '?')} regressions · "
+                    f"exact p={evidence.get('p_value_two_sided')}"
+                )
+
+    workload = view.workload_comparison
+    if workload.get("configured"):
+        baseline_fit = workload.get("baseline")
+        contender_fit = workload.get("contender")
+        console.print("")
+        console.print("WORKLOAD FIT")
+        if isinstance(baseline_fit, dict) and isinstance(contender_fit, dict):
+            console.print(
+                f"  {baseline_fit.get('overall_status')} -> {contender_fit.get('overall_status')}"
+            )
+        for label, key in (("Improved", "improvements"), ("Regressed", "regressions")):
+            items = workload.get(key)
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        console.print(f"  {label}: {item.get('key')}")
+
+    if view.pareto:
+        console.print("")
+        console.print(f"EVIDENCE PARETO: {view.pareto.get('relation')}")
+        metrics = view.pareto.get("metrics")
+        if isinstance(metrics, list):
+            for item in metrics:
+                if not isinstance(item, dict) or item.get("relation") == "UNKNOWN":
+                    continue
+                console.print(
+                    f"  {item.get('key')}: {item.get('champion_value')} -> "
+                    f"{item.get('candidate_value')} · {item.get('relation')}"
+                )
+        utility = view.pareto.get("explicit_user_utility")
+        if isinstance(utility, dict):
+            console.print(
+                f"USER UTILITY: {utility.get('status')} · {utility.get('relation')} · "
+                f"delta={utility.get('utility_delta')}"
+            )
 
 
 def _print_workload(view: WorkloadView) -> None:
@@ -2066,6 +2143,25 @@ def workload_show(
         _emit_json(_workload_payload(view))
         return
     _print_workload(view)
+
+
+@workload_app.command("compare-models")
+def workload_compare_models(
+    baseline: Annotated[str, typer.Argument(help="Registered baseline/stock model ID.")],
+    contender: Annotated[str, typer.Argument(help="Registered contender/descendant model ID.")],
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = compare_models(path, baseline, contender)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json({"ok": True, **view.to_dict()})
+        return
+    _print_model_comparison(view)
 
 
 @workload_app.command("fit")
