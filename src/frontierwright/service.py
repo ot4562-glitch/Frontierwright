@@ -96,9 +96,11 @@ from frontierwright.reference_backend import PRESETS, REFERENCE_BACKEND_ID
 from frontierwright.reference_tokenizer import (
     DEFAULT_MAX_TRAINING_BYTES,
     TokenizerArtifact,
+    load_reference_tokenizer,
     load_tokenizer_payload,
     read_training_bytes,
     tokenizer_fingerprint,
+    tokenizer_vocab_size,
     write_tokenizer_artifact,
 )
 from frontierwright.registry import ProjectState, Registry
@@ -148,6 +150,9 @@ class BirthView:
     seed: int | None = None
     backend_id: str | None = None
     parameter_count: int | None = None
+    tokenizer_artifact_id: str | None = None
+    tokenizer_fingerprint: str | None = None
+    vocab_size: int | None = None
     runtime: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
@@ -695,6 +700,22 @@ def get_birth_view(root: Path) -> BirthView:
             if isinstance(parameter_count, int) and not isinstance(parameter_count, bool)
             else None
         ),
+        tokenizer_artifact_id=(
+            str(birth["tokenizer_artifact_id"])
+            if birth.get("tokenizer_artifact_id") is not None
+            else None
+        ),
+        tokenizer_fingerprint=(
+            str(birth["tokenizer_fingerprint"])
+            if birth.get("tokenizer_fingerprint") is not None
+            else None
+        ),
+        vocab_size=(
+            int(runtime_map["vocab_size"])
+            if isinstance(runtime_map.get("vocab_size"), int)
+            and not isinstance(runtime_map.get("vocab_size"), bool)
+            else None
+        ),
         runtime=dict(runtime_map),
     )
 
@@ -894,6 +915,7 @@ def birth_zero_model(
     preset: str,
     seed: int,
     python_executable: str,
+    tokenizer_artifact_id: str | None = None,
     timeout_seconds: float = 300.0,
 ) -> BirthView:
     registry = Registry(root)
@@ -935,12 +957,46 @@ def birth_zero_model(
             "Model birth is only valid for ZERO-origin projects.",
             13,
         )
+
+    selected_tokenizer: TokenizerView | None = None
+    if tokenizer_artifact_id is not None:
+        if not tokenizer_artifact_id.strip():
+            raise FrontierwrightError(
+                "BIRTH_TOKENIZER_INVALID",
+                "Tokenizer artifact ID must be nonempty when supplied.",
+                2,
+            )
+        tokenizer_record = registry.get_tokenizer_artifact(tokenizer_artifact_id)
+        if tokenizer_record is None:
+            raise FrontierwrightError(
+                "BIRTH_TOKENIZER_NOT_FOUND",
+                "Selected tokenizer artifact is not registered in this project.",
+                12,
+            )
+        selected_tokenizer = _tokenizer_view_from_record(
+            tokenizer_record,
+            replayed=True,
+        )
+
+    selected_tokenizer_fingerprint = (
+        selected_tokenizer.fingerprint if selected_tokenizer is not None else None
+    )
+    selected_tokenizer_path = (
+        selected_tokenizer.path if selected_tokenizer is not None else None
+    )
+    selected_vocab_size = (
+        selected_tokenizer.vocab_size if selected_tokenizer is not None else None
+    )
+
     if state.champion is not None:
         existing = registry.get_model_birth(state.champion.model.model_id)
         if (
             existing is not None
             and existing.get("preset") == preset
             and existing.get("seed") == seed
+            and existing.get("tokenizer_artifact_id") == tokenizer_artifact_id
+            and existing.get("tokenizer_fingerprint")
+            == selected_tokenizer_fingerprint
         ):
             return get_birth_view(root)
         raise FrontierwrightError(
@@ -963,6 +1019,9 @@ def birth_zero_model(
         "seed": seed,
         "output_root": str(staging_root.resolve()),
     }
+    if selected_tokenizer_path is not None:
+        request["tokenizer_path"] = selected_tokenizer_path
+        request["tokenizer_fingerprint"] = selected_tokenizer_fingerprint
     _write_state_json(request_path, request)
 
     try:
@@ -1003,6 +1062,19 @@ def birth_zero_model(
                 "Birth backend result does not match the requested preset/seed.",
                 14,
             )
+        if selected_tokenizer is not None:
+            if metrics.get("tokenizer_fingerprint") != selected_tokenizer_fingerprint:
+                raise FrontierwrightError(
+                    "BIRTH_TOKENIZER_MISMATCH",
+                    "Birth backend did not bind the selected tokenizer fingerprint.",
+                    14,
+                )
+            if metrics.get("vocab_size") != selected_vocab_size:
+                raise FrontierwrightError(
+                    "BIRTH_TOKENIZER_MISMATCH",
+                    "Birth backend vocab size does not match the selected tokenizer.",
+                    14,
+                )
 
         backend_model_path = Path(output_raw).expanduser().resolve()
         try:
@@ -1047,6 +1119,24 @@ def birth_zero_model(
                     14,
                 )
 
+        published_tokenizer_path = final_descriptor.source_path / "tokenizer.json"
+        published_tokenizer = load_reference_tokenizer(published_tokenizer_path)
+        published_tokenizer_fingerprint = tokenizer_fingerprint(published_tokenizer)
+        published_vocab_size = tokenizer_vocab_size(published_tokenizer)
+        if selected_tokenizer is not None:
+            if published_tokenizer_fingerprint != selected_tokenizer_fingerprint:
+                raise FrontierwrightError(
+                    "BIRTH_TOKENIZER_MISMATCH",
+                    "Published root tokenizer differs from the selected artifact.",
+                    14,
+                )
+            if published_vocab_size != selected_vocab_size:
+                raise FrontierwrightError(
+                    "BIRTH_TOKENIZER_MISMATCH",
+                    "Published root tokenizer vocab size differs from the selected artifact.",
+                    14,
+                )
+
         model = ModelState(
             model_id=model_id,
             identity_id=str(state.project["identity_id"]),
@@ -1065,6 +1155,8 @@ def birth_zero_model(
             seed=seed,
             backend_id=REFERENCE_BACKEND_ID,
             runtime=dict(metrics),
+            tokenizer_artifact_id=tokenizer_artifact_id,
+            tokenizer_fingerprint=selected_tokenizer_fingerprint,
         )
     except Exception:
         if staging_root.exists():

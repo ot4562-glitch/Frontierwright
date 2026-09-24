@@ -399,3 +399,80 @@ def decode_token_ids(token_ids: list[int], payload: dict[str, Any]) -> bytes:
             )
         output.extend(expansions[token_id])
     return bytes(output)
+
+LEGACY_BYTE_TOKENIZER_TYPE = "frontierwright-byte-level"
+
+
+def load_reference_tokenizer(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise FrontierwrightError(
+            "TOKENIZER_ARTIFACT_INVALID",
+            f"Tokenizer artifact is unreadable: {path}",
+            13,
+        ) from exc
+    if not isinstance(raw, dict):
+        raise FrontierwrightError(
+            "TOKENIZER_ARTIFACT_INVALID",
+            "Tokenizer artifact must contain an object.",
+            13,
+        )
+    tokenizer_type = raw.get("type")
+    if tokenizer_type == TOKENIZER_TYPE:
+        return load_tokenizer_payload(path)
+    if tokenizer_type == LEGACY_BYTE_TOKENIZER_TYPE:
+        vocab_size = raw.get("vocab_size")
+        if isinstance(vocab_size, bool) or vocab_size != BASE_VOCAB_SIZE:
+            raise FrontierwrightError(
+                "TOKENIZER_ARTIFACT_INVALID",
+                "Legacy byte tokenizer must declare vocab_size=256.",
+                13,
+            )
+        return raw
+    raise FrontierwrightError(
+        "TOKENIZER_ARTIFACT_INVALID",
+        f"Unsupported tokenizer type: {tokenizer_type!r}",
+        13,
+    )
+
+
+def tokenizer_vocab_size(payload: dict[str, Any]) -> int:
+    raw = payload.get("vocab_size")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < BASE_VOCAB_SIZE:
+        raise FrontierwrightError(
+            "TOKENIZER_ARTIFACT_INVALID",
+            "Tokenizer vocab_size must be an integer >= 256.",
+            13,
+        )
+    return raw
+
+
+def encode_with_tokenizer(data: bytes, payload: dict[str, Any]) -> list[int]:
+    if payload.get("type") == LEGACY_BYTE_TOKENIZER_TYPE:
+        return list(data)
+    if payload.get("type") == TOKENIZER_TYPE:
+        return encode_bytes(data, payload)
+    raise FrontierwrightError(
+        "TOKENIZER_ARTIFACT_INVALID",
+        "Unsupported tokenizer type for encoding.",
+        13,
+    )
+
+
+def decode_with_tokenizer(token_ids: list[int], payload: dict[str, Any]) -> bytes:
+    if payload.get("type") == LEGACY_BYTE_TOKENIZER_TYPE:
+        if any(token_id < 0 or token_id >= BASE_VOCAB_SIZE for token_id in token_ids):
+            raise FrontierwrightError(
+                "TOKENIZER_TOKEN_INVALID",
+                "Legacy byte tokenizer received a token outside 0..255.",
+                13,
+            )
+        return bytes(token_ids)
+    if payload.get("type") == TOKENIZER_TYPE:
+        return decode_token_ids(token_ids, payload)
+    raise FrontierwrightError(
+        "TOKENIZER_ARTIFACT_INVALID",
+        "Unsupported tokenizer type for decoding.",
+        13,
+    )

@@ -70,6 +70,15 @@ def merge_reference_models(
     ):
         raise ValueError("merge inputs must use the same supported reference preset")
     preset = presets[primary_preset]
+    primary_vocab_size = primary_config.get("vocab_size")
+    secondary_vocab_size = secondary_config.get("vocab_size")
+    if (
+        isinstance(primary_vocab_size, bool)
+        or not isinstance(primary_vocab_size, int)
+        or primary_vocab_size <= 0
+        or secondary_vocab_size != primary_vocab_size
+    ):
+        raise ValueError("merge inputs must use the same valid vocab_size")
 
     try:
         primary_tokenizer = (primary / "tokenizer.json").read_bytes()
@@ -115,7 +124,7 @@ def merge_reference_models(
                 )
             merged_state[key] = left.detach().clone().to(device="cpu")
 
-    model = build_model(torch, preset).to("cpu")
+    model = build_model(torch, preset, primary_vocab_size).to("cpu")
     model.load_state_dict(merged_state, strict=True)
     total_parameters = int(parameter_count(model))
 

@@ -4,10 +4,17 @@ from pathlib import Path
 import pytest
 
 import frontierwright.service as service_module
+from frontierwright.data import DatasetRole
 from frontierwright.domain import ModelOrigin
 from frontierwright.errors import FrontierwrightError
 from frontierwright.registry import Registry
-from frontierwright.service import birth_zero_model, get_birth_view, get_status
+from frontierwright.service import (
+    add_local_dataset,
+    birth_zero_model,
+    get_birth_view,
+    get_status,
+    train_project_tokenizer,
+)
 
 
 def fake_birth_backend(
@@ -21,20 +28,31 @@ def fake_birth_backend(
     request = json.loads(request_path.read_text(encoding="utf-8"))
     output = Path(str(request["output_root"])) / "model"
     output.mkdir(parents=True, exist_ok=False)
+    tokenizer_path = request.get("tokenizer_path")
+    if isinstance(tokenizer_path, str):
+        tokenizer_payload = json.loads(Path(tokenizer_path).read_text(encoding="utf-8"))
+        tokenizer_text = json.dumps(tokenizer_payload, sort_keys=True, indent=2) + "\n"
+        vocab_size = int(tokenizer_payload["vocab_size"])
+    else:
+        tokenizer_payload = {
+            "type": "frontierwright-byte-level",
+            "vocab_size": 256,
+        }
+        tokenizer_text = json.dumps(tokenizer_payload, sort_keys=True)
+        vocab_size = 256
+
     (output / "config.json").write_text(
         json.dumps(
             {
                 "model_type": "frontierwright_byte_causal_lm",
                 "preset": request["preset"],
                 "parameter_count": 8_000_000,
+                "vocab_size": vocab_size,
             }
         ),
         encoding="utf-8",
     )
-    (output / "tokenizer.json").write_text(
-        '{"type":"frontierwright-byte-level","vocab_size":256}',
-        encoding="utf-8",
-    )
+    (output / "tokenizer.json").write_text(tokenizer_text, encoding="utf-8")
     weights = f"root:{request['preset']}:{request['seed']}".encode()
     (output / "model.safetensors").write_bytes(weights)
     return {
@@ -47,6 +65,8 @@ def fake_birth_backend(
             "preset": request["preset"],
             "seed": request["seed"],
             "parameter_count": 8_000_000,
+            "vocab_size": vocab_size,
+            "tokenizer_fingerprint": request.get("tokenizer_fingerprint"),
             "python_version": "fixture",
             "torch_version": "fixture",
             "device": "cpu",
@@ -176,3 +196,77 @@ def test_birth_is_zero_origin_only(
         )
 
     assert get_birth_view(project).born is False
+
+
+def test_zero_birth_binds_managed_tokenizer_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    registry = Registry(project)
+    registry.initialize("NOVA", ModelOrigin.ZERO)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "train.txt").write_text(
+        "banana bandana frontierwright academy\n" * 60,
+        encoding="utf-8",
+    )
+    data_view = add_local_dataset(
+        project,
+        corpus,
+        name="Birth corpus",
+        role=DatasetRole.PRETRAIN,
+    )
+    dataset_id = str(data_view.datasets[0]["dataset_id"])
+    tokenizer = train_project_tokenizer(
+        project,
+        dataset_id=dataset_id,
+        vocab_size=280,
+        max_training_bytes=4096,
+    )
+    assert tokenizer.artifact_id is not None
+    assert tokenizer.fingerprint is not None
+    assert tokenizer.path is not None
+    assert tokenizer.vocab_size is not None and tokenizer.vocab_size > 256
+
+    calls = 0
+
+    def counted_backend(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return fake_birth_backend(*args, **kwargs)
+
+    monkeypatch.setattr(service_module, "run_structured_command", counted_backend)
+
+    first = birth_zero_model(
+        project,
+        preset="zero-8m",
+        seed=42,
+        python_executable="fixture-python",
+        tokenizer_artifact_id=tokenizer.artifact_id,
+    )
+    second = birth_zero_model(
+        project,
+        preset="zero-8m",
+        seed=42,
+        python_executable="fixture-python",
+        tokenizer_artifact_id=tokenizer.artifact_id,
+    )
+
+    assert first == second
+    assert calls == 1
+    assert first.tokenizer_artifact_id == tokenizer.artifact_id
+    assert first.tokenizer_fingerprint == tokenizer.fingerprint
+    assert first.vocab_size == tokenizer.vocab_size
+    assert first.checkpoint is not None
+
+    birth_record = registry.get_model_birth(str(first.model_id))
+    assert birth_record is not None
+    assert birth_record["tokenizer_artifact_id"] == tokenizer.artifact_id
+    assert birth_record["tokenizer_fingerprint"] == tokenizer.fingerprint
+
+    model_tokenizer = json.loads(
+        (Path(first.checkpoint) / "tokenizer.json").read_text(encoding="utf-8")
+    )
+    managed_tokenizer = json.loads(Path(tokenizer.path).read_text(encoding="utf-8"))
+    assert model_tokenizer == managed_tokenizer

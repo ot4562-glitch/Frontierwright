@@ -176,3 +176,9 @@ def test_birth_tokenizer_cli_json_surface(tmp_path: Path) -> None:
     assert list_payload["ok"] is True
     assert len(list_payload["tokenizers"]) == 1
     assert list_payload["tokenizers"][0]["artifact_id"] == payload["artifact_id"]
+
+
+def test_birth_zero_cli_exposes_tokenizer_artifact_option() -> None:
+    result = runner.invoke(app, ["birth", "zero", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "--tokenizer-artifact" in result.output

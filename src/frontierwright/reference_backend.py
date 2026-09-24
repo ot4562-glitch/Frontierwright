@@ -26,6 +26,13 @@ from frontierwright.reference_quantization import (
     load_quantized_reference_state,
     quantize_reference_model,
 )
+from frontierwright.reference_tokenizer import (
+    decode_with_tokenizer,
+    encode_with_tokenizer,
+    load_reference_tokenizer,
+    tokenizer_fingerprint,
+    tokenizer_vocab_size,
+)
 
 REFERENCE_BACKEND_ID = "frontierwright-reference-pytorch-v1"
 SUPPORTED_PATHS = (
@@ -630,14 +637,17 @@ def _read_preference_pairs(
 def _validate_preference_pairs(
     pairs: tuple[PreferencePair, ...],
     preset: ModelPreset,
+    tokenizer_payload: dict[str, Any],
 ) -> None:
     maximum = preset.context_length + 1
     for index, pair in enumerate(pairs):
+        prompt_ids = encode_with_tokenizer(pair.prompt, tokenizer_payload)
         for label, response in (
             ("chosen", pair.chosen),
             ("rejected", pair.rejected),
         ):
-            combined = len(pair.prompt) + len(response)
+            response_ids = encode_with_tokenizer(response, tokenizer_payload)
+            combined = len(prompt_ids) + len(response_ids)
             if combined < 2:
                 raise ValueError(
                     f"DPO pair {index} {label} sequence is too short to score"
@@ -645,9 +655,8 @@ def _validate_preference_pairs(
             if combined > maximum:
                 raise ValueError(
                     f"DPO pair {index} {label} exceeds context capacity "
-                    f"({combined} bytes > {maximum})"
+                    f"({combined} tokens > {maximum})"
                 )
-
 
 def _response_logprob(
     torch: Any,
@@ -655,14 +664,19 @@ def _response_logprob(
     *,
     prompt: bytes,
     response: bytes,
+    tokenizer_payload: dict[str, Any],
     device: str,
 ) -> Any:
-    combined = prompt + response
-    tokens = torch.tensor(list(combined), dtype=torch.long, device=device)
+    prompt_ids = encode_with_tokenizer(prompt, tokenizer_payload)
+    response_ids = encode_with_tokenizer(response, tokenizer_payload)
+    combined_ids = prompt_ids + response_ids
+    if len(combined_ids) < 2 or not response_ids:
+        raise ValueError("DPO response tokenization produced an unscorable sequence")
+    tokens = torch.tensor(combined_ids, dtype=torch.long, device=device)
     inputs = tokens[:-1].unsqueeze(0)
     targets = tokens[1:]
     logits = model(inputs)[0]
-    response_start = max(len(prompt) - 1, 0)
+    response_start = max(len(prompt_ids) - 1, 0)
     response_logits = logits[response_start:]
     response_targets = targets[response_start:]
     token_logprobs = torch.nn.functional.log_softmax(
@@ -675,14 +689,13 @@ def _response_logprob(
     ).squeeze(1)
     return selected.sum()
 
-
 def _dpo_training_objects(
     torch: Any,
     config: ReferenceConfig,
     pairs: tuple[PreferencePair, ...],
     *,
     model_source_path: str,
-) -> tuple[Any, Any, Any, Any, str, dict[str, object]]:
+) -> tuple[Any, Any, Any, Any, dict[str, Any], str, dict[str, object]]:
     torch.manual_seed(config.seed)
     device = _select_device(torch, config.device)
     if device == "cuda":
@@ -700,7 +713,8 @@ def _dpo_training_objects(
         model_source_path=model_source_path,
         device=device,
     )
-    _validate_preference_pairs(pairs, config.preset)
+    tokenizer_payload, vocab_size = _reference_tokenizer_for_model(model_source_path)
+    _validate_preference_pairs(pairs, config.preset, tokenizer_payload)
 
     for parameter in reference.parameters():
         parameter.requires_grad = False
@@ -727,12 +741,15 @@ def _dpo_training_objects(
         "pair_count": len(pairs),
         "base_parameter_count": base_parameter_count,
         "trainable_parameter_count": _trainable_parameter_count(policy),
+        "vocab_size": vocab_size,
+        "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer_payload),
     }
     return (
         policy,
         reference,
         optimizer,
         generator,
+        tokenizer_payload,
         device,
         training_details,
     )
@@ -745,6 +762,7 @@ def _dpo_train_step(
     optimizer: Any,
     pairs: tuple[PreferencePair, ...],
     generator: Any,
+    tokenizer_payload: dict[str, Any],
     *,
     config: ReferenceConfig,
     device: str,
@@ -767,6 +785,7 @@ def _dpo_train_step(
             policy,
             prompt=pair.prompt,
             response=pair.chosen,
+            tokenizer_payload=tokenizer_payload,
             device=device,
         )
         policy_rejected = _response_logprob(
@@ -774,6 +793,7 @@ def _dpo_train_step(
             policy,
             prompt=pair.prompt,
             response=pair.rejected,
+            tokenizer_payload=tokenizer_payload,
             device=device,
         )
         with torch.no_grad():
@@ -782,6 +802,7 @@ def _dpo_train_step(
                 reference,
                 prompt=pair.prompt,
                 response=pair.chosen,
+                tokenizer_payload=tokenizer_payload,
                 device=device,
             )
             reference_rejected = _response_logprob(
@@ -789,6 +810,7 @@ def _dpo_train_step(
                 reference,
                 prompt=pair.prompt,
                 response=pair.rejected,
+                tokenizer_payload=tokenizer_payload,
                 device=device,
             )
 
@@ -798,9 +820,12 @@ def _dpo_train_step(
             policy_logratio - reference_logratio
         )
         losses.append(-torch.nn.functional.logsigmoid(preference_logit))
-        processed_tokens += 2 * (
-            len(pair.prompt + pair.chosen) - 1
-            + len(pair.prompt + pair.rejected) - 1
+        prompt_ids = encode_with_tokenizer(pair.prompt, tokenizer_payload)
+        chosen_ids = encode_with_tokenizer(pair.chosen, tokenizer_payload)
+        rejected_ids = encode_with_tokenizer(pair.rejected, tokenizer_payload)
+        processed_tokens += (
+            len(prompt_ids) + len(chosen_ids) - 1
+            + len(prompt_ids) + len(rejected_ids) - 1
         )
 
     loss = torch.stack(losses).mean()
@@ -831,11 +856,19 @@ def _distillation_training_objects(
         model_source_path=model_source_path,
         device=device,
     )
+    tokenizer_payload, vocab_size = _reference_tokenizer_for_model(model_source_path)
+    token_ids = encode_with_tokenizer(corpus_bytes, tokenizer_payload)
+    if not token_ids:
+        raise ValueError("distillation tokenizer produced an empty corpus")
     for parameter in teacher.parameters():
         parameter.requires_grad = False
     teacher.eval()
 
-    student = _build_model(torch, student_preset).to(device)
+    student = _build_model(
+        torch,
+        student_preset,
+        vocab_size=vocab_size,
+    ).to(device)
     teacher_parameter_count = _parameter_count(teacher)
     student_parameter_count = _parameter_count(student)
     if student_parameter_count >= teacher_parameter_count:
@@ -848,7 +881,7 @@ def _distillation_training_objects(
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    corpus = torch.tensor(list(corpus_bytes), dtype=torch.long)
+    corpus = torch.tensor(token_ids, dtype=torch.long)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(config.seed)
     details: dict[str, object] = {
@@ -862,6 +895,8 @@ def _distillation_training_objects(
         "teacher_parameter_count": teacher_parameter_count,
         "base_parameter_count": student_parameter_count,
         "trainable_parameter_count": _trainable_parameter_count(student),
+        "vocab_size": vocab_size,
+        "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer_payload),
     }
     return (
         student,
@@ -910,11 +945,11 @@ def _kd_step(
 
     temperature = config.distill_temperature
     student_log_probs = torch.nn.functional.log_softmax(
-        student_logits.reshape(-1, VOCAB_SIZE) / temperature,
+        student_logits.reshape(-1, int(student_logits.shape[-1])) / temperature,
         dim=-1,
     )
     teacher_probs = torch.nn.functional.softmax(
-        teacher_logits.reshape(-1, VOCAB_SIZE) / temperature,
+        teacher_logits.reshape(-1, int(teacher_logits.shape[-1])) / temperature,
         dim=-1,
     )
     soft_loss = torch.nn.functional.kl_div(
@@ -923,7 +958,7 @@ def _kd_step(
         reduction="batchmean",
     ) * (temperature * temperature)
     hard_loss = torch.nn.functional.cross_entropy(
-        student_logits.reshape(-1, VOCAB_SIZE),
+        student_logits.reshape(-1, int(student_logits.shape[-1])),
         y.reshape(-1),
     )
     loss = (
@@ -953,7 +988,11 @@ def _objective_for_path(path_id: object) -> str:
     raise ValueError(f"unsupported reference training path: {path_id!r}")
 
 
-def _build_model(torch: Any, preset: ModelPreset) -> Any:
+def _build_model(
+    torch: Any,
+    preset: ModelPreset,
+    vocab_size: int = VOCAB_SIZE,
+) -> Any:
     nn = torch.nn
 
     class Block(nn.Module):  # type: ignore[misc, name-defined]
@@ -988,14 +1027,14 @@ def _build_model(torch: Any, preset: ModelPreset) -> Any:
     class ByteCausalLM(nn.Module):  # type: ignore[misc, name-defined]
         def __init__(self) -> None:
             super().__init__()
-            self.token_embedding = nn.Embedding(VOCAB_SIZE, preset.d_model)
+            self.token_embedding = nn.Embedding(vocab_size, preset.d_model)
             self.position_embedding = nn.Embedding(
                 preset.context_length,
                 preset.d_model,
             )
             self.blocks = nn.ModuleList([Block() for _ in range(preset.n_layers)])
             self.final_norm = nn.LayerNorm(preset.d_model)
-            self.lm_head = nn.Linear(preset.d_model, VOCAB_SIZE, bias=False)
+            self.lm_head = nn.Linear(preset.d_model, vocab_size, bias=False)
             self.lm_head.weight = self.token_embedding.weight
 
             for module in self.modules():
@@ -1436,6 +1475,47 @@ def _process_rss_bytes() -> int | None:
         return None
 
 
+def _reference_tokenizer_for_model(model_source_path: str) -> tuple[dict[str, Any], int]:
+    source = _native_path(model_source_path).expanduser().resolve()
+    tokenizer_path = source / "tokenizer.json"
+    config_path = source / "config.json"
+    if not tokenizer_path.is_file() or not config_path.is_file():
+        raise ValueError("reference model must contain config.json and tokenizer.json")
+
+    tokenizer_payload = load_reference_tokenizer(tokenizer_path)
+    vocab_size = tokenizer_vocab_size(tokenizer_payload)
+    try:
+        config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("reference model config.json is unreadable") from exc
+    if not isinstance(config_payload, dict):
+        raise ValueError("reference model config.json must contain an object")
+    config_vocab_size = config_payload.get("vocab_size")
+    if (
+        isinstance(config_vocab_size, bool)
+        or not isinstance(config_vocab_size, int)
+        or config_vocab_size != vocab_size
+    ):
+        raise ValueError(
+            "reference model config/tokenizer vocab_size mismatch"
+        )
+    return tokenizer_payload, vocab_size
+
+
+def _encode_reference_corpus(
+    corpus_bytes: bytes,
+    *,
+    model_source_path: str | None,
+) -> tuple[list[int], dict[str, Any] | None, int]:
+    if model_source_path is None:
+        return list(corpus_bytes), None, VOCAB_SIZE
+    tokenizer_payload, vocab_size = _reference_tokenizer_for_model(model_source_path)
+    token_ids = encode_with_tokenizer(corpus_bytes, tokenizer_payload)
+    if not token_ids:
+        raise ValueError("tokenizer produced an empty corpus")
+    return token_ids, tokenizer_payload, vocab_size
+
+
 def _load_reference_model(
     torch: Any,
     preset: ModelPreset,
@@ -1464,7 +1544,8 @@ def _load_reference_model(
             f"for preset {preset.name}"
         )
 
-    model = _build_model(torch, preset)
+    _, vocab_size = _reference_tokenizer_for_model(model_source_path)
+    model = _build_model(torch, preset, vocab_size=vocab_size)
     if weights_path.is_file():
         state_dict = torch.load(
             weights_path,
@@ -1495,8 +1576,12 @@ def _training_objects(
     if device == "cuda":
         torch.cuda.manual_seed_all(config.seed)
 
+    token_ids, tokenizer_payload, vocab_size = _encode_reference_corpus(
+        corpus_bytes,
+        model_source_path=model_source_path,
+    )
     if model_source_path is None:
-        model = _build_model(torch, config.preset).to(device)
+        model = _build_model(torch, config.preset, vocab_size=vocab_size).to(device)
     else:
         model = _load_reference_model(
             torch,
@@ -1510,6 +1595,12 @@ def _training_objects(
         "method": "full_parameter",
         "base_parameter_count": base_parameter_count,
         "trainable_parameter_count": base_parameter_count,
+        "vocab_size": vocab_size,
+        "tokenizer_fingerprint": (
+            tokenizer_fingerprint(tokenizer_payload)
+            if tokenizer_payload is not None
+            else None
+        ),
     }
     if path_id == "LORA_SFT":
         training_details = {
@@ -1561,7 +1652,7 @@ def _train_step(
     optimizer.zero_grad(set_to_none=True)
     logits = model(x)
     loss = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, VOCAB_SIZE),
+        logits.reshape(-1, int(logits.shape[-1])),
         y.reshape(-1),
     )
     loss.backward()
@@ -1572,17 +1663,17 @@ def _train_step(
 
 def _evaluation_batches(
     torch: Any,
-    corpus_bytes: bytes,
+    token_ids: list[int],
     *,
     config: ReferenceEvaluationConfig,
     device: str,
 ) -> list[tuple[Any, Any]]:
-    corpus = torch.tensor(list(corpus_bytes), dtype=torch.long)
+    corpus = torch.tensor(token_ids, dtype=torch.long)
     required = config.preset.context_length + 1
     if int(corpus.numel()) < required:
         raise ValueError(
             "evaluation corpus is too small for one full context window; "
-            f"need at least {required} bytes"
+            f"need at least {required} tokens"
         )
 
     starts = list(
@@ -1640,9 +1731,11 @@ def _evaluate(
         _native_path(dataset_source),
         max_bytes=config.max_dataset_bytes,
     )
+    tokenizer_payload, _ = _reference_tokenizer_for_model(model_source_path)
+    token_ids = encode_with_tokenizer(corpus_bytes, tokenizer_payload)
     batches = _evaluation_batches(
         torch,
-        corpus_bytes,
+        token_ids,
         config=config,
         device=device,
     )
@@ -1655,7 +1748,7 @@ def _evaluate(
         for x, y in batches:
             logits = model(x)
             loss_sum = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, VOCAB_SIZE),
+                logits.reshape(-1, int(logits.shape[-1])),
                 y.reshape(-1),
                 reduction="sum",
             )
@@ -1710,6 +1803,10 @@ def _generate(
     prompt_bytes = prompt.encode("utf-8")
     if not prompt_bytes:
         raise ValueError("prompt must encode to at least one byte")
+    tokenizer_payload, _ = _reference_tokenizer_for_model(model_source_path)
+    prompt_token_ids = encode_with_tokenizer(prompt_bytes, tokenizer_payload)
+    if not prompt_token_ids:
+        raise ValueError("prompt tokenizer produced no tokens")
 
     device = _select_device(torch, config.device)
     model = _load_reference_model(
@@ -1721,7 +1818,7 @@ def _generate(
     model.eval()
 
     generated_ids: list[int] = []
-    token_history = list(prompt_bytes)
+    token_history = list(prompt_token_ids)
     generator = None
     if config.temperature > 0.0:
         generator = torch.Generator(device=device)
@@ -1753,7 +1850,7 @@ def _generate(
     if device == "cuda":
         torch.cuda.synchronize()
     elapsed = max(time.perf_counter() - start, 1e-9)
-    continuation_bytes = bytes(generated_ids)
+    continuation_bytes = decode_with_tokenizer(generated_ids, tokenizer_payload)
     continuation_text = continuation_bytes.decode("utf-8", errors="replace")
 
     return {
@@ -1772,8 +1869,9 @@ def _generate(
             "temperature": config.temperature,
             "seed": config.seed,
             "prompt_bytes": len(prompt_bytes),
-            "context_bytes_used": min(
-                len(prompt_bytes),
+            "prompt_tokens": len(prompt_token_ids),
+            "context_tokens_used": min(
+                len(prompt_token_ids),
                 config.preset.context_length,
             ),
             "generated_tokens": len(generated_ids),
@@ -1814,9 +1912,11 @@ def _profile_inference(
     model.eval()
     profile_prompt = "Frontierwright inference profile:"
     prompt_bytes = profile_prompt.encode("utf-8")
+    tokenizer_payload, _ = _reference_tokenizer_for_model(model_source_path)
+    prompt_token_ids = encode_with_tokenizer(prompt_bytes, tokenizer_payload)
 
     def run_once() -> tuple[float, list[int]]:
-        token_history = list(prompt_bytes)
+        token_history = list(prompt_token_ids)
         generated_ids: list[int] = []
         if device == "cuda":
             torch.cuda.synchronize()
@@ -1858,7 +1958,9 @@ def _profile_inference(
 
     mean_latency = sum(latencies) / len(latencies)
     mean_throughput = sum(throughputs) / len(throughputs)
-    sample_text = bytes(sample_ids).decode("utf-8", errors="replace")
+    sample_text = decode_with_tokenizer(
+        sample_ids, tokenizer_payload
+    ).decode("utf-8", errors="replace")
     current_vram = (
         int(torch.cuda.memory_allocated()) if device == "cuda" else None
     )
@@ -1877,6 +1979,7 @@ def _profile_inference(
             "measurement_scope": "steady_state_generation_excludes_model_load",
             "profile_prompt": profile_prompt,
             "prompt_bytes": len(prompt_bytes),
+            "prompt_tokens": len(prompt_token_ids),
             "max_new_tokens": getattr(config, "max_" + "new_tokens"),
             "warmup_runs": config.warmup_runs,
             "measured_runs": config.measured_runs,
@@ -1907,6 +2010,8 @@ def _birth(request: dict[str, Any]) -> dict[str, object]:
     preset_name = request.get("preset", "zero-8m")
     seed = request.get("seed", 42)
     output_root = request.get("output_root")
+    tok_path_raw = request.get("tokenizer_path")
+    expected_tok_hash = request.get("tokenizer_fingerprint")
 
     if not isinstance(preset_name, str) or preset_name not in PRESETS:
         raise ValueError(f"unknown zero-model preset: {preset_name}")
@@ -1914,10 +2019,29 @@ def _birth(request: dict[str, Any]) -> dict[str, object]:
         raise ValueError("birth seed must be a nonnegative integer")
     if not isinstance(output_root, str) or not output_root:
         raise ValueError("output_root is required")
+    if expected_tok_hash is not None and (
+        not isinstance(expected_tok_hash, str) or not expected_tok_hash
+    ):
+        raise ValueError("tokenizer_fingerprint must be a nonempty string when supplied")
+
+    tok_payload: dict[str, Any] | None = None
+    tok_hash: str | None = None
+    vocab_size = VOCAB_SIZE
+    if tok_path_raw is not None:
+        if not isinstance(tok_path_raw, str) or not tok_path_raw:
+            raise ValueError("tokenizer_path must be a nonempty string when supplied")
+        tok_path = _native_path(tok_path_raw).expanduser().resolve()
+        tok_payload = load_reference_tokenizer(tok_path)
+        tok_hash = tokenizer_fingerprint(tok_payload)
+        if expected_tok_hash is not None and tok_hash != expected_tok_hash:
+            raise ValueError("tokenizer artifact fingerprint does not match birth request")
+        vocab_size = tokenizer_vocab_size(tok_payload)
+    elif expected_tok_hash is not None:
+        raise ValueError("tokenizer_fingerprint requires tokenizer_path")
 
     preset = PRESETS[preset_name]
     torch.manual_seed(seed)
-    model = _build_model(torch, preset).to("cpu")
+    model = _build_model(torch, preset, vocab_size=vocab_size).to("cpu")
     parameter_count = _parameter_count(model)
 
     output = _native_path(output_root).expanduser().resolve() / "model"
@@ -1928,7 +2052,7 @@ def _birth(request: dict[str, Any]) -> dict[str, object]:
         "model_type": "frontierwright_byte_causal_lm",
         "frontierwright_reference_backend": REFERENCE_BACKEND_ID,
         "preset": preset.name,
-        "vocab_size": VOCAB_SIZE,
+        "vocab_size": vocab_size,
         "d_model": preset.d_model,
         "n_layers": preset.n_layers,
         "n_heads": preset.n_heads,
@@ -1937,40 +2061,34 @@ def _birth(request: dict[str, Any]) -> dict[str, object]:
         "parameter_count": parameter_count,
     }
     (output / "config.json").write_text(
-        json.dumps(config_payload, sort_keys=True, indent=2) + "\n",
+        json.dumps(config_payload, sort_keys=True, indent=2) + chr(10),
         encoding="utf-8",
     )
+    tok_output = tok_payload or {
+        "type": "frontierwright-byte-level",
+        "version": 1,
+        "vocab_size": VOCAB_SIZE,
+        "mapping": "token id equals byte value 0..255",
+    }
     (output / "tokenizer.json").write_text(
-        json.dumps(
-            {
-                "type": "frontierwright-byte-level",
-                "version": 1,
-                "vocab_size": VOCAB_SIZE,
-                "mapping": "token id equals byte value 0..255",
-            },
-            sort_keys=True,
-            indent=2,
-        )
-        + "\n",
+        json.dumps(tok_output, sort_keys=True, indent=2) + chr(10),
         encoding="utf-8",
     )
     torch.save(model.state_dict(), output / "pytorch_model.bin")
+    birth_metadata = {
+        "backend_id": REFERENCE_BACKEND_ID,
+        "preset": preset.name,
+        "seed": seed,
+        "parameter_count": parameter_count,
+        "vocab_size": vocab_size,
+        "tokenizer_fingerprint": tok_hash,
+        "torch_version": str(torch.__version__),
+        "python_version": sys.version.split()[0],
+        "device": "cpu",
+        "trained_steps": 0,
+    }
     (output / "birth_metadata.json").write_text(
-        json.dumps(
-            {
-                "backend_id": REFERENCE_BACKEND_ID,
-                "preset": preset.name,
-                "seed": seed,
-                "parameter_count": parameter_count,
-                "torch_version": str(torch.__version__),
-                "python_version": sys.version.split()[0],
-                "device": "cpu",
-                "trained_steps": 0,
-            },
-            sort_keys=True,
-            indent=2,
-        )
-        + "\n",
+        json.dumps(birth_metadata, sort_keys=True, indent=2) + chr(10),
         encoding="utf-8",
     )
 
@@ -1979,19 +2097,8 @@ def _birth(request: dict[str, Any]) -> dict[str, object]:
         "ok": True,
         "operation": "birth",
         "output_model_path": _reported_child_path(output_root, "model"),
-        "metrics": {
-            "backend_id": REFERENCE_BACKEND_ID,
-            "preset": preset.name,
-            "seed": seed,
-            "parameter_count": parameter_count,
-            "torch_version": str(torch.__version__),
-            "python_version": sys.version.split()[0],
-            "device": "cpu",
-            "trained_steps": 0,
-        },
+        "metrics": birth_metadata,
     }
-
-
 def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, object]:
     torch = _import_torch()
     path_id = request.get("path_id")
@@ -2017,6 +2124,7 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
             reference_model,
             optimizer,
             generator,
+            dpo_tokenizer_payload,
             device,
             training_details,
         ) = _dpo_training_objects(
@@ -2032,6 +2140,7 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
             optimizer,
             preference_pairs,
             generator,
+            dpo_tokenizer_payload,
             config=config,
             device=device,
         )
@@ -2103,6 +2212,7 @@ def _calibrate(request: dict[str, Any], config: ReferenceConfig) -> dict[str, ob
                 optimizer,
                 preference_pairs,
                 generator,
+                dpo_tokenizer_payload,
                 config=config,
                 device=device,
             )
@@ -2199,6 +2309,7 @@ def _train(
             reference_model,
             optimizer,
             generator,
+            dpo_tokenizer_payload,
             device,
             training_details,
         ) = _dpo_training_objects(
@@ -2255,6 +2366,7 @@ def _train(
                 optimizer,
                 preference_pairs,
                 generator,
+                dpo_tokenizer_payload,
                 config=config,
                 device=device,
             )
@@ -2302,12 +2414,17 @@ def _train(
         if path_id == "DISTILL" and config.student_preset is not None
         else config.preset
     )
+    if not isinstance(model_source_path, str) or not model_source_path:
+        raise ValueError("trained reference output requires a source tokenizer")
+    output_tokenizer_payload, output_vocab_size = _reference_tokenizer_for_model(
+        model_source_path
+    )
     config_payload = {
         "architectures": ["FrontierwrightByteCausalLM"],
         "model_type": "frontierwright_byte_causal_lm",
         "frontierwright_reference_backend": REFERENCE_BACKEND_ID,
         "preset": output_preset.name,
-        "vocab_size": VOCAB_SIZE,
+        "vocab_size": output_vocab_size,
         "d_model": output_preset.d_model,
         "n_layers": output_preset.n_layers,
         "n_heads": output_preset.n_heads,
@@ -2321,12 +2438,7 @@ def _train(
     )
     (output / "tokenizer.json").write_text(
         json.dumps(
-            {
-                "type": "frontierwright-byte-level",
-                "version": 1,
-                "vocab_size": VOCAB_SIZE,
-                "mapping": "token id equals byte value 0..255",
-            },
+            output_tokenizer_payload,
             sort_keys=True,
             indent=2,
         )

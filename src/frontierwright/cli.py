@@ -764,6 +764,13 @@ def _print_birth(view: BirthView) -> None:
     console.print(f"Seed: {view.seed}")
     parameter_count = view.parameter_count if view.parameter_count is not None else "?"
     console.print(f"Parameters: {parameter_count}")
+    if view.vocab_size is not None:
+        console.print(f"Vocabulary: {view.vocab_size}")
+    if view.tokenizer_artifact_id is not None:
+        console.print(f"Tokenizer artifact: {view.tokenizer_artifact_id}")
+        console.print(f"Tokenizer fingerprint: {view.tokenizer_fingerprint}")
+    else:
+        console.print("Tokenizer: built-in byte vocabulary")
     console.print(f"Model: {view.model_id}")
     console.print(f"Fingerprint: {view.model_fingerprint}")
     console.print(f"Checkpoint: {view.checkpoint}")
@@ -1084,6 +1091,16 @@ def birth_zero(
         typer.Option("--preset", help="Built-in zero-model preset: zero-8m or zero-25m."),
     ] = "zero-8m",
     seed: Annotated[int, typer.Option("--seed", help="Initialization seed.")] = 42,
+    tokenizer_artifact_id: Annotated[
+        str | None,
+        typer.Option(
+            "--tokenizer-artifact",
+            help=(
+                "Managed tokenizer artifact ID to bind into the root model. "
+                "Omit to use the built-in 256-byte vocabulary."
+            ),
+        ),
+    ] = None,
     python_executable: Annotated[
         str,
         typer.Option(
@@ -1106,6 +1123,7 @@ def birth_zero(
             preset=preset,
             seed=seed,
             python_executable=python_executable,
+            tokenizer_artifact_id=tokenizer_artifact_id,
             timeout_seconds=timeout_seconds,
         )
     except FrontierwrightError as exc:

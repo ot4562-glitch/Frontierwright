@@ -59,7 +59,7 @@ from frontierwright.recipes import (
 from frontierwright.reference_tokenizer import TokenizerArtifact
 from frontierwright.resources import ResourceSnapshot
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -284,6 +284,8 @@ CREATE TABLE model_births (
     preset TEXT NOT NULL,
     seed INTEGER NOT NULL CHECK (seed >= 0),
     backend_id TEXT NOT NULL,
+    tokenizer_artifact_id TEXT REFERENCES tokenizer_artifacts(artifact_id),
+    tokenizer_fingerprint TEXT,
     runtime_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -1086,6 +1088,30 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 connection.commit()
                 version = 20
 
+            if version == 20:
+                birth_columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(model_births)")
+                }
+                connection.execute("BEGIN IMMEDIATE")
+                if "tokenizer_artifact_id" not in birth_columns:
+                    connection.execute(
+                        "ALTER TABLE model_births ADD COLUMN tokenizer_artifact_id TEXT "
+                        "REFERENCES tokenizer_artifacts(artifact_id)"
+                    )
+                if "tokenizer_fingerprint" not in birth_columns:
+                    connection.execute(
+                        "ALTER TABLE model_births ADD COLUMN tokenizer_fingerprint TEXT"
+                    )
+                connection.execute("PRAGMA user_version = 21")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 20, "to_version": 21},
+                )
+                connection.commit()
+                version = 21
+
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
                     "UNSUPPORTED_SCHEMA",
@@ -1442,6 +1468,8 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
         seed: int,
         backend_id: str,
         runtime: dict[str, object],
+        tokenizer_artifact_id: str | None = None,
+        tokenizer_fingerprint: str | None = None,
     ) -> None:
         with self.connect(write=True) as connection:
             project = connection.execute(
@@ -1468,6 +1496,30 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     13,
                 )
 
+            if (tokenizer_artifact_id is None) != (tokenizer_fingerprint is None):
+                raise FrontierwrightError(
+                    "BIRTH_TOKENIZER_INVALID",
+                    "Tokenizer artifact ID and fingerprint must be supplied together.",
+                    13,
+                )
+            if tokenizer_artifact_id is not None:
+                tokenizer = connection.execute(
+                    "SELECT fingerprint FROM tokenizer_artifacts WHERE artifact_id = ?",
+                    (tokenizer_artifact_id,),
+                ).fetchone()
+                if tokenizer is None:
+                    raise FrontierwrightError(
+                        "BIRTH_TOKENIZER_NOT_FOUND",
+                        "Tokenizer artifact is not registered in this project.",
+                        12,
+                    )
+                if str(tokenizer["fingerprint"]) != tokenizer_fingerprint:
+                    raise FrontierwrightError(
+                        "BIRTH_TOKENIZER_DRIFT",
+                        "Tokenizer artifact fingerprint does not match the registry.",
+                        13,
+                    )
+
             champion_id = project["champion_id"]
             if champion_id is not None:
                 if champion_id == model.model_id:
@@ -1483,13 +1535,21 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     13,
                 )
 
+            evidence_files = [
+                f"birth-backend:{backend_id}",
+                f"birth-preset:{preset}",
+                f"birth-seed:{seed}",
+            ]
+            if tokenizer_artifact_id is not None and tokenizer_fingerprint is not None:
+                evidence_files.extend(
+                    [
+                        f"birth-tokenizer:{tokenizer_artifact_id}",
+                        f"birth-tokenizer-fingerprint:{tokenizer_fingerprint}",
+                    ]
+                )
             evidence = HistoryEvidenceResult(
                 confidence=HistoryConfidence.COMPLETE,
-                evidence_files=(
-                    f"birth-backend:{backend_id}",
-                    f"birth-preset:{preset}",
-                    f"birth-seed:{seed}",
-                ),
+                evidence_files=tuple(evidence_files),
                 reason=(
                     "Root model bytes were materialized by Frontierwright birth and "
                     "fingerprinted before becoming the current model."
@@ -1499,13 +1559,16 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             self.insert_model_artifact(connection, model.model_id, descriptor, evidence)
             connection.execute(
                 "INSERT INTO model_births "
-                "(model_id, preset, seed, backend_id, runtime_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(model_id, preset, seed, backend_id, tokenizer_artifact_id, "
+                "tokenizer_fingerprint, runtime_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     model.model_id,
                     preset,
                     seed,
                     backend_id,
+                    tokenizer_artifact_id,
+                    tokenizer_fingerprint,
                     json.dumps(runtime, sort_keys=True, allow_nan=False),
                     timestamp(),
                 ),
@@ -1524,6 +1587,8 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     "preset": preset,
                     "seed": seed,
                     "backend_id": backend_id,
+                    "tokenizer_artifact_id": tokenizer_artifact_id,
+                    "tokenizer_fingerprint": tokenizer_fingerprint,
                     "trained_steps": 0,
                 },
             )
