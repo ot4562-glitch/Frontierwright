@@ -257,3 +257,11 @@ Before integrating any external project:
 5. keep raw external metrics;
 6. do not translate external scores into Frontierwright stats without a frozen mapping;
 7. re-run Frontierwright regression/evaluation after every transform/training operation.
+
+## Serving-benchmark precision addendum — 2026-09-25
+
+Current vLLM benchmark documentation explicitly warns that prefix-cache reuse can inflate
+throughput across repeated runs and distinguishes client-visible TTFT, request TPOT and ITL
+measurement points. Frontierwright therefore stores serving-condition identity and now
+composes client latency evidence with server VRAM/RSS receipts only when exact model
+fingerprint, runtime/version, execution boundary and condition hash match.

@@ -91,6 +91,7 @@ from frontierwright.service import (
     import_lighteval_evidence,
     import_lm_eval_evidence,
     import_local_model,
+    import_serving_resource_evidence,
     import_vllm_serving_evidence,
     ingest_stats,
     initialize_project,
@@ -1762,6 +1763,54 @@ def operate_import_vllm_benchmark(
     console.print(
         "VRAM/RSS: UNKNOWN from client benchmark; import or run separate resource "
         "measurement before making memory-fit claims."
+    )
+
+
+@operate_app.command("import-serving-resources")
+def operate_import_serving_resources(
+    manifest: Annotated[
+        Path,
+        typer.Argument(
+            help=(
+                "Framework-neutral server resource manifest pinned to an exact model "
+                "fingerprint and serving condition hash."
+            )
+        ),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="Frontierwright project directory."),
+    ] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = import_serving_resource_evidence(path, manifest_path=manifest, model_id=model)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    payload = {"ok": True, **view.to_dict()}
+    if json_output:
+        _emit_json(payload)
+        return
+    metrics = payload["metrics"]
+    assert isinstance(metrics, dict)
+    console.print("[bold]SERVING RESOURCE EVIDENCE IMPORTED[/bold]")
+    console.print(f"Runtime: {payload['runtime_id']} · {payload['runtime_version']}")
+    console.print(f"Condition hash: {payload['profile_condition_hash']}")
+    console.print(
+        f"Peak VRAM: {metrics.get('peak_vram_bytes')} · "
+        f"Process RSS: {metrics.get('max_sampled_process_rss_bytes')}"
+    )
+    console.print(
+        "Memory evidence is combined with latency/throughput evidence only when model, "
+        "runtime, execution boundary, and condition hash match exactly."
     )
 
 

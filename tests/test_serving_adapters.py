@@ -3,12 +3,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from frontierwright.cli import app
 from frontierwright.domain import ModelOrigin, ModelState
+from frontierwright.errors import FrontierwrightError
 from frontierwright.registry import Registry
-from frontierwright.service import compare_candidate, get_resource_view
+from frontierwright.service import (
+    compare_candidate,
+    get_resource_view,
+    import_serving_resource_evidence,
+)
 
 runner = CliRunner()
 
@@ -22,14 +28,14 @@ def setup_pair(root: Path) -> tuple[Registry, ModelState, ModelState]:
         identity_id=state.project["identity_id"],
         origin=ModelOrigin.IMPORTED_LOCAL,
         checkpoint="champion-checkpoint",
-        fingerprint="sha256:champion-vllm",
+        fingerprint="sha256:" + "a" * 64,
     )
     candidate = ModelState(
         model_id="candidate-vllm",
         identity_id=state.project["identity_id"],
         origin=ModelOrigin.IMPORTED_LOCAL,
         checkpoint="candidate-checkpoint",
-        fingerprint="sha256:candidate-vllm",
+        fingerprint="sha256:" + "b" * 64,
         parent_model_id=champion.model_id,
     )
     registry.register_candidate(champion)
@@ -182,3 +188,176 @@ def test_vllm_client_result_does_not_invent_model_memory_headroom(tmp_path: Path
     assert model_fit["peak_vram_bytes"] is None
     assert model_fit["max_sampled_process_rss_bytes"] is None
     assert get_resource_view(project).available is False
+
+
+def write_resource_manifest(
+    path: Path,
+    *,
+    model_fingerprint: str,
+    profile_condition_hash: str,
+    peak_vram_bytes: int,
+    process_rss_bytes: int,
+    runtime_version: str = "0.12.0@abcdef",
+) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "model_fingerprint": model_fingerprint,
+                "runtime_id": "vllm",
+                "runtime_version": runtime_version,
+                "profile_condition_hash": profile_condition_hash,
+                "measurement_scope": "server_process_resource_profile",
+                "execution_boundary": "LOCAL_MACHINE",
+                "metrics": {
+                    "peak_vram_bytes": peak_vram_bytes,
+                    "max_sampled_process_rss_bytes": process_rss_bytes,
+                    "cuda_memory_total_bytes": 12 * 1024**3,
+                    "cuda_memory_free_min_sampled_bytes": 2 * 1024**3,
+                    "cuda_memory_free_after_profile_bytes": 3 * 1024**3,
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def import_resource_manifest(project: Path, model_id: str, manifest: Path) -> dict[str, object]:
+    result = runner.invoke(
+        app,
+        [
+            "operate",
+            "import-serving-resources",
+            str(manifest),
+            "--path",
+            str(project),
+            "--model",
+            model_id,
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return json.loads(result.stdout)
+
+
+def test_serving_resource_receipts_compose_only_under_exact_runtime_conditions(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = setup_pair(project)
+    champion_result = write_vllm_result(
+        tmp_path / "champion.json",
+        source_model="org/stock-model",
+        e2e_ms=500.0,
+        ttft_ms=120.0,
+        tpot_ms=20.0,
+        itl_ms=21.0,
+        output_throughput=40.0,
+    )
+    candidate_result = write_vllm_result(
+        tmp_path / "candidate.json",
+        source_model="local/custom-descendant",
+        e2e_ms=430.0,
+        ttft_ms=90.0,
+        tpot_ms=18.0,
+        itl_ms=19.0,
+        output_throughput=35.0,
+    )
+    champion_client = import_result(project, champion.model_id, champion_result)
+    candidate_client = import_result(project, candidate.model_id, candidate_result)
+    condition_hash = str(champion_client["profile_condition_hash"])
+    assert candidate_client["profile_condition_hash"] == condition_hash
+
+    champion_resource = write_resource_manifest(
+        tmp_path / "champion-resource.json",
+        model_fingerprint=champion.fingerprint,
+        profile_condition_hash=condition_hash,
+        peak_vram_bytes=8 * 1024**3,
+        process_rss_bytes=10 * 1024**3,
+    )
+    candidate_resource = write_resource_manifest(
+        tmp_path / "candidate-resource.json",
+        model_fingerprint=candidate.fingerprint,
+        profile_condition_hash=condition_hash,
+        peak_vram_bytes=6 * 1024**3,
+        process_rss_bytes=8 * 1024**3,
+    )
+    champion_memory = import_resource_manifest(project, champion.model_id, champion_resource)
+    candidate_memory = import_resource_manifest(project, candidate.model_id, candidate_resource)
+    assert champion_memory["runtime_id"] == "vllm"
+    assert candidate_memory["profile_condition_hash"] == condition_hash
+
+    comparison = compare_candidate(project, candidate.model_id)
+    assert comparison.pareto["inference_profile_comparable"] is True
+    metrics = {item["key"]: item for item in comparison.pareto["metrics"]}
+    assert metrics["serving.latency_p50"]["relation"] == "BETTER"
+    assert metrics["serving.ttft_p50"]["relation"] == "BETTER"
+    assert metrics["resource.peak_vram"]["relation"] == "BETTER"
+    assert metrics["resource.process_rss"]["relation"] == "BETTER"
+
+    # The merged Champion profile records both independent evidence sources.
+    state = registry.read()
+    from frontierwright.service import _latest_model_fit_from_state
+
+    fit = _latest_model_fit_from_state(state, champion.model_id)
+    assert fit["latency_seconds_p50"] == 0.5
+    assert fit["peak_vram_bytes"] == 8 * 1024**3
+    sources = fit["evidence_sources"]
+    assert isinstance(sources, list)
+    assert len(sources) == 2
+
+
+def test_serving_resource_condition_mismatch_does_not_cross_fill_client_metrics(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    _, champion, candidate = setup_pair(project)
+    result = write_vllm_result(
+        tmp_path / "candidate.json",
+        source_model="local/custom-descendant",
+        e2e_ms=430.0,
+        ttft_ms=90.0,
+        tpot_ms=18.0,
+        itl_ms=19.0,
+        output_throughput=35.0,
+    )
+    client = import_result(project, candidate.model_id, result)
+    wrong_condition = "sha256:" + "c" * 64
+    assert client["profile_condition_hash"] != wrong_condition
+    manifest = write_resource_manifest(
+        tmp_path / "candidate-resource.json",
+        model_fingerprint=candidate.fingerprint,
+        profile_condition_hash=wrong_condition,
+        peak_vram_bytes=6 * 1024**3,
+        process_rss_bytes=8 * 1024**3,
+    )
+    import_resource_manifest(project, candidate.model_id, manifest)
+
+    from frontierwright.service import _latest_model_fit_from_state
+
+    fit = _latest_model_fit_from_state(Registry(project).read(), candidate.model_id)
+    assert fit["profile_condition_hash"] == wrong_condition
+    assert fit["peak_vram_bytes"] == 6 * 1024**3
+    assert fit["latency_seconds_p50"] is None
+    assert len(fit["evidence_sources"]) == 1
+
+
+def test_serving_resource_manifest_rejects_wrong_model_fingerprint(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _, champion, _ = setup_pair(project)
+    manifest = write_resource_manifest(
+        tmp_path / "wrong-model.json",
+        model_fingerprint="sha256:" + "f" * 64,
+        profile_condition_hash="sha256:" + "d" * 64,
+        peak_vram_bytes=1,
+        process_rss_bytes=1,
+    )
+    with pytest.raises(FrontierwrightError) as exc_info:
+        import_serving_resource_evidence(
+            project, manifest_path=manifest, model_id=champion.model_id
+        )
+    assert exc_info.value.code == "SERVING_RESOURCE_MODEL_MISMATCH"

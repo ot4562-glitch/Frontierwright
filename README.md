@@ -202,7 +202,9 @@ The rc2 development line is already moving beyond stock-model selection:
 - **Workload Profiles** pin task/language/context/latency/privacy requirements and hard
   capability floors as versioned evidence.
 - **Measured model fit** links real inference receipts to the exact model instead of
-  treating currently-free system memory as post-load headroom.
+  treating currently-free system memory as post-load headroom. Client latency/throughput
+  and server VRAM/RSS receipts may be composed only when exact model fingerprint, runtime,
+  execution boundary, and serving-condition hash match.
 - **Evidence-driven next experiments** turn FAIL/UNKNOWN workload constraints into
   falsifiable measurements or bounded interventions. Frontierwright never predicts that
   a listed experiment will improve the model; success is defined by comparable evidence.

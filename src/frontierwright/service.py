@@ -128,7 +128,12 @@ from frontierwright.reference_tokenizer import (
 from frontierwright.registry import ProjectState, Registry
 from frontierwright.resources import detect_local_resources
 from frontierwright.rl import RLExperimentSpec, rl_spec_from_config
-from frontierwright.serving_adapters import VLLMServingImport, import_vllm_bench_serve
+from frontierwright.serving_adapters import (
+    ServingResourceImport,
+    VLLMServingImport,
+    import_serving_resource_manifest,
+    import_vllm_bench_serve,
+)
 from frontierwright.workload_evaluations import (
     WORKLOAD_EVAL_BINDING_KIND,
     WorkloadEvaluationBinding,
@@ -4841,6 +4846,35 @@ def _resource_headroom_from_snapshot(snapshot: dict[str, object]) -> dict[str, o
     }
 
 
+def _inference_event_metrics(
+    event: dict[str, object], *, model_id: str
+) -> tuple[dict[str, object], dict[str, object]] | None:
+    if event.get("kind") != "INFERENCE_PROFILE_MEASURED":
+        return None
+    details = event.get("details")
+    if not isinstance(details, dict) or details.get("model_id") != model_id:
+        return None
+    metrics = details.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    return details, metrics
+
+
+def _same_composable_profile(anchor: dict[str, object], other: dict[str, object]) -> bool:
+    condition_hash = anchor.get("profile_condition_hash")
+    if not isinstance(condition_hash, str) or not condition_hash:
+        return False
+    if other.get("profile_condition_hash") != condition_hash:
+        return False
+    for key in ("execution_boundary", "runtime_id", "runtime_version"):
+        anchor_value = anchor.get(key)
+        other_value = other.get(key)
+        if anchor_value is not None or other_value is not None:
+            if anchor_value != other_value:
+                return False
+    return True
+
+
 def _latest_model_fit_from_state(
     state: ProjectState, model_id: str | None = None
 ) -> dict[str, object]:
@@ -4848,67 +4882,113 @@ def _latest_model_fit_from_state(
         if state.champion is None:
             return {}
         model_id = state.champion.model.model_id
+
+    matched: list[tuple[dict[str, object], dict[str, object], dict[str, object]]] = []
     for event in reversed(state.history):
-        if event.get("kind") != "INFERENCE_PROFILE_MEASURED":
+        parsed = _inference_event_metrics(event, model_id=model_id)
+        if parsed is None:
             continue
-        details = event.get("details")
-        if not isinstance(details, dict) or details.get("model_id") != model_id:
-            continue
-        metrics = details.get("metrics")
-        if not isinstance(metrics, dict):
-            continue
+        details, metrics = parsed
+        matched.append((event, details, metrics))
 
-        total = metrics.get("cuda_memory_total_bytes")
-        free_min = metrics.get("cuda_memory_free_min_sampled_bytes")
-        free_fraction: float | None = None
-        if (
-            isinstance(total, int)
-            and not isinstance(total, bool)
-            and total > 0
-            and isinstance(free_min, int)
-            and not isinstance(free_min, bool)
-            and free_min >= 0
-        ):
-            free_fraction = min(1.0, max(0.0, free_min / total))
+    if not matched:
+        return {}
 
-        return {
-            "semantics": "MEASURED_INFERENCE_PROFILE",
-            "model_id": model_id,
-            "model_fingerprint": details.get("model_fingerprint"),
-            "measured_at": event.get("created_at"),
-            "measurement_scope": metrics.get("measurement_scope"),
-            "execution_boundary": metrics.get("execution_boundary", "LOCAL_MACHINE"),
-            "device": metrics.get("device"),
-            "source_adapter": metrics.get("source_adapter"),
-            "source_adapter_version": metrics.get("source_adapter_version"),
-            "source_sha256": metrics.get("source_sha256"),
-            "profile_condition_hash": metrics.get("profile_condition_hash"),
-            "latency_seconds_p50": metrics.get("latency_seconds_p50"),
-            "tokens_per_second_p50": metrics.get("tokens_per_second_p50"),
-            "ttft_seconds_p50": metrics.get("ttft_seconds_p50"),
-            "tpot_seconds_p50": metrics.get("tpot_seconds_p50"),
-            "itl_seconds_p50": metrics.get("itl_seconds_p50"),
-            "request_throughput_per_second": metrics.get("request_throughput_per_second"),
-            "output_tokens_per_second_aggregate": metrics.get("output_tokens_per_second_aggregate"),
-            "total_tokens_per_second_aggregate": metrics.get("total_tokens_per_second_aggregate"),
-            "max_sampled_process_rss_bytes": metrics.get("max_sampled_process_rss_bytes"),
-            "peak_vram_bytes": metrics.get("peak_vram_bytes"),
-            "cuda_memory_total_bytes": total,
-            "cuda_memory_free_min_sampled_bytes": free_min,
-            "cuda_memory_free_after_profile_bytes": metrics.get(
-                "cuda_memory_free_after_profile_bytes"
-            ),
-            "cuda_memory_free_fraction_min_sampled": free_fraction,
-            "max_new_tokens": metrics.get("max_new_tokens"),
-            "measured_runs": metrics.get("measured_runs"),
-            "context_length": metrics.get("context_length"),
-            "note": (
-                "Measured during the recorded local inference profile for this exact model. "
-                "CUDA free-memory values are device-level samples; PyTorch peak allocation "
-                "is reported separately."
-            ),
+    anchor_event, anchor_details, anchor_metrics = matched[0]
+    merged = dict(anchor_metrics)
+    evidence_sources: list[dict[str, object]] = [
+        {
+            "source_adapter": anchor_metrics.get("source_adapter"),
+            "source_adapter_version": anchor_metrics.get("source_adapter_version"),
+            "source_sha256": anchor_metrics.get("source_sha256"),
+            "measurement_scope": anchor_metrics.get("measurement_scope"),
+            "measured_at": anchor_event.get("created_at"),
         }
-    return {}
+    ]
+
+    # External serving evidence is intentionally composable only when the benchmark
+    # workload condition, execution boundary, and runtime identity all match exactly.
+    # Newer non-null measurements win; older compatible receipts may only fill gaps.
+    if isinstance(anchor_metrics.get("profile_condition_hash"), str):
+        for event, _details, metrics in matched[1:]:
+            if not _same_composable_profile(anchor_metrics, metrics):
+                continue
+            filled = False
+            for key, value in metrics.items():
+                if value is None:
+                    continue
+                if key not in merged or merged[key] is None:
+                    merged[key] = value
+                    filled = True
+            if filled:
+                evidence_sources.append(
+                    {
+                        "source_adapter": metrics.get("source_adapter"),
+                        "source_adapter_version": metrics.get("source_adapter_version"),
+                        "source_sha256": metrics.get("source_sha256"),
+                        "measurement_scope": metrics.get("measurement_scope"),
+                        "measured_at": event.get("created_at"),
+                    }
+                )
+
+    total = merged.get("cuda_memory_total_bytes")
+    free_min = merged.get("cuda_memory_free_min_sampled_bytes")
+    free_fraction: float | None = None
+    if (
+        isinstance(total, int)
+        and not isinstance(total, bool)
+        and total > 0
+        and isinstance(free_min, int)
+        and not isinstance(free_min, bool)
+        and free_min >= 0
+    ):
+        free_fraction = min(1.0, max(0.0, free_min / total))
+
+    scopes = [
+        item.get("measurement_scope")
+        for item in evidence_sources
+        if isinstance(item.get("measurement_scope"), str)
+    ]
+    return {
+        "semantics": "MEASURED_INFERENCE_PROFILE",
+        "model_id": model_id,
+        "model_fingerprint": anchor_details.get("model_fingerprint"),
+        "measured_at": anchor_event.get("created_at"),
+        "measurement_scope": (
+            "+".join(dict.fromkeys(str(value) for value in scopes)) if scopes else None
+        ),
+        "execution_boundary": merged.get("execution_boundary", "LOCAL_MACHINE"),
+        "device": merged.get("device"),
+        "runtime_id": merged.get("runtime_id"),
+        "runtime_version": merged.get("runtime_version"),
+        "source_adapter": merged.get("source_adapter"),
+        "source_adapter_version": merged.get("source_adapter_version"),
+        "source_sha256": merged.get("source_sha256"),
+        "evidence_sources": evidence_sources,
+        "profile_condition_hash": merged.get("profile_condition_hash"),
+        "latency_seconds_p50": merged.get("latency_seconds_p50"),
+        "tokens_per_second_p50": merged.get("tokens_per_second_p50"),
+        "ttft_seconds_p50": merged.get("ttft_seconds_p50"),
+        "tpot_seconds_p50": merged.get("tpot_seconds_p50"),
+        "itl_seconds_p50": merged.get("itl_seconds_p50"),
+        "request_throughput_per_second": merged.get("request_throughput_per_second"),
+        "output_tokens_per_second_aggregate": merged.get("output_tokens_per_second_aggregate"),
+        "total_tokens_per_second_aggregate": merged.get("total_tokens_per_second_aggregate"),
+        "max_sampled_process_rss_bytes": merged.get("max_sampled_process_rss_bytes"),
+        "peak_vram_bytes": merged.get("peak_vram_bytes"),
+        "cuda_memory_total_bytes": total,
+        "cuda_memory_free_min_sampled_bytes": free_min,
+        "cuda_memory_free_after_profile_bytes": merged.get("cuda_memory_free_after_profile_bytes"),
+        "cuda_memory_free_fraction_min_sampled": free_fraction,
+        "max_new_tokens": merged.get("max_new_tokens"),
+        "measured_runs": merged.get("measured_runs"),
+        "context_length": merged.get("context_length"),
+        "note": (
+            "Measured inference evidence for this exact model. Multiple receipts are "
+            "combined only when serving-condition hash, execution boundary, and runtime "
+            "identity match exactly; missing dimensions remain UNKNOWN."
+        ),
+    }
 
 
 def import_vllm_serving_evidence(
@@ -4966,6 +5046,64 @@ def import_vllm_serving_evidence(
             "model_fingerprint": model.fingerprint,
             "metrics": imported.metrics,
             "provenance": "IMPORTED_VLLM_BENCH_SERVE",
+        },
+    )
+    return imported
+
+
+def import_serving_resource_evidence(
+    root: Path,
+    *,
+    manifest_path: Path,
+    model_id: str | None,
+) -> ServingResourceImport:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before importing serving resource evidence.",
+            10,
+        )
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "Specify --model or establish a Champion before importing resource evidence.",
+                12,
+            )
+        target_model_id = state.champion.model.model_id
+    model = registry.get_model(target_model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+    imported = import_serving_resource_manifest(manifest_path)
+    if imported.model_fingerprint != model.fingerprint:
+        raise FrontierwrightError(
+            "SERVING_RESOURCE_MODEL_MISMATCH",
+            "Serving resource manifest model fingerprint does not match the target model.",
+            12,
+        )
+
+    for event in reversed(state.history):
+        parsed = _inference_event_metrics(event, model_id=model.model_id)
+        if parsed is None:
+            continue
+        _details, metrics = parsed
+        if (
+            metrics.get("source_adapter") == imported.metrics.get("source_adapter")
+            and metrics.get("source_sha256") == imported.source_sha256
+            and metrics.get("runtime_id") == imported.runtime_id
+            and metrics.get("runtime_version") == imported.runtime_version
+        ):
+            return imported
+
+    registry.record_event(
+        "INFERENCE_PROFILE_MEASURED",
+        {
+            "model_id": model.model_id,
+            "model_fingerprint": model.fingerprint,
+            "metrics": imported.metrics,
+            "provenance": "IMPORTED_SERVING_RESOURCE_MANIFEST",
         },
     )
     return imported
