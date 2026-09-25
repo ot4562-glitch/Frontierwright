@@ -18,6 +18,18 @@ from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import RunUsage, load_command_backend_spec, run_training_backend
 from frontierwright.registry import Registry
 
+if sys.platform == "win32":
+
+    def _kill_process_group(pid: int, *, force: bool = False) -> None:
+        del pid, force
+        raise RuntimeError("POSIX process groups are unavailable on Windows")
+
+else:
+
+    def _kill_process_group(pid: int, *, force: bool = False) -> None:
+        os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
 WORKER_RESULT_SCHEMA = 1
 
 
@@ -224,7 +236,7 @@ def terminate_worker_tree(process: subprocess.Popen[bytes]) -> None:
 
     if os.name != "nt":
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            _kill_process_group(process.pid)
         except ProcessLookupError:
             return
         try:
@@ -232,7 +244,7 @@ def terminate_worker_tree(process: subprocess.Popen[bytes]) -> None:
             return
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                _kill_process_group(process.pid, force=True)
             except ProcessLookupError:
                 return
             process.wait(timeout=5)

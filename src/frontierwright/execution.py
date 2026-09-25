@@ -12,16 +12,35 @@ import math
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, Protocol
 
 from frontierwright.data import DatasetClassification
 from frontierwright.errors import FrontierwrightError
 from frontierwright.paths import TrainingPathId
+
+
+class _BinaryReadSeek(Protocol):
+    def seek(self, offset: int, whence: int = 0, /) -> int: ...
+
+    def read(self, size: int = -1, /) -> bytes: ...
+
+
+if sys.platform == "win32":
+
+    def _kill_process_group(pid: int, *, force: bool = False) -> None:
+        del pid, force
+        raise RuntimeError("POSIX process groups are unavailable on Windows")
+
+else:
+
+    def _kill_process_group(pid: int, *, force: bool = False) -> None:
+        os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
 
 
 class PermissionLevel(IntEnum):
@@ -517,7 +536,7 @@ MAX_BACKEND_OUTPUT_BYTES = 1024 * 1024
 BACKEND_WATCH_INTERVAL_SECONDS = 0.1
 
 
-def _read_bounded_output(handle: BinaryIO, label: str) -> str:
+def _read_bounded_output(handle: _BinaryReadSeek, label: str) -> str:
     handle.seek(0)
     raw = handle.read(MAX_BACKEND_OUTPUT_BYTES + 1)
     if len(raw) > MAX_BACKEND_OUTPUT_BYTES:
@@ -572,7 +591,7 @@ def _terminate_backend_tree(process: subprocess.Popen[bytes]) -> None:
             pass
     else:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            _kill_process_group(process.pid)
         except ProcessLookupError:
             return
 
@@ -586,7 +605,7 @@ def _terminate_backend_tree(process: subprocess.Popen[bytes]) -> None:
         process.kill()
     else:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            _kill_process_group(process.pid, force=True)
         except ProcessLookupError:
             return
     process.wait(timeout=5)

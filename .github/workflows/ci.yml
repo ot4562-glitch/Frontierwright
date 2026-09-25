@@ -30,6 +30,9 @@ jobs:
         run: python -m ruff check .
       - name: mypy
         run: python -m mypy src/frontierwright
+      - name: mypy Windows type surface
+        if: runner.os == 'Linux'
+        run: python -m mypy --platform win32 src/frontierwright
       - name: Tests
         run: python -m pytest -q
       - name: Build wheel and sdist
