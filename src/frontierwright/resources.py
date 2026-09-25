@@ -1,8 +1,9 @@
-"""Local resource detection with explicit provenance and no guessed capability flags."""
+"""Local resource detection with explicit provenance and actionable diagnostics."""
 
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import os
 import platform
 import re
@@ -25,6 +26,28 @@ class GPUResource:
 
 
 @dataclass(frozen=True)
+class ResourceDiagnostic:
+    """Explain what a probe established and how to resolve missing evidence."""
+
+    probe_id: str
+    status: str
+    reason_code: str
+    detail: str
+    next_action: str | None = None
+    physical_absence_proven: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "probe_id": self.probe_id,
+            "status": self.status,
+            "reason_code": self.reason_code,
+            "detail": self.detail,
+            "next_action": self.next_action,
+            "physical_absence_proven": self.physical_absence_proven,
+        }
+
+
+@dataclass(frozen=True)
 class ResourceSnapshot:
     provenance: ResourceProvenance
     platform: str
@@ -40,6 +63,7 @@ class ResourceSnapshot:
     rocm_version: str | None
     bf16_supported: bool | None
     fp16_supported: bool | None
+    diagnostics: tuple[ResourceDiagnostic, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -67,6 +91,7 @@ class ResourceSnapshot:
             "rocm_version": self.rocm_version,
             "bf16_supported": self.bf16_supported,
             "fp16_supported": self.fp16_supported,
+            "diagnostics": [item.to_dict() for item in self.diagnostics],
         }
 
 
@@ -74,11 +99,18 @@ def _cpu_model() -> str:
     candidate = platform.processor().strip()
     if candidate:
         return candidate
+
+    # platform.processor() is frequently empty on Windows Python builds.
+    windows_identifier = os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
+    if windows_identifier:
+        return windows_identifier
+
     cpuinfo = Path("/proc/cpuinfo")
     if cpuinfo.is_file():
         for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.lower().startswith("model name") and ":" in line:
                 return line.split(":", 1)[1].strip()
+
     return platform.machine() or "UNKNOWN"
 
 
@@ -147,10 +179,25 @@ def _run(command: list[str], timeout: float = 5.0) -> subprocess.CompletedProces
         return None
 
 
-def _detect_nvidia() -> tuple[GPUResource, ...]:
+def _detail_from_process(result: subprocess.CompletedProcess[str]) -> str:
+    raw = (result.stderr or result.stdout or "").strip().replace("\r", " ").replace("\n", " ")
+    return raw[:400] if raw else f"process exited with code {result.returncode}"
+
+
+def _probe_nvidia() -> tuple[tuple[GPUResource, ...], ResourceDiagnostic]:
     executable = shutil.which("nvidia-smi") or shutil.which("nvidia-smi.exe")
     if executable is None:
-        return ()
+        return (), ResourceDiagnostic(
+            probe_id="gpu.nvidia",
+            status="MEASUREMENT_NEEDED",
+            reason_code="NVIDIA_SMI_NOT_FOUND",
+            detail="NVIDIA probe executable was not found in this runtime.",
+            next_action=(
+                "Install or repair the NVIDIA driver/runtime, or verify the device from the "
+                "host OS, then refresh resources."
+            ),
+        )
+
     result = _run(
         [
             executable,
@@ -158,13 +205,31 @@ def _detect_nvidia() -> tuple[GPUResource, ...]:
             "--format=csv,noheader,nounits",
         ]
     )
-    if result is None or result.returncode != 0:
-        return ()
+    if result is None:
+        return (), ResourceDiagnostic(
+            probe_id="gpu.nvidia",
+            status="MEASUREMENT_NEEDED",
+            reason_code="NVIDIA_SMI_UNAVAILABLE",
+            detail="The NVIDIA probe could not be executed or did not complete before timeout.",
+            next_action="Run nvidia-smi directly, repair the driver/runtime if needed, then retry.",
+        )
+    if result.returncode != 0:
+        return (), ResourceDiagnostic(
+            probe_id="gpu.nvidia",
+            status="MEASUREMENT_NEEDED",
+            reason_code="NVIDIA_SMI_FAILED",
+            detail=_detail_from_process(result),
+            next_action="Resolve the reported NVIDIA driver/runtime error, then refresh resources.",
+        )
 
     gpus: list[GPUResource] = []
+    malformed = 0
     for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
         parts = [part.strip() for part in line.split(",")]
         if len(parts) != 4:
+            malformed += 1
             continue
         name, total_mib, free_mib, driver = parts
         try:
@@ -182,19 +247,105 @@ def _detect_nvidia() -> tuple[GPUResource, ...]:
                 driver_version=driver or None,
             )
         )
-    return tuple(gpus)
+
+    if gpus:
+        return tuple(gpus), ResourceDiagnostic(
+            probe_id="gpu.nvidia",
+            status="MEASURED",
+            reason_code="NVIDIA_GPU_VISIBLE",
+            detail=f"nvidia-smi reported {len(gpus)} visible NVIDIA GPU(s).",
+        )
+
+    reason = "NVIDIA_SMI_UNPARSEABLE" if malformed else "NVIDIA_SMI_NO_VISIBLE_GPU"
+    detail = (
+        f"nvidia-smi completed but {malformed} non-empty row(s) could not be parsed."
+        if malformed
+        else "nvidia-smi completed but returned no visible GPU rows."
+    )
+    return (), ResourceDiagnostic(
+        probe_id="gpu.nvidia",
+        status="MEASUREMENT_NEEDED",
+        reason_code=reason,
+        detail=detail,
+        next_action=(
+            "Check host device visibility, driver configuration, containers/WSL passthrough, "
+            "then refresh resources."
+        ),
+    )
+
+
+def _detect_nvidia() -> tuple[GPUResource, ...]:
+    """Compatibility helper for callers that only need measured GPU records."""
+
+    return _probe_nvidia()[0]
+
+
+def _probe_rocm() -> tuple[tuple[GPUResource, ...], ResourceDiagnostic]:
+    executable = shutil.which("rocm-smi")
+    if executable is None:
+        return (), ResourceDiagnostic(
+            probe_id="gpu.rocm",
+            status="MEASUREMENT_NEEDED",
+            reason_code="ROCM_SMI_NOT_FOUND",
+            detail="ROCm probe executable was not found in this runtime.",
+            next_action=(
+                "If this machine is expected to use an AMD GPU, install/repair ROCm or verify "
+                "the device from the host OS, then refresh resources."
+            ),
+        )
+
+    result = _run([executable, "--showproductname", "--showmeminfo", "vram", "--json"])
+    if result is None:
+        return (), ResourceDiagnostic(
+            probe_id="gpu.rocm",
+            status="MEASUREMENT_NEEDED",
+            reason_code="ROCM_SMI_UNAVAILABLE",
+            detail="The ROCm probe could not be executed or did not complete before timeout.",
+            next_action="Run rocm-smi directly, repair ROCm if needed, then refresh resources.",
+        )
+    if result.returncode != 0:
+        return (), ResourceDiagnostic(
+            probe_id="gpu.rocm",
+            status="MEASUREMENT_NEEDED",
+            reason_code="ROCM_SMI_FAILED",
+            detail=_detail_from_process(result),
+            next_action="Resolve the reported ROCm/runtime error, then refresh resources.",
+        )
+
+    # ROCm JSON field names vary substantially across versions. Preserve the raw
+    # probe success as diagnostic evidence instead of inventing VRAM values.
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict) and parsed:
+        return (), ResourceDiagnostic(
+            probe_id="gpu.rocm",
+            status="UNSUPPORTED_HERE",
+            reason_code="ROCM_GPU_PARSER_NOT_IMPLEMENTED",
+            detail=(
+                "rocm-smi returned structured device evidence but this build "
+                "cannot safely map it."
+            ),
+            next_action=(
+                "Use a serving/runtime resource receipt for the exact AMD model workload, or add "
+                "a versioned ROCm parser before treating VRAM as measured."
+            ),
+        )
+
+    return (), ResourceDiagnostic(
+        probe_id="gpu.rocm",
+        status="MEASUREMENT_NEEDED",
+        reason_code="ROCM_SMI_NO_STRUCTURED_GPU",
+        detail="rocm-smi completed but did not return structured GPU evidence.",
+        next_action="Check ROCm device visibility and retry resource detection.",
+    )
 
 
 def _detect_rocm_gpus() -> tuple[GPUResource, ...]:
-    executable = shutil.which("rocm-smi")
-    if executable is None:
-        return ()
-    result = _run([executable, "--showproductname", "--showmeminfo", "vram", "--json"])
-    if result is None or result.returncode != 0:
-        return ()
-    # rocm-smi JSON varies by version. Until a stable parser is implemented,
-    # record ROCm runtime separately and avoid inventing GPU memory values.
-    return ()
+    """Compatibility helper for callers that only need measured GPU records."""
+
+    return _probe_rocm()[0]
 
 
 def _package_version(name: str) -> str | None:
@@ -230,12 +381,41 @@ def detect_local_resources(root: Path) -> ResourceSnapshot:
     root = root.resolve()
     disk = shutil.disk_usage(root)
     ram_total, ram_available = _memory()
-    gpus = _detect_nvidia()
-    if not gpus:
-        gpus = _detect_rocm_gpus()
 
-    # Precision support remains unknown until a backend-specific capability
-    # probe is run. Hardware-name heuristics would be fake certainty.
+    nvidia_gpus, nvidia_diagnostic = _probe_nvidia()
+    diagnostics: list[ResourceDiagnostic] = [nvidia_diagnostic]
+    gpus = nvidia_gpus
+
+    if not gpus:
+        rocm_gpus, rocm_diagnostic = _probe_rocm()
+        diagnostics.append(rocm_diagnostic)
+        gpus = rocm_gpus
+
+    diagnostics.extend(
+        [
+            ResourceDiagnostic(
+                probe_id="precision.bf16",
+                status="MEASUREMENT_NEEDED",
+                reason_code="BACKEND_CALIBRATION_REQUIRED",
+                detail=(
+                    "bf16 support depends on the exact backend/runtime and has not "
+                    "been calibrated."
+                ),
+                next_action="Calibrate the intended backend/runtime before claiming bf16 support.",
+            ),
+            ResourceDiagnostic(
+                probe_id="precision.fp16",
+                status="MEASUREMENT_NEEDED",
+                reason_code="BACKEND_CALIBRATION_REQUIRED",
+                detail=(
+                    "fp16 support depends on the exact backend/runtime and has not "
+                    "been calibrated."
+                ),
+                next_action="Calibrate the intended backend/runtime before claiming fp16 support.",
+            ),
+        ]
+    )
+
     return ResourceSnapshot(
         provenance=ResourceProvenance.DETECTED,
         platform=platform.platform(),
@@ -251,4 +431,5 @@ def detect_local_resources(root: Path) -> ResourceSnapshot:
         rocm_version=_rocm_version(),
         bf16_supported=None,
         fp16_supported=None,
+        diagnostics=tuple(diagnostics),
     )

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import frontierwright.resources as resources_module
 from frontierwright.domain import ModelOrigin, ResourceProvenance
 from frontierwright.registry import Registry
 from frontierwright.resources import GPUResource, ResourceSnapshot, detect_local_resources
@@ -92,3 +93,55 @@ def test_resource_view_exposes_point_in_time_headroom_without_model_fit_claim(
     assert gpus[0]["memory_total_bytes"] == 12 * gib
     assert gpus[0]["available_fraction"] == 0.25
     assert "model/inference profile" in str(view.headroom["note"])
+
+
+def test_missing_nvidia_probe_is_actionable_not_physical_absence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_which = resources_module.shutil.which
+
+    def fake_which(name: str) -> str | None:
+        if name in {"nvidia-smi", "nvidia-smi.exe"}:
+            return None
+        return original_which(name)
+
+    monkeypatch.setattr(resources_module.shutil, "which", fake_which)
+
+    snapshot = detect_local_resources(tmp_path)
+    diagnostics = {item["probe_id"]: item for item in snapshot.to_dict()["diagnostics"]}
+
+    assert diagnostics["gpu.nvidia"]["status"] == "MEASUREMENT_NEEDED"
+    assert diagnostics["gpu.nvidia"]["reason_code"] == "NVIDIA_SMI_NOT_FOUND"
+    assert "driver" in diagnostics["gpu.nvidia"]["next_action"].lower()
+    assert diagnostics["gpu.nvidia"]["physical_absence_proven"] is False
+
+
+def test_failed_nvidia_probe_preserves_failure_reason(tmp_path: Path, monkeypatch) -> None:
+    class FailedResult:
+        returncode = 9
+        stdout = ""
+        stderr = "driver communication failed"
+
+    monkeypatch.setattr(
+        resources_module.shutil,
+        "which",
+        lambda name: "nvidia-smi.exe" if name in {"nvidia-smi", "nvidia-smi.exe"} else None,
+    )
+    monkeypatch.setattr(resources_module, "_run", lambda command, timeout=5.0: FailedResult())
+
+    snapshot = detect_local_resources(tmp_path)
+    diagnostics = {item["probe_id"]: item for item in snapshot.to_dict()["diagnostics"]}
+
+    assert diagnostics["gpu.nvidia"]["status"] == "MEASUREMENT_NEEDED"
+    assert diagnostics["gpu.nvidia"]["reason_code"] == "NVIDIA_SMI_FAILED"
+    assert "driver communication failed" in diagnostics["gpu.nvidia"]["detail"]
+    assert diagnostics["gpu.nvidia"]["physical_absence_proven"] is False
+
+
+def test_cpu_model_uses_processor_identifier_fallback(monkeypatch) -> None:
+    monkeypatch.setattr(resources_module.platform, "processor", lambda: "")
+    monkeypatch.setattr(resources_module.platform, "machine", lambda: "AMD64")
+    monkeypatch.setenv("PROCESSOR_IDENTIFIER", "Example CPU 9000")
+
+    assert resources_module._cpu_model() == "Example CPU 9000"

@@ -1234,6 +1234,8 @@ def _print_resources(view: ResourceView) -> None:
         return
     snapshot = view.snapshot
     console.print(f"[bold]RESOURCES[/bold] · {view.provenance}")
+    if view.detected_at:
+        console.print(f"Measured: {view.detected_at}")
     console.print(f"CPU: {snapshot.get('cpu_model', 'UNKNOWN')}")
     console.print(f"Logical CPUs: {snapshot.get('cpu_logical_count', 'UNKNOWN')}")
     console.print(
@@ -1254,11 +1256,13 @@ def _print_resources(view: ResourceView) -> None:
                 f"{_human_bytes(gpu.get('memory_total_bytes'))} VRAM"
             )
     else:
-        console.print("GPU: none detected")
+        console.print("GPU availability: MEASUREMENT NEEDED")
+        console.print("No measured GPU record proves only probe uncertainty, not physical absence.")
+        console.print("Run: frontierwright resources diagnose")
     console.print(f"Torch: {snapshot.get('torch_version') or 'not detected'}")
     console.print(f"CUDA toolkit: {snapshot.get('cuda_toolkit_version') or 'not detected'}")
     console.print(f"ROCm: {snapshot.get('rocm_version') or 'not detected'}")
-    console.print("bf16/fp16: UNKNOWN until backend-specific capability calibration")
+    console.print("bf16/fp16: MEASUREMENT NEEDED until backend-specific calibration")
 
 
 @project_app.command("init")
@@ -1316,6 +1320,17 @@ def project_init(
 
     console.print(f"[bold]Frontierwright[/bold] initialized: {view.project_name}")
     _print_status(view)
+    console.print(f"\nNext: frontierwright play --path {path}")
+    if view.edition_profile == EditionProfile.ACADEMY.value:
+        console.print(
+            "Academy: open Actions and add PRETRAIN data to begin the real learning lifecycle."
+        )
+    elif view.edition_profile == EditionProfile.LAB.value:
+        console.print(
+            "Lab: connect controlled private infrastructure before planning private runs."
+        )
+    else:
+        console.print("Studio: describe your workload and measure this model on your machine.")
 
 
 @project_app.command("edition")
@@ -2150,7 +2165,7 @@ def operate_profile(
     _print_inference_profile(view)
 
 
-@app.command("import")
+@app.command("import", help="Import an existing local model into Studio or Lab.")
 def import_model(
     source: Annotated[Path, typer.Argument(help="Local model directory or GGUF file.")],
     path: Annotated[
@@ -2288,6 +2303,44 @@ def resources_show(
         _emit_json(_resource_payload(view))
         return
     _print_resources(view)
+
+
+@resources_app.command(
+    "diagnose",
+    help="Refresh resource probes and explain every unresolved measurement with a next action.",
+)
+def resources_diagnose(
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = detect_resources(path)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+
+    raw = view.snapshot.get("diagnostics")
+    diagnostics = [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "ok": True,
+        "profile_id": view.profile_id,
+        "detected_at": view.detected_at,
+        "diagnostics": diagnostics,
+    }
+    if json_output:
+        _emit_json(payload)
+        return
+
+    _print_resources(view)
+    console.print("\n[bold]MEASUREMENT DIAGNOSTICS[/bold]")
+    for item in diagnostics:
+        console.print(f"{item.get('probe_id')} · {item.get('status')} · {item.get('reason_code')}")
+        console.print(f"  {item.get('detail')}")
+        next_action = item.get("next_action")
+        if next_action:
+            console.print(f"  Next: {next_action}")
 
 
 @observe_app.command("record")
@@ -3928,7 +3981,7 @@ def run_repair_receipt(
     _print_run(view)
 
 
-@app.command("train")
+@app.command("train", help="Execute a calibrated READY training plan; dry-run unless --execute.")
 def train_command(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     plan_id: Annotated[
@@ -4147,13 +4200,37 @@ def history_command(
     _print_history(view)
 
 
-@app.command("play")
+@app.command(
+    "play", help="Open the keyboard-first human interface; --script enables non-PTY QA play."
+)
 def play(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     language: Annotated[
         str | None,
         typer.Option("--lang", help="Override human UI language."),
     ] = None,
+    script: Annotated[
+        Path | None,
+        typer.Option(
+            "--script",
+            help=(
+                "Run the real Textual UI through a deterministic JSON key/form script "
+                "for non-PTY QA environments such as CodexPro."
+            ),
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit scripted-play trace as stable JSON."),
+    ] = False,
+    width: Annotated[
+        int,
+        typer.Option("--width", help="Scripted-play virtual terminal width."),
+    ] = 120,
+    height: Annotated[
+        int,
+        typer.Option("--height", help="Scripted-play virtual terminal height."),
+    ] = 44,
 ) -> None:
     from frontierwright.tui import FrontierwrightApp
 
@@ -4172,7 +4249,8 @@ def play(
     lang = language or view.language
     if lang not in {"en", "ko"}:
         raise typer.BadParameter("--lang must be en or ko")
-    FrontierwrightApp(
+
+    tui = FrontierwrightApp(
         view=view,
         resources=resources,
         build=build,
@@ -4187,7 +4265,26 @@ def play(
         history=history,
         root=path,
         language=lang,
-    ).run()
+    )
+    if script is None:
+        if json_output:
+            raise typer.BadParameter(
+                "--json is available with --script; interactive play owns stdout."
+            )
+        tui.run()
+        return
+
+    from frontierwright.tui.scripted import scripted_play_payload
+
+    try:
+        payload = scripted_play_payload(tui, script, width=width, height=height)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if json_output:
+        _emit_json(payload)
+    else:
+        console.print_json(data=payload)
 
 
 def main() -> None:

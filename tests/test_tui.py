@@ -274,15 +274,15 @@ async def test_tui_starts_with_required_sections_and_keyboard_navigation() -> No
 
         await pilot.press("2")
         await pilot.pause()
-        assert tabs.active == "build"
+        assert tabs.active == "data"
 
         await pilot.press("l")
         await pilot.pause()
-        assert tabs.active == "paths"
+        assert tabs.active == "resources"
 
         await pilot.press("h")
         await pilot.pause()
-        assert tabs.active == "build"
+        assert tabs.active == "data"
 
         await pilot.press("?")
         await pilot.pause()
@@ -499,7 +499,7 @@ async def test_tui_candidate_keyboard_selection_and_compare_modal(tmp_path: Path
     async with app.run_test(size=(140, 45)) as pilot:
         tabs = app.query_one("#main-tabs", TabbedContent)
 
-        await pilot.press("8")
+        await pilot.press("7")
         await pilot.pause()
         assert tabs.active == "candidates"
         assert app.candidate_index == 0

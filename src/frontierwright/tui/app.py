@@ -69,16 +69,57 @@ from frontierwright.service import (
 )
 from frontierwright.workloads import WorkloadProfile, human_fit_status
 
-TAB_KEYS = (
-    ("1", "character"),
-    ("2", "build"),
-    ("3", "paths"),
-    ("4", "resources"),
-    ("5", "data"),
-    ("6", "workload"),
-    ("7", "history"),
-    ("8", "candidates"),
+TAB_IDS = (
+    "character",
+    "build",
+    "paths",
+    "resources",
+    "data",
+    "workload",
+    "history",
+    "candidates",
 )
+
+EDITION_TAB_ORDERS: dict[EditionProfile, tuple[str, ...]] = {
+    EditionProfile.ACADEMY: (
+        "character",
+        "data",
+        "resources",
+        "build",
+        "paths",
+        "workload",
+        "candidates",
+        "history",
+    ),
+    EditionProfile.STUDIO: (
+        "character",
+        "workload",
+        "resources",
+        "build",
+        "paths",
+        "data",
+        "candidates",
+        "history",
+    ),
+    EditionProfile.LAB: (
+        "character",
+        "workload",
+        "data",
+        "resources",
+        "paths",
+        "build",
+        "candidates",
+        "history",
+    ),
+}
+
+
+def tab_order_for_edition(edition_profile: str | None) -> tuple[str, ...]:
+    try:
+        profile = EditionProfile(edition_profile or EditionProfile.STUDIO.value)
+    except ValueError:
+        profile = EditionProfile.STUDIO
+    return EDITION_TAB_ORDERS[profile]
 
 
 def _compact_identity(value: str | None, *, keep: int = 16) -> str:
@@ -337,6 +378,12 @@ def _edition_help_text(language: str, edition_profile: str | None) -> str:
                     "what changed in the model, what evidence was measured, and what is still "
                     "unknown?"
                 ),
+                (
+                    "START HERE\n"
+                    "1. Add learning data\n"
+                    "2. Train a tokenizer and create the model\n"
+                    "3. Train, measure, compare, then decide whether a Candidate becomes Champion"
+                ),
                 keys,
             ]
         )
@@ -350,6 +397,12 @@ def _edition_help_text(language: str, edition_profile: str | None) -> str:
                     "explicit uncertainty, hard budgets, and reproducible intervention "
                     "recipes. Private boundaries are hard constraints."
                 ),
+                (
+                    "START HERE\n"
+                    "1. Connect controlled private infrastructure\n"
+                    "2. Pin model, data, workload acceptance, evaluator/reward, and budgets\n"
+                    "3. Run bounded experiments and promote only through comparable evidence"
+                ),
                 keys,
             ]
         )
@@ -361,6 +414,12 @@ def _edition_help_text(language: str, edition_profile: str | None) -> str:
                 "you actually want, and iterate through candidates. A better model is the one "
                 "that improves your workload fit under your resource envelope—not simply the "
                 "largest checkpoint."
+            ),
+            (
+                "START HERE\n"
+                "1. Import or continue a model you control\n"
+                "2. Describe your workload and measure model/machine fit\n"
+                "3. Specialize or optimize a Candidate, compare trade-offs, then promote or reject"
             ),
             keys,
         ]
@@ -652,8 +711,13 @@ class FrontierwrightApp(App[None]):
         Binding("up", "candidate_previous", "Prev", show=False),
         Binding("enter", "open_candidate", "Open", show=False),
         *[
-            Binding(key, f"select_tab('{tab_id}')", f"{key}:{tab_id}", show=False)
-            for key, tab_id in TAB_KEYS
+            Binding(
+                str(index + 1),
+                f"select_tab_index({index})",
+                f"{index + 1}:tab",
+                show=False,
+            )
+            for index in range(8)
         ],
     ]
 
@@ -701,26 +765,25 @@ class FrontierwrightApp(App[None]):
         self.candidate_index = 0
         self.last_run_id: str | None = None
         self.language = language
+        self.tab_order = tab_order_for_edition(view.edition_profile)
 
     def compose(self) -> ComposeResult:
+        renderers = {
+            "character": ("character-sheet", self._character_text),
+            "build": ("build-view", self._build_text),
+            "paths": ("paths-view", self._paths_text),
+            "resources": ("resources-view", self._resources_text),
+            "data": ("data-view", self._data_text),
+            "workload": ("workload-view", self._workload_text),
+            "history": ("history-view", self._history_text),
+            "candidates": ("candidates-view", self._candidates_text),
+        }
         yield Header(show_clock=False)
         with TabbedContent(initial="character", id="main-tabs"):
-            with TabPane(tr(self.language, "character"), id="character"):
-                yield Static(self._character_text(), id="character-sheet")
-            with TabPane(tr(self.language, "build"), id="build"):
-                yield Static(self._build_text(), id="build-view")
-            with TabPane(tr(self.language, "paths"), id="paths"):
-                yield Static(self._paths_text(), id="paths-view")
-            with TabPane(tr(self.language, "resources"), id="resources"):
-                yield Static(self._resources_text(), id="resources-view")
-            with TabPane(tr(self.language, "data"), id="data"):
-                yield Static(self._data_text(), id="data-view")
-            with TabPane(tr(self.language, "workload"), id="workload"):
-                yield Static(self._workload_text(), id="workload-view")
-            with TabPane(tr(self.language, "history"), id="history"):
-                yield Static(self._history_text(), id="history-view")
-            with TabPane(tr(self.language, "candidates"), id="candidates"):
-                yield Static(self._candidates_text(), id="candidates-view")
+            for tab_id in self.tab_order:
+                static_id, renderer = renderers[tab_id]
+                with TabPane(tr(self.language, tab_id), id=tab_id):
+                    yield Static(renderer(), id=static_id)
         yield Footer()
 
     def _character_text(self) -> str:
@@ -742,13 +805,33 @@ class FrontierwrightApp(App[None]):
         )
 
         if edition is EditionProfile.ACADEMY:
+            history_text = {
+                "COMPLETE": "Project history: fully recorded",
+                "VERIFIED": "Project history: verified",
+                "PARTIAL": "Project history: partially known",
+                "UNKNOWN": "Project history: prior training history not verified",
+            }.get(
+                self.view.history_confidence or "",
+                "Project history: not yet established",
+            )
+            capability_text = (
+                "Capability: measured"
+                if self.view.measurement_state == "MEASURED"
+                else "Capability: not measured yet"
+            )
+            model_text = (
+                "Model: not created yet"
+                if self.view.champion_model_id is None
+                else "Model: root/Champion exists"
+            )
             lines.extend(
                 [
                     "",
                     "LEARNING STATE",
                     f"Origin: {self.view.origin}",
-                    f"History evidence: {self.view.history_confidence}",
-                    f"Capability: {self.view.measurement_state}",
+                    history_text,
+                    model_text,
+                    capability_text,
                 ]
             )
             if self.view.champion_model_id is None:
@@ -798,7 +881,7 @@ class FrontierwrightApp(App[None]):
             lines.extend(
                 [
                     "",
-                    "CONTROLLED MODEL STATE",
+                    "CONTROLLED MODEL / EVIDENCE / INFRASTRUCTURE",
                     f"Origin: {self.view.origin}",
                     f"History confidence: {self.view.history_confidence}",
                     f"Measurement state: {self.view.measurement_state}",
@@ -954,20 +1037,20 @@ class FrontierwrightApp(App[None]):
             lines = [
                 "AVAILABLE ON THIS MACHINE NOW",
                 "These are resources currently free. Model-specific fit needs a real profile.",
-                "",
             ]
         elif profile is EditionProfile.LAB:
             lines = [
                 "SYSTEM HEADROOM — POINT-IN-TIME EVIDENCE",
                 f"Semantics: {headroom.get('semantics', 'UNKNOWN')} · model-specific=NO",
-                "",
             ]
         else:
             lines = [
                 "SYSTEM HEADROOM NOW",
                 "Use a real model profile before treating this as post-load headroom.",
-                "",
             ]
+        if self.resources.detected_at:
+            lines.append(f"Measured: {self.resources.detected_at}")
+        lines.append("")
 
         lines.extend(
             [
@@ -1003,7 +1086,40 @@ class FrontierwrightApp(App[None]):
                     f"{_human_bytes(gpu.get('memory_total_bytes'))} VRAM{fraction_text}"
                 )
         else:
-            lines.append("GPU: none detected")
+            diagnostics = snapshot.get("diagnostics")
+            gpu_diagnostics = (
+                [
+                    item
+                    for item in diagnostics
+                    if isinstance(item, dict)
+                    and str(item.get("probe_id") or "").startswith("gpu.")
+                    and item.get("status") != "MEASURED"
+                ]
+                if isinstance(diagnostics, list)
+                else []
+            )
+            if gpu_diagnostics:
+                status = (
+                    "MEASUREMENT NEEDED"
+                    if any(item.get("status") == "MEASUREMENT_NEEDED" for item in gpu_diagnostics)
+                    else "UNSUPPORTED HERE"
+                )
+                lines.append(f"GPU availability: {status}")
+                lines.append(
+                    "No measured GPU record exists; this does not prove that no GPU is installed."
+                )
+                for item in gpu_diagnostics:
+                    vendor = str(item.get("probe_id") or "gpu").split(".")[-1].upper()
+                    lines.append(f"  {vendor}: {item.get('reason_code')} — {item.get('detail')}")
+                    next_action = item.get("next_action")
+                    if next_action:
+                        lines.append(f"  Next: {next_action}")
+            else:
+                lines.append("GPU availability: MEASUREMENT NEEDED")
+                lines.append(
+                    "No measured GPU record exists; run resource diagnostics before concluding "
+                    "that hardware is absent."
+                )
 
         model_fit = self.resources.model_fit
         if model_fit:
@@ -1067,6 +1183,21 @@ class FrontierwrightApp(App[None]):
             lines.append(f"  Classification: {item.get('classification') or 'UNKNOWN'}")
             lines.append(f"  Fingerprint: {item.get('fingerprint')}")
             lines.append(f"  License: {item.get('license') or 'UNKNOWN'}")
+            token_count = item.get("token_count")
+            if isinstance(token_count, int):
+                lines.append(f"  Tokens: {token_count}")
+            elif self.view.edition_profile == EditionProfile.ACADEMY.value:
+                lines.append(
+                    "  Tokens: not measured yet — token count depends on the tokenizer "
+                    "bound to this model."
+                )
+            else:
+                lines.append("  Tokens: MEASUREMENT NEEDED (tokenizer-dependent)")
+            if item.get("classification") == "PRIVATE":
+                lines.append(
+                    "  PRIVATE: later operations must use a compatible data boundary; "
+                    "registration itself does not upload the source."
+                )
             if item.get("managed"):
                 lines.append(f"  Managed from: {item.get('source_dataset_id')}")
                 lines.append(f"  Recipe: {item.get('preparation_recipe_id')}")
@@ -1253,13 +1384,9 @@ class FrontierwrightApp(App[None]):
                     "whether the model actually meets your goal."
                 )
             else:
-                lines.append(
-                    "Success check: " + human_fit_status(acceptance.overall_status)
-                )
+                lines.append("Success check: " + human_fit_status(acceptance.overall_status))
                 contract_label = acceptance.contract_name or acceptance.contract_id
-                lines.append(
-                    f"Criteria: {len(acceptance.criteria)} · contract {contract_label}"
-                )
+                lines.append(f"Criteria: {len(acceptance.criteria)} · contract {contract_label}")
                 if acceptance.overall_status in {"UNKNOWN", "INCONCLUSIVE", "NOT_ASSESSED"}:
                     lines.append(
                         "Next lesson: collect the exact evidence needed to resolve the criteria."
@@ -1490,21 +1617,21 @@ class FrontierwrightApp(App[None]):
 
     def action_previous_tab(self) -> None:
         tabs = self._tabs()
-        ids = [tab_id for _, tab_id in TAB_KEYS]
+        ids = list(self.tab_order)
         current = tabs.active
         index = ids.index(current) if current in ids else 0
         tabs.active = ids[(index - 1) % len(ids)]
 
     def action_next_tab(self) -> None:
         tabs = self._tabs()
-        ids = [tab_id for _, tab_id in TAB_KEYS]
+        ids = list(self.tab_order)
         current = tabs.active
         index = ids.index(current) if current in ids else 0
         tabs.active = ids[(index + 1) % len(ids)]
 
-    def action_select_tab(self, tab_id: str) -> None:
-        if tab_id in {item[1] for item in TAB_KEYS}:
-            self._tabs().active = tab_id
+    def action_select_tab_index(self, index: int) -> None:
+        if 0 <= index < len(self.tab_order):
+            self._tabs().active = self.tab_order[index]
 
     def action_candidate_next(self) -> None:
         if not self._on_candidates_tab() or not self.candidates.candidates:

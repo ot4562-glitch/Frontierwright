@@ -18,6 +18,54 @@ so the model can keep evolving as the user's needs change.
 
 ---
 
+## Start with the edition that matches the job
+
+Frontierwright shares one evidence/lineage core, but the three editions are intentionally
+different products on top of it.
+
+### Studio — I already have a model
+
+Import a local/open checkpoint, describe what *you* actually do, measure it on *your*
+machine, then decide whether specialization or optimization is worth the trade-off.
+
+```bash
+frontierwright import /path/to/model --path ./my-model --edition STUDIO --name MYMODEL
+frontierwright play --path ./my-model
+```
+
+**First question:** is the model already a good fit for my workload and resource envelope?
+
+### Academy — I want to understand models by building one
+
+Start with no model. The UI follows the real sequence: data → tokenizer → Birth → training
+→ evaluation → Candidate → Champion. Nothing becomes a stat until it is measured.
+
+```bash
+frontierwright project init ./academy --name NOVA --origin ZERO --edition ACADEMY
+frontierwright play --path ./academy
+```
+
+**First question:** what changed in the model, and what evidence proves it?
+
+### Lab — I am developing controlled private models
+
+Start from an internal model, private data, explicit workload acceptance criteria, and
+pinned infrastructure/evaluator/reward identities. Lab optimizes for reproducible
+experiments rather than beginner guidance.
+
+```bash
+frontierwright import /path/to/internal-model --path ./lab \
+  --origin INTERNAL_LAB --edition LAB --name FRONTIER-LAB
+frontierwright play --path ./lab
+```
+
+**First question:** can this experiment be reproduced, compared, and rejected safely?
+
+> New to the repository? Install Frontierwright in [Quick start](#quick-start), then use
+> the edition route above.
+
+---
+
 ## Why Frontierwright?
 
 Open models ship in discrete sizes and configurations. Real users do not.
@@ -183,8 +231,7 @@ frontierwright play --path .
 Or start from an existing trainable model in Studio:
 
 ```bash
-frontierwright project init . --name MYMODEL --origin IMPORTED_LOCAL --edition STUDIO
-frontierwright model import /path/to/model --path .
+frontierwright import /path/to/model --path . --edition STUDIO --name MYMODEL
 frontierwright resources detect --path .
 frontierwright play --path .
 ```
@@ -223,11 +270,27 @@ versioned schemas
 idempotency for expensive actions
 ```
 
+For **human-interface QA in a non-PTY environment** such as CodexPro, rc3 can drive the
+same Textual widgets through a deterministic play script and emit the visible state after
+every step:
+
+```json
+{"steps":[{"press":["?"]},{"press":["escape","a"]}]}
+```
+
+```bash
+frontierwright play --path . --script play.json --json
+```
+
+This is intentionally a QA surface, not the normal agent API: it exercises the actual TUI
+key bindings, screens and forms so terminal-host limitations no longer prevent black-box
+human-UX testing.
+
 ---
 
 ## User-fit development layer
 
-The rc2 development line is already moving beyond stock-model selection:
+The rc3 candidate continues moving beyond stock-model selection:
 
 - **Workload Profiles** pin task/language/context/latency/privacy requirements and hard
   capability floors as versioned evidence.
@@ -284,9 +347,10 @@ External projects and papers being evaluated for interoperability are tracked in
 
 ## Current status
 
-The previously certified v1 candidate is `1.0.0rc1`. The current rc2 candidate is
-**`1.0.0rc2`**. It includes the user-fit optimization, measurement-integrity,
-continual-observation, edition-experience, and bounded Lab execution work described above.
+The previously certified v1 candidate is `1.0.0rc1`. The current candidate is
+**`1.0.0rc3`**. It retains the rc2 user-fit, continual-observation, RL, and bounded Lab
+execution contracts while adding actionable resource diagnostics, stronger edition-specific
+onboarding/navigation, and deterministic non-PTY scripted play of the real Textual UI.
 
 Run the verification suite:
 
@@ -297,10 +361,12 @@ python -m pytest
 python -m build
 ```
 
-The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc2 candidate
-integrity gate lives in `tools/rc2_release_gate.py` and adds workload-acceptance,
-measurement-resolution, observation, RL-boundary, edition-UX, and bounded-Slurm criteria
-while retaining clean-wheel and real PyTorch lifecycle/RL smokes.
+The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc3 candidate
+integrity gate lives in `tools/rc3_release_gate.py`; it retains the rc2 workload-acceptance,
+observation, RL-boundary, decision-integrity, and bounded-Slurm criteria while additionally
+requiring actionable resource diagnostics, edition-specific first-run UX, and scripted
+Academy/Studio/Lab Textual play without a host PTY. Clean-wheel and real PyTorch
+lifecycle/RL smokes remain mandatory.
 
 ---
 

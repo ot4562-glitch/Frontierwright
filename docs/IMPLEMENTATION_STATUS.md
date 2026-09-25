@@ -113,7 +113,7 @@ Implemented now:
 - promotion re-checks current champion/build/evaluation state transactionally, enforces frozen-scale build floors by default, and records explicit override evidence when a user intentionally accepts an unmeasured or build-violating candidate;
 - a bounded Lab Slurm executor accepts only controlled-private manifests, forbids profile-embedded secrets, hash-pins scheduler/worker configuration, requires the v1 shared-filesystem contract, records scheduler/accounting evidence, blocks profile drift before submission, and is exposed through `frontierwright lab slurm inspect` / `frontierwright lab slurm backend-spec`; this is one validated scheduler bridge, not generic distributed-training support;
 - stable JSON/non-interactive machine surfaces for project/model/birth/evolve/optimize/operate/export/generation/resource/workload/acceptance/observation/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter/Slurm operations;
-- mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / WORKLOAD / HISTORY / CANDIDATES, with edition-specific workload/acceptance explanations while sharing identical evidence semantics;
+- mandatory Textual keyboard TUI shell over the shared evidence core, with edition-specific tab order, first-run explanations, and Action Center priorities for Academy, Studio, and Lab;
 - English/Korean human-string structure;
 - automated domain, migration, evaluation, execution recovery/idempotency, artifact integrity, candidate, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.
 
@@ -131,6 +131,6 @@ Those unsupported surfaces remain explicitly `NOT_READY`; measurable gaps use ac
 
 ## Verification
 
-The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc2 candidate-integrity gate is `tools/rc2_release_gate.py`; it covers workload acceptance, measurement resolution, promotion integrity, comparison claims, atomic observations, the RL boundary, edition UX, bounded Slurm execution, packaging, and real training/RL smokes.
+The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The current rc3 candidate-integrity gate is `tools/rc3_release_gate.py`; it retains the rc2 workload-acceptance, promotion, comparison, observation, RL, and bounded-Slurm contracts and additionally requires actionable resource diagnostics plus Academy/Studio/Lab scripted Textual play without a host PTY.
 See the root README for current development status and verification commands.
 
