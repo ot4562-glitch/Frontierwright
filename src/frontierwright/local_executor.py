@@ -19,12 +19,64 @@ from frontierwright.execution import RunUsage, load_command_backend_spec, run_tr
 from frontierwright.registry import Registry
 
 if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _ERROR_INVALID_PARAMETER = 87
+
+    def _windows_process_identity(pid: int) -> tuple[str, str | None]:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_process_times = kernel32.GetProcessTimes
+        get_process_times.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        get_process_times.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == _ERROR_INVALID_PARAMETER:
+                return "DEAD", None
+            return "UNRESOLVED", None
+
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        try:
+            if not get_process_times(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return "UNRESOLVED", None
+            token_value = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            return "LIVE", f"win-filetime:{token_value}"
+        finally:
+            close_handle(handle)
 
     def _kill_process_group(pid: int, *, force: bool = False) -> None:
         del pid, force
         raise RuntimeError("POSIX process groups are unavailable on Windows")
 
 else:
+
+    def _windows_process_identity(pid: int) -> tuple[str, str | None]:
+        del pid
+        return "UNRESOLVED", None
 
     def _kill_process_group(pid: int, *, force: bool = False) -> None:
         os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
@@ -174,6 +226,10 @@ def process_start_token(pid: int) -> str | None:
 
     if pid <= 0:
         return None
+    if sys.platform == "win32":
+        state, token = _windows_process_identity(pid)
+        return token if state == "LIVE" else None
+
     proc_stat = Path(f"/proc/{pid}/stat")
     if proc_stat.is_file():
         try:
@@ -190,6 +246,14 @@ def process_liveness(pid: int | None, start_token: str | None) -> str:
 
     if pid is None or pid <= 0:
         return "UNRESOLVED"
+
+    if sys.platform == "win32":
+        state, current_token = _windows_process_identity(pid)
+        if state == "DEAD":
+            return "DEAD"
+        if state != "LIVE" or current_token is None or start_token is None:
+            return "UNRESOLVED"
+        return "LIVE" if current_token == start_token else "DEAD"
 
     current_token = process_start_token(pid)
     if current_token is not None:

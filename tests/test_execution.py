@@ -15,7 +15,11 @@ from frontierwright.execution import (
     PermissionLevel,
     compute_execution_request_digest,
 )
-from frontierwright.local_executor import atomic_write_json
+from frontierwright.local_executor import (
+    atomic_write_json,
+    process_liveness,
+    process_start_token,
+)
 from frontierwright.paths import TrainingPathId
 from frontierwright.registry import Registry
 from frontierwright.service import (
@@ -522,6 +526,15 @@ def test_rerun_is_blocked_while_prior_attempt_is_unresolved(tmp_path: Path) -> N
     run = Registry(project).get_run(run_id)
     assert run["status"] == "RUNNING"
     assert run["liveness_state"] == "UNRESOLVED"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process identity regression")
+def test_windows_process_identity_distinguishes_live_and_missing_pid() -> None:
+    token = process_start_token(os.getpid())
+    assert token is not None
+    assert process_liveness(os.getpid(), token) == "LIVE"
+    assert process_liveness(os.getpid(), "win-filetime:0") == "DEAD"
+    assert process_liveness(999_999_999, None) == "DEAD"
 
 
 def test_dead_worker_without_result_reconciles_to_incomplete(tmp_path: Path) -> None:
