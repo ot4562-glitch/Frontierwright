@@ -22,6 +22,119 @@ WORKLOAD_ACCEPTANCE_CONTRACT_SCHEMA_VERSION = 1
 WORKLOAD_ACCEPTANCE_ASSESSMENT_SCHEMA_VERSION = 1
 
 
+def workload_acceptance_contract_schema() -> dict[str, object]:
+    """Return the public machine-readable schema for acceptance contract v1."""
+
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://frontierwright.local/schemas/workload-acceptance-v1.json",
+        "title": "Frontierwright Workload Acceptance Contract v1",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["schema_version", "name", "workload_profile_hash", "criteria"],
+        "properties": {
+            "schema_version": {"const": WORKLOAD_ACCEPTANCE_CONTRACT_SCHEMA_VERSION},
+            "name": {"type": "string", "minLength": 1},
+            "workload_profile_hash": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-fA-F]{64}$",
+            },
+            "criteria": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "criterion_id",
+                        "selector",
+                        "unit",
+                        "operator",
+                        "threshold",
+                        "evidence_rule",
+                    ],
+                    "properties": {
+                        "criterion_id": {"type": "string", "minLength": 1},
+                        "selector": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["task_id", "task_version", "metric"],
+                            "properties": {
+                                "task_id": {"type": "string", "minLength": 1},
+                                "task_version": {"type": "string", "minLength": 1},
+                                "metric": {"type": "string", "minLength": 1},
+                            },
+                        },
+                        "unit": {"type": "string", "minLength": 1},
+                        "operator": {"enum": ["AT_LEAST", "AT_MOST"]},
+                        "threshold": {"type": "number"},
+                        "evidence_rule": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["kind"],
+                                    "properties": {
+                                        "kind": {"const": "DETERMINISTIC_POINT"},
+                                        "confidence_level": {"type": "null"},
+                                    },
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["kind", "confidence_level"],
+                                    "properties": {
+                                        "kind": {"const": "EXPLICIT_INTERVAL"},
+                                        "confidence_level": {
+                                            "type": "number",
+                                            "exclusiveMinimum": 0,
+                                            "exclusiveMaximum": 1,
+                                        },
+                                    },
+                                },
+                            ]
+                        },
+                        "evaluator_id": {"type": ["string", "null"]},
+                        "evaluator_version": {"type": ["string", "null"]},
+                        "required_conditions": {"type": "object"},
+                    },
+                },
+            },
+        },
+    }
+
+
+def workload_acceptance_contract_example(workload_profile_hash: str) -> dict[str, object]:
+    """Return one complete contract example bound to an exact workload profile."""
+
+    _sha256_identity(workload_profile_hash, "workload_profile_hash")
+    return {
+        "schema_version": WORKLOAD_ACCEPTANCE_CONTRACT_SCHEMA_VERSION,
+        "name": "My workload success criteria",
+        "workload_profile_hash": workload_profile_hash,
+        "criteria": [
+            {
+                "criterion_id": "task-success",
+                "selector": {
+                    "task_id": "my-heldout-task",
+                    "task_version": "1",
+                    "metric": "accuracy",
+                },
+                "unit": "fraction",
+                "operator": "AT_LEAST",
+                "threshold": 0.8,
+                "evidence_rule": {
+                    "kind": "EXPLICIT_INTERVAL",
+                    "confidence_level": 0.95,
+                },
+                "evaluator_id": None,
+                "evaluator_version": None,
+                "required_conditions": {"split": "heldout"},
+            }
+        ],
+    }
+
+
 class AcceptanceOperator(StrEnum):
     AT_LEAST = "AT_LEAST"
     AT_MOST = "AT_MOST"
@@ -412,29 +525,51 @@ def _criterion_from_payload(payload: object, index: int) -> WorkloadAcceptanceCr
             f"criteria[{index}].selector must be an object.",
             2,
         )
+    operator_raw = str(payload.get("operator", "")).upper()
     try:
-        operator = AcceptanceOperator(str(payload.get("operator", "")).upper())
-        rule_payload = payload.get("evidence_rule")
-        if not isinstance(rule_payload, dict):
-            raise FrontierwrightError(
-                "WORKLOAD_ACCEPTANCE_INVALID",
-                f"criteria[{index}].evidence_rule must be an object.",
-                2,
-            )
-        evidence_rule = AcceptanceEvidenceRule(
-            kind=AcceptanceEvidenceRuleKind(str(rule_payload.get("kind", "")).upper()),
-            confidence_level=(
-                float(rule_payload["confidence_level"])
-                if rule_payload.get("confidence_level") is not None
-                else None
-            ),
-        )
+        operator = AcceptanceOperator(operator_raw)
     except ValueError as exc:
+        allowed = ", ".join(item.value for item in AcceptanceOperator)
         raise FrontierwrightError(
             "WORKLOAD_ACCEPTANCE_INVALID",
-            f"criteria[{index}] contains an unsupported enum or numeric value.",
+            f"criteria[{index}].operator must be one of: {allowed}.",
             2,
         ) from exc
+
+    rule_payload = payload.get("evidence_rule")
+    if not isinstance(rule_payload, dict):
+        raise FrontierwrightError(
+            "WORKLOAD_ACCEPTANCE_INVALID",
+            f"criteria[{index}].evidence_rule must be an object.",
+            2,
+        )
+    rule_kind_raw = str(rule_payload.get("kind", "")).upper()
+    try:
+        rule_kind = AcceptanceEvidenceRuleKind(rule_kind_raw)
+    except ValueError as exc:
+        allowed = ", ".join(item.value for item in AcceptanceEvidenceRuleKind)
+        raise FrontierwrightError(
+            "WORKLOAD_ACCEPTANCE_INVALID",
+            f"criteria[{index}].evidence_rule.kind must be one of: {allowed}.",
+            2,
+        ) from exc
+
+    confidence_raw = rule_payload.get("confidence_level")
+    if confidence_raw is None:
+        confidence_level = None
+    else:
+        try:
+            confidence_level = float(confidence_raw)
+        except (TypeError, ValueError) as exc:
+            raise FrontierwrightError(
+                "WORKLOAD_ACCEPTANCE_INVALID",
+                f"criteria[{index}].evidence_rule.confidence_level must be numeric.",
+                2,
+            ) from exc
+    evidence_rule = AcceptanceEvidenceRule(
+        kind=rule_kind,
+        confidence_level=confidence_level,
+    )
 
     return WorkloadAcceptanceCriterion(
         criterion_id=str(payload.get("criterion_id", "")),

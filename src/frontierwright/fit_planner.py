@@ -265,6 +265,32 @@ def plan_fit_opportunities(
             ),
         )
 
+    if "evaluation.workload_acceptance" in unknown_keys:
+        _append_unique(
+            items,
+            seen,
+            FitOpportunity(
+                opportunity_id="configure-workload-acceptance",
+                opportunity_class=OpportunityClass.BLOCKING_EVIDENCE,
+                action="frontierwright workload acceptance example --json",
+                title=_edition_title(
+                    edition,
+                    academy="Choose what counts as success before deciding the next model",
+                    studio="Turn your optimization goals into measurable success criteria",
+                    lab="Pin the exact acceptance contract before trusting the experiment",
+                ),
+                reason=(
+                    "Workload acceptance is mandatory decision evidence but no compatible "
+                    "versioned success criteria are configured or assessed."
+                ),
+                evidence_keys=("evaluation.workload_acceptance",),
+                success_criterion=(
+                    "A versioned acceptance contract is created and assessed against exact "
+                    "compatible evaluation evidence."
+                ),
+            ),
+        )
+
     if "privacy.serving_boundary" in unknown_keys:
         _append_unique(
             items,

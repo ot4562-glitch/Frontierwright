@@ -270,7 +270,7 @@ versioned schemas
 idempotency for expensive actions
 ```
 
-For **human-interface QA in a non-PTY environment** such as CodexPro, rc3 can drive the
+For **human-interface QA in a non-PTY environment** such as CodexPro, rc4 retains the ability to drive the
 same Textual widgets through a deterministic play script and emit the visible state after
 every step:
 
@@ -290,7 +290,7 @@ human-UX testing.
 
 ## User-fit development layer
 
-The rc3 candidate continues moving beyond stock-model selection:
+The rc4 candidate continues moving beyond stock-model selection:
 
 - **Workload Profiles** pin task/language/context/latency/privacy requirements and hard
   capability floors as versioned evidence.
@@ -335,10 +335,11 @@ Lab topologies/checkpoint recovery, and validated adaptive evaluation.
 Canonical direction, in precedence order:
 
 1. [Product decisions](product/PRODUCT_DECISIONS_OVERRIDE_20260922.md)
-2. [User-fit optimization & edition experience](product/USER_FIT_OPTIMIZATION_AND_EDITION_EXPERIENCE_20260924.md)
-3. [Edition architecture](product/EDITION_ARCHITECTURE_DECISION_20260923.md)
-4. [v1 implementation blueprint](product/V1_IMPLEMENTATION_BLUEPRINT_20260922.md)
-5. [Capability v1 spec](product/CAPABILITY_V1_SPEC_20260924.md)
+2. [RC4 Stat v2, benchmark sources & Studio growth](product/RC4_STAT_V2_BENCHMARK_AND_STUDIO_GROWTH_20260926.md)
+3. [User-fit optimization & edition experience](product/USER_FIT_OPTIMIZATION_AND_EDITION_EXPERIENCE_20260924.md)
+4. [Edition architecture](product/EDITION_ARCHITECTURE_DECISION_20260923.md)
+5. [v1 implementation blueprint](product/V1_IMPLEMENTATION_BLUEPRINT_20260922.md)
+6. [Capability v1 spec](product/CAPABILITY_V1_SPEC_20260924.md)
 
 External projects and papers being evaluated for interoperability are tracked in
 [External technical references](product/EXTERNAL_TECHNICAL_REFERENCES_20260924.md).
@@ -348,9 +349,12 @@ External projects and papers being evaluated for interoperability are tracked in
 ## Current status
 
 The previously certified v1 candidate is `1.0.0rc1`. The current candidate is
-**`1.0.0rc3`**. It retains the rc2 user-fit, continual-observation, RL, and bounded Lab
-execution contracts while adding actionable resource diagnostics, stronger edition-specific
-onboarding/navigation, and deterministic non-PTY scripted play of the real Textual UI.
+**`1.0.0rc4`**. It retains the rc3 lifecycle, user-fit, continual-observation, RL, bounded
+Lab, and edition UX contracts while adding the RC4 Stat v2 foundation: a permanent project
+origin model, origin-relative stat primitives, uncertainty-aware runtime comparison,
+discoverable workload-acceptance schema/example surfaces, explicit run-admission versus
+replay semantics, and a curated external benchmark source registry. Executable multi-source
+Capability v2 adapters remain a later RC4/Lab slice and are not claimed by this candidate.
 
 Run the verification suite:
 
@@ -361,12 +365,12 @@ python -m pytest
 python -m build
 ```
 
-The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc3 candidate
-integrity gate lives in `tools/rc3_release_gate.py`; it retains the rc2 workload-acceptance,
-observation, RL-boundary, decision-integrity, and bounded-Slurm criteria while additionally
-requiring actionable resource diagnostics, edition-specific first-run UX, and scripted
-Academy/Studio/Lab Textual play without a host PTY. Clean-wheel and real PyTorch
-lifecycle/RL smokes remain mandatory.
+The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc4 candidate
+integrity gate lives in `tools/rc4_release_gate.py`; it inherits the rc3 lifecycle and
+edition criteria and additionally locks permanent-origin persistence/migration, acceptance
+discoverability and next-actions, uncertainty-aware Pareto evidence, explicit remaining-run
+and replay semantics, and the benchmark source registry. Clean-wheel, scripted Textual,
+real PyTorch lifecycle, and reference-RL smokes remain mandatory.
 
 ---
 

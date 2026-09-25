@@ -29,6 +29,7 @@ from frontierwright.service import (
     execute_training_plan,
     get_data_view,
     get_paths_view,
+    get_plan_view,
     get_run_view,
     import_local_model,
     preflight_training_calibration,
@@ -325,6 +326,52 @@ def test_command_backend_full_plan_calibrate_run_candidate_flow(tmp_path: Path) 
 
     persisted = get_run_view(project, completed.run_id or "")
     assert persisted.status == "COMPLETED"
+
+
+def test_plan_view_separates_calibration_from_new_run_allowance(tmp_path: Path) -> None:
+    project, backend_spec = setup_project(tmp_path)
+    plan_id = make_ready_plan(project, backend_spec, max_runs=1)
+
+    before = get_plan_view(project, plan_id)
+    assert before.calibration_ready is True
+    assert before.ready is True
+    assert before.new_attempt_allowed is True
+    assert before.replay_available is False
+    assert before.run_count == 0
+    assert before.remaining_runs == 1
+
+    completed = execute_training_plan(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+        dry_run=False,
+        rerun=False,
+    )
+    assert completed.status == "COMPLETED"
+
+    after = get_plan_view(project, plan_id)
+    assert after.calibration_ready is True
+    assert after.ready is False
+    assert after.new_attempt_allowed is False
+    assert after.replay_available is True
+    assert after.run_count == 1
+    assert after.remaining_runs == 0
+    assert any("max_runs budget consumed" in item for item in after.blockers)
+
+    replay = execute_training_plan(
+        project,
+        plan_id=plan_id,
+        backend_spec_path=backend_spec,
+        dry_run=False,
+        rerun=False,
+    )
+    assert replay.run_id == completed.run_id
+
+    path = next(
+        item for item in get_paths_view(project).paths if item["path_id"] == "LORA_SFT"
+    )
+    assert path["availability"] != "READY"
+    assert "ready_plan_id" not in path
 
 
 def test_plan_permission_blocks_calibration_and_execution(tmp_path: Path) -> None:

@@ -734,6 +734,7 @@ class ParetoMetricRelation(StrEnum):
     BETTER = "BETTER"
     WORSE = "WORSE"
     SAME = "SAME"
+    UNCERTAIN = "UNCERTAIN"
     UNKNOWN = "UNKNOWN"
 
 
@@ -756,6 +757,7 @@ class ParetoMetricInput:
     candidate_value: float | int | None
     unit: str | None = None
     evidence_source: str | None = None
+    improvement_interval: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -770,11 +772,15 @@ class ParetoMetricEvidence:
     relation: ParetoMetricRelation
     unit: str | None
     evidence_source: str | None
+    improvement_interval: tuple[float, float] | None
 
     def to_payload(self) -> dict[str, object]:
         payload = asdict(self)
         payload["direction"] = self.direction.value
         payload["relation"] = self.relation.value
+        payload["improvement_interval"] = (
+            list(self.improvement_interval) if self.improvement_interval is not None else None
+        )
         return payload
 
 
@@ -788,13 +794,15 @@ class ParetoComparison:
         for metric in self.metrics:
             counts[metric.relation.value] += 1
         unknown_count = counts[ParetoMetricRelation.UNKNOWN.value]
-        complete = unknown_count == 0 and bool(self.metrics)
+        uncertain_count = counts[ParetoMetricRelation.UNCERTAIN.value]
+        complete = unknown_count == 0 and uncertain_count == 0 and bool(self.metrics)
         return {
             "relation": self.relation.value,
             "relation_scope": ("ALL_LISTED_DIMENSIONS" if complete else "MEASURED_DIMENSIONS_ONLY"),
             "complete": complete,
             "known_metric_count": len(self.metrics) - unknown_count,
             "unknown_metric_count": unknown_count,
+            "uncertain_metric_count": uncertain_count,
             "unqualified_dominance_claim_eligible": bool(
                 complete and self.relation is ParetoRelation.CANDIDATE_DOMINATES
             ),
@@ -802,9 +810,9 @@ class ParetoComparison:
             "metrics": [metric.to_payload() for metric in self.metrics],
             "synthetic_utility_score": None,
             "note": (
-                "Pareto relation uses only directly comparable measured point estimates. "
-                "When dimensions are UNKNOWN, dominance is limited to measured dimensions "
-                "and is not an unqualified superiority claim."
+                "Pareto relation uses comparable measured evidence and explicit uncertainty "
+                "intervals when available. UNKNOWN or UNCERTAIN dimensions block an "
+                "unqualified dominance claim."
             ),
         }
 
@@ -831,20 +839,39 @@ def compare_pareto_metrics(
                     relation=ParetoMetricRelation.UNKNOWN,
                     unit=item.unit,
                     evidence_source=item.evidence_source,
+                    improvement_interval=None,
                 )
             )
             continue
 
         raw_delta = candidate - champion
-        if math.isclose(candidate, champion, rel_tol=1e-9, abs_tol=1e-12):
-            improvement_delta = 0.0
+        improvement_delta = (
+            raw_delta if item.direction is ParetoDirection.HIGHER_BETTER else -raw_delta
+        )
+        interval = item.improvement_interval
+        if interval is not None:
+            lower = _finite_number(interval[0])
+            upper = _finite_number(interval[1])
+            if lower is None or upper is None or lower > upper:
+                raise ValueError("improvement_interval must be finite and ordered")
+            interval = (lower, upper)
+            if math.isclose(lower, 0.0, abs_tol=1e-12) and math.isclose(
+                upper, 0.0, abs_tol=1e-12
+            ):
+                relation = ParetoMetricRelation.SAME
+            elif lower <= 0 <= upper:
+                relation = ParetoMetricRelation.UNCERTAIN
+            elif lower > 0:
+                relation = ParetoMetricRelation.BETTER
+            else:
+                relation = ParetoMetricRelation.WORSE
+        elif math.isclose(candidate, champion, rel_tol=1e-9, abs_tol=1e-12):
             relation = ParetoMetricRelation.SAME
         else:
-            improvement_delta = (
-                raw_delta if item.direction is ParetoDirection.HIGHER_BETTER else -raw_delta
-            )
             relation = (
-                ParetoMetricRelation.BETTER if improvement_delta > 0 else ParetoMetricRelation.WORSE
+                ParetoMetricRelation.BETTER
+                if improvement_delta > 0
+                else ParetoMetricRelation.WORSE
             )
         metrics.append(
             ParetoMetricEvidence(
@@ -858,16 +885,27 @@ def compare_pareto_metrics(
                 relation=relation,
                 unit=item.unit,
                 evidence_source=item.evidence_source,
+                improvement_interval=interval,
             )
         )
 
-    known = [metric for metric in metrics if metric.relation is not ParetoMetricRelation.UNKNOWN]
-    better = any(metric.relation is ParetoMetricRelation.BETTER for metric in known)
-    worse = any(metric.relation is ParetoMetricRelation.WORSE for metric in known)
-    if not known:
-        final_relation = ParetoRelation.INSUFFICIENT_EVIDENCE
-    elif better and worse:
+    decisive = [
+        metric
+        for metric in metrics
+        if metric.relation
+        not in {ParetoMetricRelation.UNKNOWN, ParetoMetricRelation.UNCERTAIN}
+    ]
+    uncertain = any(
+        metric.relation is ParetoMetricRelation.UNCERTAIN for metric in metrics
+    )
+    better = any(metric.relation is ParetoMetricRelation.BETTER for metric in decisive)
+    worse = any(metric.relation is ParetoMetricRelation.WORSE for metric in decisive)
+    if better and worse:
         final_relation = ParetoRelation.TRADEOFF
+    elif uncertain:
+        final_relation = ParetoRelation.INSUFFICIENT_EVIDENCE
+    elif not decisive:
+        final_relation = ParetoRelation.INSUFFICIENT_EVIDENCE
     elif better:
         final_relation = ParetoRelation.CANDIDATE_DOMINATES
     elif worse:

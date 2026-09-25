@@ -65,7 +65,7 @@ from frontierwright.workload_acceptance import (
 )
 from frontierwright.workloads import WorkloadProfile
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -99,7 +99,8 @@ CREATE TABLE project (
     edition_profile TEXT NOT NULL CHECK (
         edition_profile IN ('STUDIO','ACADEMY','LAB')),
     created_at TEXT NOT NULL,
-    champion_id TEXT REFERENCES models(model_id)
+    champion_id TEXT REFERENCES models(model_id),
+    origin_model_id TEXT REFERENCES models(model_id)
 );
 CREATE TABLE candidates (
     model_id TEXT PRIMARY KEY REFERENCES models(model_id),
@@ -685,6 +686,10 @@ CREATE TABLE IF NOT EXISTS usage_observations (
 CREATE UNIQUE INDEX IF NOT EXISTS unique_usage_observation_retry
 ON usage_observations(model_fingerprint, idempotency_key)
 WHERE idempotency_key IS NOT NULL;
+"""
+
+MIGRATION_25_TO_26 = """
+ALTER TABLE project ADD COLUMN origin_model_id TEXT REFERENCES models(model_id);
 """
 
 MIGRATION_10_TO_11 = """
@@ -1368,6 +1373,54 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 connection.commit()
                 version = 25
 
+            if version == 25:
+                project_columns = {
+                    str(row["name"]) for row in connection.execute("PRAGMA table_info(project)")
+                }
+                if "origin_model_id" not in project_columns:
+                    connection.executescript(
+                        "BEGIN IMMEDIATE;" + chr(10) + MIGRATION_25_TO_26
+                    )
+                else:
+                    connection.execute("BEGIN IMMEDIATE")
+                root_rows = connection.execute(
+                    "SELECT model_id FROM models WHERE parent_model_id IS NULL"
+                ).fetchall()
+                root_ids = {str(row["model_id"]) for row in root_rows}
+                origin_model_id = next(iter(root_ids)) if len(root_ids) == 1 else None
+                if origin_model_id is None and root_ids:
+                    event_rows = connection.execute(
+                        "SELECT details FROM events ORDER BY sequence"
+                    ).fetchall()
+                    for event_row in event_rows:
+                        try:
+                            event_payload = json.loads(str(event_row["details"]))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            continue
+                        if not isinstance(event_payload, dict):
+                            continue
+                        candidate_id = event_payload.get("model_id")
+                        if isinstance(candidate_id, str) and candidate_id in root_ids:
+                            origin_model_id = candidate_id
+                            break
+                if origin_model_id is not None:
+                    connection.execute(
+                        "UPDATE project SET origin_model_id = ? WHERE singleton = 1",
+                        (origin_model_id,),
+                    )
+                connection.execute("PRAGMA user_version = 26")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {
+                        "from_version": 25,
+                        "to_version": 26,
+                        "origin_model_id": origin_model_id,
+                    },
+                )
+                connection.commit()
+                version = 26
+
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
                     "UNSUPPORTED_SCHEMA",
@@ -1804,8 +1857,10 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             self.insert_model(connection, model)
             self.insert_model_artifact(connection, model.model_id, descriptor, evidence)
             connection.execute(
-                "UPDATE project SET champion_id = ?, history_confidence = ? WHERE singleton = 1",
-                (model.model_id, evidence.confidence.value),
+                "UPDATE project SET champion_id = ?, origin_model_id = "
+                "COALESCE(origin_model_id, ?), history_confidence = ? "
+                "WHERE singleton = 1",
+                (model.model_id, model.model_id, evidence.confidence.value),
             )
             self.event(
                 connection,
@@ -1935,8 +1990,10 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 ),
             )
             connection.execute(
-                "UPDATE project SET champion_id = ?, history_confidence = ? WHERE singleton = 1",
-                (model.model_id, HistoryConfidence.COMPLETE.value),
+                "UPDATE project SET champion_id = ?, origin_model_id = "
+                "COALESCE(origin_model_id, ?), history_confidence = ? "
+                "WHERE singleton = 1",
+                (model.model_id, model.model_id, HistoryConfidence.COMPLETE.value),
             )
             self.event(
                 connection,
@@ -2575,8 +2632,9 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 ),
             )
             connection.execute(
-                "UPDATE project SET champion_id = ? WHERE singleton = 1",
-                (model_id,),
+                "UPDATE project SET champion_id = ?, origin_model_id = "
+                "COALESCE(origin_model_id, ?) WHERE singleton = 1",
+                (model_id, model_id),
             )
             self.event(
                 connection,

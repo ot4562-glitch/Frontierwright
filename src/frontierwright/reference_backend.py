@@ -507,7 +507,7 @@ def _load_inference_profile_config(
 
 def _import_torch() -> Any:
     try:
-        import torch  # type: ignore[import-not-found]
+        import torch
     except ImportError as exc:
         raise RuntimeError(
             "PyTorch is not installed in the reference-backend environment. "

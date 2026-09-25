@@ -64,6 +64,24 @@ def test_unknown_evidence_is_measured_before_intervention() -> None:
 
 
 
+def test_missing_acceptance_maps_to_public_runnable_next_action() -> None:
+    plan = plan_fit_opportunities(
+        edition=EditionProfile.STUDIO,
+        model_id="model-1",
+        workload_configured=True,
+        constraints=[_constraint("evaluation.workload_acceptance", "UNKNOWN")],
+        model_fit={},
+        workload_evaluation_coverage={"complete": True},
+    )
+
+    assert [item.opportunity_id for item in plan.opportunities] == [
+        "configure-workload-acceptance"
+    ]
+    opportunity = plan.opportunities[0]
+    assert opportunity.action == "frontierwright workload acceptance example --json"
+    assert opportunity.evidence_keys == ("evaluation.workload_acceptance",)
+
+
 def test_inconclusive_fit_schedules_more_measurement_instead_of_stalling() -> None:
     plan = plan_fit_opportunities(
         edition=EditionProfile.STUDIO,

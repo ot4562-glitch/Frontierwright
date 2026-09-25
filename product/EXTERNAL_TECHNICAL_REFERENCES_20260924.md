@@ -284,3 +284,45 @@ Engineering rules:
 - never equate non-significance with model equivalence;
 - never make promotion automatic from a statistical test alone; workload floors, raw
   trade-offs, runtime/resource evidence and explicit user intent remain separate evidence.
+
+
+## RC4 evaluator-source refresh — 2026-09-26
+
+Current public source checks reinforce the RC4 adapter-first direction.
+
+### lm-evaluation-harness
+
+Source: https://github.com/EleutherAI/lm-evaluation-harness
+
+Observed 2026-09-26:
+- the project remains actively maintained;
+- the public README documents September 2026 plugin registration for model backends,
+  filters, metrics, and aggregations through package entry points;
+- the release page lists v0.4.13 as the latest surfaced release;
+- the project continues to expose local/Hugging Face/vLLM/API backends and a broad task
+  registry.
+
+Frontierwright consequence:
+- treat lm-eval as an external evaluator/framework source rather than a copied benchmark;
+- pin exact evaluator revision and task identity in every receipt;
+- prefer plugin/adaptor integration over forking benchmark logic into Frontierwright core.
+
+### SciCode
+
+Source: https://github.com/scicode-bench/SciCode
+
+Observed 2026-09-26:
+- the repository describes 338 scientific coding subproblems from 80 main problems across
+  five scientific domains;
+- the benchmark publishes scientist-annotated solutions/tests and documents integrations
+  with Inspect AI and OpenCompass.
+
+Frontierwright consequence:
+- keep SciCode as a candidate Lab evidence source for CODING plus auxiliary
+  REASONING/KNOWLEDGE evidence;
+- keep exact subproblem/test identity and evaluator implementation visible;
+- do not merge SciCode system/tool execution results into a pure model stat without an
+  explicit model/system boundary.
+
+These checks update source selection only. They do not mean the listed suites are bundled,
+licensed for redistribution, or executable through Frontierwright RC4 yet.

@@ -190,6 +190,7 @@ class StatusView:
     build_mode: str | None = None
     strong_recommendation_allowed: bool = False
     champion_model_id: str | None = None
+    origin_model_id: str | None = None
     model_format: str | None = None
     trainable: bool | None = None
     model_fingerprint: str | None = None
@@ -506,7 +507,12 @@ class PlanView:
     config: dict[str, object] = field(default_factory=dict)
     idempotency_key: str | None = None
     calibration: dict[str, object] | None = None
+    calibration_ready: bool = False
     ready: bool = False
+    new_attempt_allowed: bool = False
+    replay_available: bool = False
+    run_count: int = 0
+    remaining_runs: int | None = None
     blockers: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
@@ -813,6 +819,9 @@ def get_status(root: Path) -> StatusView:
         build_mode=mode.value,
         strong_recommendation_allowed=confidence.allows_recommendation,
         champion_model_id=state.champion.model.model_id if state.champion else None,
+        origin_model_id=(
+            str(project["origin_model_id"]) if project.get("origin_model_id") else None
+        ),
         model_format=(
             state.champion.model.model_format.value if state.champion is not None else None
         ),
@@ -5125,7 +5134,9 @@ def _latest_model_fit_from_state(
         "evidence_sources": evidence_sources,
         "profile_condition_hash": merged.get("profile_condition_hash"),
         "latency_seconds_p50": merged.get("latency_seconds_p50"),
+        "latency_seconds_runs": merged.get("latency_seconds_runs"),
         "tokens_per_second_p50": merged.get("tokens_per_second_p50"),
+        "tokens_per_second_runs": merged.get("tokens_per_second_runs"),
         "ttft_seconds_p50": merged.get("ttft_seconds_p50"),
         "tpot_seconds_p50": merged.get("tpot_seconds_p50"),
         "itl_seconds_p50": merged.get("itl_seconds_p50"),
@@ -7085,6 +7096,35 @@ def get_plan_view(root: Path, plan_id: str) -> PlanView:
     calibration = registry.latest_calibration_for_plan(plan.plan_id)
     blockers = _plan_input_blockers(registry, state, plan)
     blockers.extend(_calibration_budget_blockers(plan, calibration, state.resource_profile))
+    calibration_ready = not blockers
+    plan_runs = [item for item in state.runs if item.get("plan_id") == plan.plan_id]
+    run_count = len(plan_runs)
+    remaining_runs = (
+        None
+        if plan.budgets.max_runs is None
+        else max(0, plan.budgets.max_runs - run_count)
+    )
+    latest_run = (
+        max(
+            plan_runs,
+            key=lambda item: (str(item.get("started_at", "")), str(item.get("run_id", ""))),
+        )
+        if plan_runs
+        else None
+    )
+    replay_available = bool(
+        latest_run is not None
+        and latest_run.get("status") in {RunStatus.RUNNING.value, RunStatus.COMPLETED.value}
+    )
+    new_attempt_allowed = bool(
+        calibration_ready and (remaining_runs is None or remaining_runs > 0)
+    )
+    if calibration_ready and not new_attempt_allowed:
+        blockers.append(
+            "max_runs budget consumed; existing successful/active request remains replayable"
+            if replay_available
+            else "max_runs budget consumed; no new training attempt is admitted"
+        )
     return PlanView(
         plan_id=plan.plan_id,
         path_id=plan.path_id.value,
@@ -7112,7 +7152,12 @@ def get_plan_view(root: Path, plan_id: str) -> PlanView:
         config=plan.config,
         idempotency_key=plan.idempotency_key,
         calibration=calibration,
-        ready=not blockers,
+        calibration_ready=calibration_ready,
+        ready=new_attempt_allowed,
+        new_attempt_allowed=new_attempt_allowed,
+        replay_available=replay_available,
+        run_count=run_count,
+        remaining_runs=remaining_runs,
         blockers=list(dict.fromkeys(blockers)),
     )
 
@@ -8422,6 +8467,39 @@ def _qualify_workload_decision_claim(
     return payload
 
 
+def _observed_range_improvement_interval(
+    champion_profile: dict[str, object],
+    candidate_profile: dict[str, object],
+    *,
+    samples_key: str,
+    direction: ParetoDirection,
+) -> tuple[float, float] | None:
+    """Return a conservative observed-range interval for repeated runtime samples."""
+
+    def samples(profile: dict[str, object]) -> tuple[float, ...]:
+        raw = profile.get(samples_key)
+        if not isinstance(raw, list):
+            return ()
+        values: list[float] = []
+        for value in raw:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return ()
+            number = float(value)
+            if not math.isfinite(number):
+                return ()
+            values.append(number)
+        return tuple(values)
+
+    champion = samples(champion_profile)
+    candidate = samples(candidate_profile)
+    if len(champion) < 2 or len(candidate) < 2:
+        return None
+
+    if direction is ParetoDirection.HIGHER_BETTER:
+        return min(candidate) - max(champion), max(candidate) - min(champion)
+    return min(champion) - max(candidate), max(champion) - min(candidate)
+
+
 def _candidate_pareto_evidence(
     registry: Registry,
     *,
@@ -8498,6 +8576,12 @@ def _candidate_pareto_evidence(
                 champion_value=measured(champion_profile, "latency_seconds_p50"),
                 candidate_value=measured(candidate_profile, "latency_seconds_p50"),
                 unit="seconds",
+                improvement_interval=_observed_range_improvement_interval(
+                    champion_profile,
+                    candidate_profile,
+                    samples_key="latency_seconds_runs",
+                    direction=ParetoDirection.LOWER_BETTER,
+                ),
                 evidence_source=inference_source,
             ),
             ParetoMetricInput(
@@ -8507,6 +8591,12 @@ def _candidate_pareto_evidence(
                 champion_value=measured(champion_profile, "tokens_per_second_p50"),
                 candidate_value=measured(candidate_profile, "tokens_per_second_p50"),
                 unit="tokens/second",
+                improvement_interval=_observed_range_improvement_interval(
+                    champion_profile,
+                    candidate_profile,
+                    samples_key="tokens_per_second_runs",
+                    direction=ParetoDirection.HIGHER_BETTER,
+                ),
                 evidence_source=inference_source,
             ),
             ParetoMetricInput(

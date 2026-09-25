@@ -85,6 +85,8 @@ def test_current_champion_replaces_historical_peak_in_current_display(tmp_path: 
     registry.promote_candidate("strong")
 
     first = get_status(tmp_path)
+    assert first.origin_model_id == "strong"
+    assert registry.read().project["origin_model_id"] == "strong"
     assert first.stats["coding"] == 140
 
     weaker = candidate(
@@ -99,6 +101,8 @@ def test_current_champion_replaces_historical_peak_in_current_display(tmp_path: 
 
     current = get_status(tmp_path)
     assert current.champion_model_id == "weaker-current"
+    assert current.origin_model_id == "strong"
+    assert registry.read().project["origin_model_id"] == "strong"
     assert current.stats["coding"] == 120
     assert current.stats["general"] == 110
 

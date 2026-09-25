@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 
 from frontierwright import __version__
+from frontierwright.benchmark_sources import benchmark_source_payloads
 from frontierwright.data import DatasetClassification, DatasetRole
 from frontierwright.domain import ModelOrigin
 from frontierwright.editions import EditionProfile
@@ -137,6 +138,10 @@ from frontierwright.slurm_executor import (
     load_slurm_executor_profile,
     slurm_backend_spec_payload,
 )
+from frontierwright.workload_acceptance import (
+    workload_acceptance_contract_example,
+    workload_acceptance_contract_schema,
+)
 from frontierwright.workloads import WorkloadProfile, human_fit_status
 
 app = typer.Typer(
@@ -153,6 +158,7 @@ observe_app = typer.Typer(help="Record privacy-minimal evidence from real model 
 build_app = typer.Typer(help="Inspect and edit the desired model build.")
 stats_app = typer.Typer(help="Inspect or ingest capability evaluation evidence.")
 evaluation_app = typer.Typer(help="Run and inspect raw evaluation packs.")
+benchmarks_app = typer.Typer(help="Inspect curated benchmark sources for Stat v2.")
 data_app = typer.Typer(help="Register and inspect user/lab datasets.")
 plan_app = typer.Typer(help="Create and inspect pinned training plans.")
 backend_app = typer.Typer(help="Inspect and configure training backends.")
@@ -174,6 +180,7 @@ app.add_typer(observe_app, name="observe")
 app.add_typer(build_app, name="build")
 app.add_typer(stats_app, name="stats")
 app.add_typer(evaluation_app, name="eval")
+app.add_typer(benchmarks_app, name="benchmarks")
 app.add_typer(data_app, name="data")
 app.add_typer(plan_app, name="plan")
 app.add_typer(backend_app, name="backend")
@@ -211,12 +218,45 @@ def _emit_json(payload: dict[str, object]) -> None:
     typer.echo(
         json.dumps(
             payload,
-            ensure_ascii=False,
+            ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
         )
     )
+
+
+@benchmarks_app.command("list")
+def benchmarks_list(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    sources = benchmark_source_payloads()
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "stat_axes": [
+            "KNOWLEDGE",
+            "REASONING",
+            "MATH",
+            "CODING",
+            "INSTRUCTION",
+            "LANGUAGE",
+            "CONTEXT",
+        ],
+        "sources": sources,
+    }
+    if json_output:
+        _emit_json(payload)
+        return
+    for source in sources:
+        raw_axes = source.get("axes")
+        axes = (
+            ",".join(str(axis) for axis in raw_axes)
+            if isinstance(raw_axes, list) and raw_axes
+            else "-"
+        )
+        typer.echo(
+            f"{source['source_id']} {source['kind']} {source['lifecycle']} axes={axes}"
+        )
 
 
 def _fail(exc: FrontierwrightError, *, json_output: bool) -> NoReturn:
@@ -2485,6 +2525,35 @@ def workload_show(
         _emit_json(_workload_payload(view))
         return
     _print_workload(view)
+
+
+@workload_acceptance_app.command("schema")
+def workload_acceptance_schema(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    payload = workload_acceptance_contract_schema()
+    if json_output:
+        _emit_json(payload)
+        return
+    typer.echo(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+
+
+@workload_acceptance_app.command("example")
+def workload_acceptance_example(
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        view = get_workload_view(path)
+        if not view.configured or not view.profile_hash:
+            raise FrontierwrightError("WORKLOAD_NOT_CONFIGURED", "Configure a workload first.", 13)
+        payload = workload_acceptance_contract_example(view.profile_hash)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json(payload)
+        return
+    typer.echo(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
 
 
 @workload_acceptance_app.command("create")

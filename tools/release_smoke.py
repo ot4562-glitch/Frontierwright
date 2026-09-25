@@ -26,6 +26,8 @@ def _run(argv: list[str], *, cwd: Path | None = None) -> subprocess.CompletedPro
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env={**os.environ, "PYTHONUTF8": "1"},
     )
 
