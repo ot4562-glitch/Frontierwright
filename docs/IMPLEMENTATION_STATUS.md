@@ -131,6 +131,6 @@ Those unsupported surfaces remain explicitly `NOT_READY`; measurable gaps use ac
 
 ## Verification
 
-The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc2 development-integrity gate is `tools/rc2_release_gate.py`; it covers workload acceptance, measurement resolution, promotion integrity, comparison claims, atomic observations, the RL boundary, edition UX, bounded Slurm execution, packaging, and real training/RL smokes.
+The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc2 candidate-integrity gate is `tools/rc2_release_gate.py`; it covers workload acceptance, measurement resolution, promotion integrity, comparison claims, atomic observations, the RL boundary, edition UX, bounded Slurm execution, packaging, and real training/RL smokes.
 See the root README for current development status and verification commands.
 

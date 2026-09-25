@@ -284,9 +284,9 @@ External projects and papers being evaluated for interoperability are tracked in
 
 ## Current status
 
-The previously certified v1 candidate is `1.0.0rc1`. The current development version
-is **`1.0.0rc2.dev0`**, which starts the user-fit optimization and edition-experience
-pass described above.
+The previously certified v1 candidate is `1.0.0rc1`. The current rc2 candidate is
+**`1.0.0rc2`**. It includes the user-fit optimization, measurement-integrity,
+continual-observation, edition-experience, and bounded Lab execution work described above.
 
 Run the verification suite:
 
@@ -297,7 +297,7 @@ python -m pytest
 python -m build
 ```
 
-The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc2 development
+The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc2 candidate
 integrity gate lives in `tools/rc2_release_gate.py` and adds workload-acceptance,
 measurement-resolution, observation, RL-boundary, edition-UX, and bounded-Slurm criteria
 while retaining clean-wheel and real PyTorch lifecycle/RL smokes.

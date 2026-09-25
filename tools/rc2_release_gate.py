@@ -1,4 +1,4 @@
-"""Frontierwright rc2 development integrity gate.
+"""Frontierwright rc2 candidate integrity gate.
 
 This gate supplements the frozen v1 candidate gate. It verifies the user-fit,
 measurement, decision-integrity, continual-observation, RL-boundary, edition UX,
@@ -265,7 +265,7 @@ def main() -> int:
         json.dumps(
             {
                 "ok": True,
-                "gate": "Frontierwright rc2 development integrity",
+                "gate": "Frontierwright rc2 candidate integrity",
                 "candidate_version": __version__,
                 "criteria_passed": len(RC2_CRITERIA),
                 "criteria_total": len(RC2_CRITERIA),
