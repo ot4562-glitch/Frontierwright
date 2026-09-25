@@ -18,6 +18,9 @@ RL_SPEC_SCHEMA_VERSION = 1
 REFERENCE_RL_ALGORITHM = "reinforce"
 REFERENCE_RL_ENVIRONMENT_KIND = "VERIFIABLE_MULTIPLE_CHOICE"
 REFERENCE_RL_REWARD_KIND = "EXACT_CORRECT_CHOICE"
+DIRECT_OBSERVATION_REWARD_KINDS = frozenset(
+    {"USAGE_OBSERVATION", "OPERATIONAL_OUTCOME", "USAGE_SUCCESS_RATE"}
+)
 
 
 def _required_text(value: object, label: str) -> str:
@@ -153,6 +156,22 @@ class RLExperimentSpec:
             "algorithm_config",
             _json_object(self.algorithm_config or {}, "algorithm_config"),
         )
+        reward_kind = self.reward.kind.upper()
+        source_kind = self.reward.config.get("source_kind")
+        normalized_source = source_kind.upper() if isinstance(source_kind, str) else None
+        if (
+            reward_kind in DIRECT_OBSERVATION_REWARD_KINDS
+            or normalized_source in DIRECT_OBSERVATION_REWARD_KINDS
+        ):
+            raise FrontierwrightError(
+                "RL_OBSERVATION_REWARD_REQUIRES_TRANSFORM",
+                (
+                    "Operational usage observations cannot be used directly as RL rewards. "
+                    "Create and validate a separate versioned reward/verifier transformation "
+                    "with explicit provenance first."
+                ),
+                2,
+            )
 
     def to_payload(self) -> dict[str, object]:
         return {

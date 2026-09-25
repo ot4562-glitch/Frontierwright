@@ -20,6 +20,7 @@ from frontierwright.registry import Registry
 from frontierwright.service import (
     CompareView,
     StatusView,
+    WorkloadAcceptanceView,
     WorkloadView,
     get_build_view,
     get_candidates_view,
@@ -806,3 +807,65 @@ async def test_tui_keyboard_measures_selected_candidate_capability(
         "math": 100.0,
         "coding": 100.0,
     }
+
+
+def test_tui_acceptance_experience_is_edition_specific_but_semantically_shared() -> None:
+    workload = WorkloadView(
+        configured=True,
+        profile_id="workload-demo",
+        profile_hash="sha256:workload-demo",
+        profile_name="Measured work",
+        source="EXPLICIT_USER",
+        profile={
+            "languages": ["ko"],
+            "domains": ["economics"],
+            "task_weights": {"research": 1.0},
+            "privacy": "PRIVATE",
+        },
+    )
+    acceptance = WorkloadAcceptanceView(
+        configured=True,
+        contract_id="acceptance-demo",
+        contract_hash="sha256:acceptance-demo",
+        workload_profile_hash="sha256:workload-demo",
+        contract_name="Research quality",
+        active=True,
+        criteria=[
+            {
+                "criterion_id": "research-accuracy",
+                "threshold": 0.8,
+                "unit": "fraction",
+            }
+        ],
+        assessment_id="assessment-demo",
+        overall_status="INCONCLUSIVE",
+    )
+
+    academy = FrontierwrightApp(
+        view=replace(make_view(), edition_profile="ACADEMY"),
+        workload=workload,
+        workload_acceptance=acceptance,
+    )
+    studio = FrontierwrightApp(
+        view=replace(make_view(), edition_profile="STUDIO"),
+        workload=workload,
+        workload_acceptance=acceptance,
+    )
+    lab = FrontierwrightApp(
+        view=replace(make_view(), edition_profile="LAB"),
+        workload=workload,
+        workload_acceptance=acceptance,
+    )
+
+    academy_text = academy._workload_text()
+    studio_text = studio._workload_text()
+    lab_text = lab._workload_text()
+    assert "WHAT COUNTS AS SUCCESS?" in academy_text
+    assert "MORE EVIDENCE NEEDED" in academy_text
+    assert "Next lesson" in academy_text
+    assert "SUCCESS CRITERIA" in studio_text
+    assert "MORE EVIDENCE NEEDED" in studio_text
+    assert "ACCEPTANCE CONTRACT" in lab_text
+    assert "acceptance-demo" in lab_text
+    assert "sha256:acceptance-demo" in lab_text
+    assert "MORE EVIDENCE NEEDED" in lab_text

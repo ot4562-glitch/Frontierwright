@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Iterator
@@ -58,9 +59,13 @@ from frontierwright.recipes import (
 )
 from frontierwright.reference_tokenizer import TokenizerArtifact
 from frontierwright.resources import ResourceSnapshot
+from frontierwright.workload_acceptance import (
+    WorkloadAcceptanceAssessmentV1,
+    WorkloadAcceptanceContractV1,
+)
 from frontierwright.workloads import WorkloadProfile
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 25
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -134,6 +139,52 @@ CREATE TABLE workload_profiles (
     created_at TEXT NOT NULL,
     active INTEGER NOT NULL CHECK (active IN (0,1))
 );
+CREATE TABLE workload_acceptance_contracts (
+    contract_id TEXT PRIMARY KEY,
+    contract_hash TEXT NOT NULL UNIQUE,
+    workload_profile_hash TEXT NOT NULL REFERENCES workload_profiles(profile_hash),
+    contract_name TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    contract_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0,1))
+);
+CREATE UNIQUE INDEX one_active_acceptance_contract_per_workload
+ON workload_acceptance_contracts(workload_profile_hash) WHERE active = 1;
+CREATE TABLE workload_acceptance_assessments (
+    assessment_id TEXT PRIMARY KEY,
+    assessment_hash TEXT NOT NULL UNIQUE,
+    contract_id TEXT NOT NULL REFERENCES workload_acceptance_contracts(contract_id),
+    contract_hash TEXT NOT NULL,
+    workload_profile_hash TEXT NOT NULL,
+    model_id TEXT NOT NULL REFERENCES models(model_id),
+    model_fingerprint TEXT NOT NULL,
+    overall_status TEXT NOT NULL CHECK (
+        overall_status IN ('PASS','FAIL','INCONCLUSIVE','UNKNOWN')),
+    assessment_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE workload_acceptance_assessment_evidence (
+    assessment_id TEXT NOT NULL REFERENCES workload_acceptance_assessments(assessment_id)
+        ON DELETE CASCADE,
+    receipt_id TEXT NOT NULL REFERENCES evaluation_receipts(receipt_id),
+    receipt_sha256 TEXT NOT NULL,
+    PRIMARY KEY (assessment_id, receipt_id)
+);
+CREATE TABLE usage_observations (
+    observation_id TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL REFERENCES models(model_id),
+    model_fingerprint TEXT NOT NULL,
+    workload_profile_hash TEXT,
+    schema_version INTEGER NOT NULL,
+    idempotency_key TEXT,
+    payload_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX unique_usage_observation_retry
+ON usage_observations(model_fingerprint, idempotency_key)
+WHERE idempotency_key IS NOT NULL;
 CREATE TABLE build_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     mode TEXT NOT NULL CHECK (mode IN ('INTENT','TARGETS_FLOORS')),
@@ -584,6 +635,58 @@ DROP TABLE datasets;
 ALTER TABLE datasets_v23 RENAME TO datasets;
 """
 
+MIGRATION_23_TO_24 = """
+CREATE TABLE IF NOT EXISTS workload_acceptance_contracts (
+    contract_id TEXT PRIMARY KEY,
+    contract_hash TEXT NOT NULL UNIQUE,
+    workload_profile_hash TEXT NOT NULL REFERENCES workload_profiles(profile_hash),
+    contract_name TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    contract_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    active INTEGER NOT NULL CHECK (active IN (0,1))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_acceptance_contract_per_workload
+ON workload_acceptance_contracts(workload_profile_hash) WHERE active = 1;
+CREATE TABLE IF NOT EXISTS workload_acceptance_assessments (
+    assessment_id TEXT PRIMARY KEY,
+    assessment_hash TEXT NOT NULL UNIQUE,
+    contract_id TEXT NOT NULL REFERENCES workload_acceptance_contracts(contract_id),
+    contract_hash TEXT NOT NULL,
+    workload_profile_hash TEXT NOT NULL,
+    model_id TEXT NOT NULL REFERENCES models(model_id),
+    model_fingerprint TEXT NOT NULL,
+    overall_status TEXT NOT NULL CHECK (
+        overall_status IN ('PASS','FAIL','INCONCLUSIVE','UNKNOWN')),
+    assessment_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workload_acceptance_assessment_evidence (
+    assessment_id TEXT NOT NULL REFERENCES workload_acceptance_assessments(assessment_id)
+        ON DELETE CASCADE,
+    receipt_id TEXT NOT NULL REFERENCES evaluation_receipts(receipt_id),
+    receipt_sha256 TEXT NOT NULL,
+    PRIMARY KEY (assessment_id, receipt_id)
+);
+"""
+
+MIGRATION_24_TO_25 = """
+CREATE TABLE IF NOT EXISTS usage_observations (
+    observation_id TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL REFERENCES models(model_id),
+    model_fingerprint TEXT NOT NULL,
+    workload_profile_hash TEXT,
+    schema_version INTEGER NOT NULL,
+    idempotency_key TEXT,
+    payload_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS unique_usage_observation_retry
+ON usage_observations(model_fingerprint, idempotency_key)
+WHERE idempotency_key IS NOT NULL;
+"""
+
 MIGRATION_10_TO_11 = """
 CREATE TABLE IF NOT EXISTS model_births (
     model_id TEXT PRIMARY KEY REFERENCES models(model_id),
@@ -594,6 +697,7 @@ CREATE TABLE IF NOT EXISTS model_births (
     created_at TEXT NOT NULL
 );
 """
+
 
 def timestamp() -> str:
     return datetime.now(UTC).isoformat()
@@ -679,6 +783,7 @@ class Registry:
             return
         try:
             connection = sqlite3.connect(self.path, timeout=5)
+            connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
 
@@ -812,9 +917,7 @@ class Registry:
                         "TEXT REFERENCES datasets(dataset_id)"
                     )
                 if "preparation_recipe_id" not in dataset_columns:
-                    connection.execute(
-                        "ALTER TABLE datasets ADD COLUMN preparation_recipe_id TEXT"
-                    )
+                    connection.execute("ALTER TABLE datasets ADD COLUMN preparation_recipe_id TEXT")
                 if "preparation_recipe_hash" not in dataset_columns:
                     connection.execute(
                         "ALTER TABLE datasets ADD COLUMN preparation_recipe_hash TEXT"
@@ -831,13 +934,9 @@ class Registry:
                     "created_at TEXT NOT NULL)"
                 )
                 if "dataset_recipe_id" not in plan_columns:
-                    connection.execute(
-                        "ALTER TABLE plans ADD COLUMN dataset_recipe_id TEXT"
-                    )
+                    connection.execute("ALTER TABLE plans ADD COLUMN dataset_recipe_id TEXT")
                 if "dataset_recipe_hash" not in plan_columns:
-                    connection.execute(
-                        "ALTER TABLE plans ADD COLUMN dataset_recipe_hash TEXT"
-                    )
+                    connection.execute("ALTER TABLE plans ADD COLUMN dataset_recipe_hash TEXT")
                 connection.execute("PRAGMA user_version = 12")
                 self.event(
                     connection,
@@ -853,17 +952,11 @@ class Registry:
                 }
                 connection.execute("BEGIN IMMEDIATE")
                 if "intervention_id" not in plan_columns:
-                    connection.execute(
-                        "ALTER TABLE plans ADD COLUMN intervention_id TEXT"
-                    )
+                    connection.execute("ALTER TABLE plans ADD COLUMN intervention_id TEXT")
                 if "intervention_version" not in plan_columns:
-                    connection.execute(
-                        "ALTER TABLE plans ADD COLUMN intervention_version TEXT"
-                    )
+                    connection.execute("ALTER TABLE plans ADD COLUMN intervention_version TEXT")
                 if "intervention_family" not in plan_columns:
-                    connection.execute(
-                        "ALTER TABLE plans ADD COLUMN intervention_family TEXT"
-                    )
+                    connection.execute("ALTER TABLE plans ADD COLUMN intervention_family TEXT")
                 connection.execute(
                     "UPDATE plans SET intervention_id = CASE path_id "
                     "WHEN 'FROM_SCRATCH_PRETRAINING' THEN 'frontierwright.learn.pretrain' "
@@ -885,8 +978,7 @@ class Registry:
                     "WHERE intervention_family IS NULL"
                 )
                 connection.execute(
-                    "UPDATE plans SET intervention_version = '1' "
-                    "WHERE intervention_version IS NULL"
+                    "UPDATE plans SET intervention_version = '1' WHERE intervention_version IS NULL"
                 )
                 connection.execute("PRAGMA user_version = 13")
                 self.event(
@@ -899,22 +991,15 @@ class Registry:
 
             if version == 13:
                 build_columns = {
-                    str(row[1])
-                    for row in connection.execute("PRAGMA table_info(build_state)")
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(build_state)")
                 }
                 connection.execute("BEGIN IMMEDIATE")
                 if "scale_hash" not in build_columns:
-                    connection.execute(
-                        "ALTER TABLE build_state ADD COLUMN scale_hash TEXT"
-                    )
+                    connection.execute("ALTER TABLE build_state ADD COLUMN scale_hash TEXT")
                 if "scale_id" not in build_columns:
-                    connection.execute(
-                        "ALTER TABLE build_state ADD COLUMN scale_id TEXT"
-                    )
+                    connection.execute("ALTER TABLE build_state ADD COLUMN scale_id TEXT")
                 if "scale_version" not in build_columns:
-                    connection.execute(
-                        "ALTER TABLE build_state ADD COLUMN scale_version TEXT"
-                    )
+                    connection.execute("ALTER TABLE build_state ADD COLUMN scale_version TEXT")
                 connection.execute("PRAGMA user_version = 14")
                 self.event(
                     connection,
@@ -992,13 +1077,9 @@ class Registry:
                     ")"
                 )
                 if "backend_adapter_ref" not in plan_columns:
-                    connection.execute(
-                        "ALTER TABLE plans ADD COLUMN backend_adapter_ref TEXT"
-                    )
+                    connection.execute("ALTER TABLE plans ADD COLUMN backend_adapter_ref TEXT")
                 if "backend_adapter_hash" not in plan_columns:
-                    connection.execute(
-                        "ALTER TABLE plans ADD COLUMN backend_adapter_hash TEXT"
-                    )
+                    connection.execute("ALTER TABLE plans ADD COLUMN backend_adapter_hash TEXT")
                 connection.execute("PRAGMA user_version = 16")
                 self.event(
                     connection,
@@ -1009,9 +1090,7 @@ class Registry:
                 version = 16
 
             if version == 16:
-                run_columns = {
-                    str(row[1]) for row in connection.execute("PRAGMA table_info(runs)")
-                }
+                run_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)")}
                 connection.execute("BEGIN IMMEDIATE")
                 if "usage_json" not in run_columns:
                     connection.execute(
@@ -1153,8 +1232,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
 
             if version == 20:
                 birth_columns = {
-                    str(row[1])
-                    for row in connection.execute("PRAGMA table_info(model_births)")
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(model_births)")
                 }
                 connection.execute("BEGIN IMMEDIATE")
                 if "tokenizer_artifact_id" not in birth_columns:
@@ -1190,9 +1268,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 connection.commit()
                 connection.execute("PRAGMA foreign_keys = OFF")
                 try:
-                    connection.executescript(
-                        "BEGIN IMMEDIATE;" + chr(10) + MIGRATION_22_TO_23
-                    )
+                    connection.executescript("BEGIN IMMEDIATE;" + chr(10) + MIGRATION_22_TO_23)
                     connection.execute("PRAGMA user_version = 23")
                     self.event(
                         connection,
@@ -1205,6 +1281,92 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                         connection.rollback()
                     connection.execute("PRAGMA foreign_keys = ON")
                 version = 23
+
+            if version == 23:
+                connection.executescript("BEGIN IMMEDIATE;" + chr(10) + MIGRATION_23_TO_24)
+                connection.execute("PRAGMA user_version = 24")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 23, "to_version": 24},
+                )
+                connection.commit()
+                version = 24
+
+            if version == 24:
+                connection.executescript("BEGIN IMMEDIATE;" + chr(10) + MIGRATION_24_TO_25)
+                rows = connection.execute(
+                    "SELECT recorded_at, details FROM events "
+                    "WHERE kind = 'USAGE_OBSERVATION_RECORDED' ORDER BY sequence"
+                ).fetchall()
+                for row in rows:
+                    try:
+                        payload = json.loads(str(row["details"]))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    observation_id = payload.get("observation_id")
+                    model_id = payload.get("model_id")
+                    model_fingerprint = payload.get("model_fingerprint")
+                    schema_version = payload.get("schema_version")
+                    if (
+                        not isinstance(observation_id, str)
+                        or not isinstance(model_id, str)
+                        or not isinstance(model_fingerprint, str)
+                        or isinstance(schema_version, bool)
+                        or not isinstance(schema_version, int)
+                    ):
+                        continue
+                    encoded = json.dumps(
+                        payload,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    )
+                    payload_hash = (
+                        "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+                    )
+                    try:
+                        connection.execute(
+                            "INSERT INTO usage_observations ("
+                            "observation_id, model_id, model_fingerprint, workload_profile_hash, "
+                            "schema_version, idempotency_key, payload_hash, payload_json, "
+                            "created_at"
+                            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                observation_id,
+                                model_id,
+                                model_fingerprint,
+                                payload.get("workload_profile_hash"),
+                                schema_version,
+                                payload.get("idempotency_key"),
+                                payload_hash,
+                                encoded,
+                                str(row["recorded_at"]),
+                            ),
+                        )
+                    except sqlite3.IntegrityError:
+                        existing = connection.execute(
+                            "SELECT payload_hash FROM usage_observations WHERE observation_id = ? "
+                            "OR (model_fingerprint = ? AND idempotency_key = ?)",
+                            (
+                                observation_id,
+                                model_fingerprint,
+                                payload.get("idempotency_key"),
+                            ),
+                        ).fetchone()
+                        if existing is None or str(existing["payload_hash"]) != payload_hash:
+                            raise
+                connection.execute("PRAGMA user_version = 25")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 24, "to_version": 25},
+                )
+                connection.commit()
+                version = 25
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -1355,7 +1517,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     f"schema_version = {SCHEMA_VERSION}",
                     f'project_id = "{project["project_id"]}"',
                     f'identity_id = "{project["identity_id"]}"',
-                    f'name = {json.dumps(project["name"], ensure_ascii=False)}',
+                    f"name = {json.dumps(project['name'], ensure_ascii=False)}",
                     f'language = "{project["language"]}"',
                     f'origin = "{project["origin"]}"',
                     f'edition_profile = "{project["edition_profile"]}"',
@@ -1400,6 +1562,111 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             raise FrontierwrightError("EVENT_KIND_INVALID", "Event kind must be nonempty.", 2)
         with self.connect(write=True) as connection:
             self.event(connection, kind, details)
+
+    def record_usage_observation_atomic(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        """Persist one observation and its history event in the same transaction."""
+
+        observation_id = payload.get("observation_id")
+        model_id = payload.get("model_id")
+        model_fingerprint = payload.get("model_fingerprint")
+        schema_version = payload.get("schema_version")
+        if (
+            not isinstance(observation_id, str)
+            or not observation_id
+            or not isinstance(model_id, str)
+            or not model_id
+            or not isinstance(model_fingerprint, str)
+            or not model_fingerprint
+            or isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+        ):
+            raise FrontierwrightError(
+                "INVALID_USAGE_OBSERVATION",
+                "Observation persistence requires exact IDs, fingerprint, and schema version.",
+                2,
+            )
+        raw_idempotency = payload.get("idempotency_key")
+        idempotency_key = raw_idempotency if isinstance(raw_idempotency, str) else None
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        payload_hash = "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+        with self.connect(write=True) as connection:
+            if idempotency_key is not None:
+                existing = connection.execute(
+                    "SELECT payload_hash, payload_json FROM usage_observations "
+                    "WHERE model_fingerprint = ? AND idempotency_key = ?",
+                    (model_fingerprint, idempotency_key),
+                ).fetchone()
+            else:
+                existing = connection.execute(
+                    "SELECT payload_hash, payload_json FROM usage_observations "
+                    "WHERE observation_id = ?",
+                    (observation_id,),
+                ).fetchone()
+            if existing is not None:
+                if str(existing["payload_hash"]) != payload_hash:
+                    raise FrontierwrightError(
+                        "USAGE_OBSERVATION_IDEMPOTENCY_CONFLICT",
+                        "The idempotency key already identifies different usage evidence.",
+                        13,
+                    )
+                decoded = json.loads(str(existing["payload_json"]))
+                if not isinstance(decoded, dict):
+                    raise FrontierwrightError(
+                        "REGISTRY_ERROR",
+                        "Stored usage observation payload is invalid.",
+                        4,
+                    )
+                return True, decoded
+
+            connection.execute(
+                "INSERT INTO usage_observations ("
+                "observation_id, model_id, model_fingerprint, workload_profile_hash, "
+                "schema_version, idempotency_key, payload_hash, payload_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    observation_id,
+                    model_id,
+                    model_fingerprint,
+                    payload.get("workload_profile_hash"),
+                    schema_version,
+                    idempotency_key,
+                    payload_hash,
+                    encoded,
+                    timestamp(),
+                ),
+            )
+            self.event(connection, "USAGE_OBSERVATION_RECORDED", payload)
+        return False, dict(payload)
+
+    def list_usage_observation_payloads(
+        self,
+        *,
+        model_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT payload_json FROM usage_observations"
+        params: tuple[object, ...] = ()
+        if model_id is not None:
+            query += " WHERE model_id = ?"
+            params = (model_id,)
+        query += " ORDER BY created_at, observation_id"
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        payloads: list[dict[str, Any]] = []
+        for row in rows:
+            decoded = json.loads(str(row["payload_json"]))
+            if isinstance(decoded, dict):
+                payloads.append(decoded)
+        return payloads
 
     @staticmethod
     def insert_model(connection: sqlite3.Connection, model: ModelState) -> None:
@@ -1668,8 +1935,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 ),
             )
             connection.execute(
-                "UPDATE project SET champion_id = ?, history_confidence = ? "
-                "WHERE singleton = 1",
+                "UPDATE project SET champion_id = ?, history_confidence = ? WHERE singleton = 1",
                 (model.model_id, HistoryConfidence.COMPLETE.value),
             )
             self.event(
@@ -1760,11 +2026,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     isinstance(weight, bool)
                     or not isinstance(weight, (int, float))
                     or float(weight) <= 0.0
-                    or (
-                        float(weight) > 1.0
-                        if upper_inclusive
-                        else float(weight) >= 1.0
-                    )
+                    or (float(weight) > 1.0 if upper_inclusive else float(weight) >= 1.0)
                 )
                 if invalid_weight:
                     raise FrontierwrightError(
@@ -2248,12 +2510,8 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     "SELECT sequence FROM events ORDER BY sequence DESC LIMIT 1"
                 ).fetchone()
                 actual_state: dict[str, str | None] = {
-                    "champion_id": (
-                        str(champion_id) if champion_id is not None else None
-                    ),
-                    "build_updated_at": (
-                        str(build["updated_at"]) if build is not None else None
-                    ),
+                    "champion_id": (str(champion_id) if champion_id is not None else None),
+                    "build_updated_at": (str(build["updated_at"]) if build is not None else None),
                     "champion_profile_id": (
                         str(champion_profile["profile_id"])
                         if champion_profile is not None
@@ -2456,8 +2714,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
     def list_lab_adapters(self) -> tuple[dict[str, Any], ...]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM lab_adapters WHERE active = 1 "
-                "ORDER BY adapter_id, adapter_version"
+                "SELECT * FROM lab_adapters WHERE active = 1 ORDER BY adapter_id, adapter_version"
             ).fetchall()
             items: list[dict[str, Any]] = []
             for row in rows:
@@ -2626,8 +2883,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
     def latest_calibration_for_plan(self, plan_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM calibrations WHERE plan_id = ? "
-                "ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM calibrations WHERE plan_id = ? ORDER BY created_at DESC LIMIT 1",
                 (plan_id,),
             ).fetchone()
             if row is None:
@@ -2712,8 +2968,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 )
 
             calibration = connection.execute(
-                "SELECT calibration_id FROM calibrations "
-                "WHERE calibration_id = ? AND plan_id = ?",
+                "SELECT calibration_id FROM calibrations WHERE calibration_id = ? AND plan_id = ?",
                 (calibration_id, plan_id),
             ).fetchone()
             if calibration is None:
@@ -2849,10 +3104,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     3,
                 )
             if row["result_sha256"] is not None:
-                if (
-                    row["result_sha256"] == result_sha256
-                    and row["result_json"] == serialized
-                ):
+                if row["result_sha256"] == result_sha256 and row["result_json"] == serialized:
                     return
                 raise FrontierwrightError(
                     "RUN_RESULT_CONFLICT",
@@ -3058,7 +3310,6 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             ).fetchall()
             return tuple(dict(row) for row in rows)
 
-
     def register_dataset(
         self,
         descriptor: DatasetDescriptor,
@@ -3073,9 +3324,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
         token_count: int | None = None,
     ) -> str:
         require_text(name, "dataset name")
-        effective_classification = (
-            classification or default_dataset_classification(provenance)
-        )
+        effective_classification = classification or default_dataset_classification(provenance)
         if token_count is not None and token_count < 0:
             raise FrontierwrightError(
                 "INVALID_TOKEN_COUNT",
@@ -3210,9 +3459,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             effective_text: dict[str, str | None] = {}
             for key in ("license", "domain", "language"):
                 value = overrides.get(key, source[key])
-                if value is not None and (
-                    not isinstance(value, str) or not value.strip()
-                ):
+                if value is not None and (not isinstance(value, str) or not value.strip()):
                     raise FrontierwrightError(
                         "DATASET_METADATA_INVALID",
                         f"Prepared dataset {key} must be nonempty text or null.",
@@ -3535,10 +3782,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
         if row is None:
             return ()
         raw = json.loads(row["stats_json"])
-        return tuple(
-            CapabilityStat(**{**item, "axis": Axis(item["axis"])})
-            for item in raw
-        )
+        return tuple(CapabilityStat(**{**item, "axis": Axis(item["axis"])}) for item in raw)
 
     def _current_build_mode(self, connection: sqlite3.Connection) -> BuildMode:
         project = connection.execute(
@@ -3700,6 +3944,330 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
     def get_active_workload_profile(self) -> dict[str, Any] | None:
         return self.read().workload_profile
 
+    @staticmethod
+    def _decode_acceptance_contract_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["active"] = bool(result["active"])
+        result["contract"] = json.loads(result.pop("contract_json"))
+        return result
+
+    @staticmethod
+    def _decode_acceptance_assessment_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["assessment"] = json.loads(result.pop("assessment_json"))
+        return result
+
+    def save_workload_acceptance_contract(
+        self,
+        contract: WorkloadAcceptanceContractV1,
+    ) -> dict[str, Any]:
+        payload = contract.to_payload()
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        with self.connect(write=True) as connection:
+            profile = connection.execute(
+                "SELECT profile_hash FROM workload_profiles WHERE profile_hash = ?",
+                (contract.workload_profile_hash,),
+            ).fetchone()
+            if profile is None:
+                raise FrontierwrightError(
+                    "WORKLOAD_ACCEPTANCE_PROFILE_NOT_FOUND",
+                    (
+                        "Acceptance contract references a workload profile "
+                        "not present in this project."
+                    ),
+                    12,
+                )
+
+            existing = connection.execute(
+                "SELECT * FROM workload_acceptance_contracts WHERE contract_hash = ?",
+                (contract.contract_hash,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["contract_json"]) != encoded:
+                    raise FrontierwrightError(
+                        "WORKLOAD_ACCEPTANCE_CONTRACT_CONFLICT",
+                        "Acceptance contract hash already exists with different content.",
+                        13,
+                    )
+                if not bool(existing["active"]):
+                    connection.execute(
+                        "UPDATE workload_acceptance_contracts SET active = 0 "
+                        "WHERE workload_profile_hash = ?",
+                        (contract.workload_profile_hash,),
+                    )
+                    connection.execute(
+                        "UPDATE workload_acceptance_contracts SET active = 1 WHERE contract_id = ?",
+                        (contract.contract_id,),
+                    )
+                    self.event(
+                        connection,
+                        "WORKLOAD_ACCEPTANCE_CONTRACT_ACTIVATED",
+                        {
+                            "contract_id": contract.contract_id,
+                            "contract_hash": contract.contract_hash,
+                            "workload_profile_hash": contract.workload_profile_hash,
+                        },
+                    )
+                stored_id = contract.contract_id
+            else:
+                connection.execute(
+                    "UPDATE workload_acceptance_contracts SET active = 0 "
+                    "WHERE workload_profile_hash = ?",
+                    (contract.workload_profile_hash,),
+                )
+                connection.execute(
+                    "INSERT INTO workload_acceptance_contracts ("
+                    "contract_id, contract_hash, workload_profile_hash, contract_name, "
+                    "schema_version, contract_json, created_at, active"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                    (
+                        contract.contract_id,
+                        contract.contract_hash,
+                        contract.workload_profile_hash,
+                        contract.name,
+                        contract.schema_version,
+                        encoded,
+                        timestamp(),
+                    ),
+                )
+                self.event(
+                    connection,
+                    "WORKLOAD_ACCEPTANCE_CONTRACT_SET",
+                    {
+                        "contract_id": contract.contract_id,
+                        "contract_hash": contract.contract_hash,
+                        "workload_profile_hash": contract.workload_profile_hash,
+                        "criterion_count": len(contract.criteria),
+                    },
+                )
+                stored_id = contract.contract_id
+
+        stored = self.get_workload_acceptance_contract(stored_id)
+        if stored is None:
+            raise FrontierwrightError(
+                "REGISTRY_ERROR",
+                "Acceptance contract was not readable after persistence.",
+                4,
+            )
+        return stored
+
+    def get_workload_acceptance_contract(self, contract_ref: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workload_acceptance_contracts "
+                "WHERE contract_id = ? OR contract_hash = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (contract_ref, contract_ref),
+            ).fetchone()
+            return self._decode_acceptance_contract_row(row) if row is not None else None
+
+    def get_active_workload_acceptance_contract(
+        self,
+        workload_profile_hash: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workload_acceptance_contracts "
+                "WHERE workload_profile_hash = ? AND active = 1 "
+                "ORDER BY created_at DESC LIMIT 1",
+                (workload_profile_hash,),
+            ).fetchone()
+            return self._decode_acceptance_contract_row(row) if row is not None else None
+
+    def store_workload_acceptance_assessment(
+        self,
+        assessment: WorkloadAcceptanceAssessmentV1,
+    ) -> dict[str, Any]:
+        payload = assessment.to_payload()
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        with self.connect(write=True) as connection:
+            contract = connection.execute(
+                "SELECT contract_hash, workload_profile_hash FROM "
+                "workload_acceptance_contracts WHERE contract_id = ?",
+                (assessment.contract_id,),
+            ).fetchone()
+            if contract is None:
+                raise FrontierwrightError(
+                    "WORKLOAD_ACCEPTANCE_CONTRACT_NOT_FOUND",
+                    "Acceptance assessment references an unknown contract.",
+                    12,
+                )
+            if (
+                str(contract["contract_hash"]) != assessment.contract_hash
+                or str(contract["workload_profile_hash"]) != assessment.workload_profile_hash
+            ):
+                raise FrontierwrightError(
+                    "WORKLOAD_ACCEPTANCE_CONTRACT_MISMATCH",
+                    "Assessment contract/workload identity does not match the registry.",
+                    12,
+                )
+
+            model_row = connection.execute(
+                "SELECT snapshot FROM models WHERE model_id = ?",
+                (assessment.model_id,),
+            ).fetchone()
+            if model_row is None:
+                raise FrontierwrightError(
+                    "WORKLOAD_ACCEPTANCE_MODEL_NOT_FOUND",
+                    "Acceptance assessment references an unknown model.",
+                    12,
+                )
+            if decode_model(model_row["snapshot"]).fingerprint != assessment.model_fingerprint:
+                raise FrontierwrightError(
+                    "WORKLOAD_ACCEPTANCE_MODEL_MISMATCH",
+                    "Acceptance assessment model fingerprint does not match the registry.",
+                    12,
+                )
+
+            existing = connection.execute(
+                "SELECT assessment_hash, assessment_json FROM "
+                "workload_acceptance_assessments WHERE assessment_id = ?",
+                (assessment.assessment_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["assessment_hash"]) == assessment.assessment_hash
+                    and str(existing["assessment_json"]) == encoded
+                ):
+                    stored = self._decode_acceptance_assessment_row(existing)
+                    stored["assessment_id"] = assessment.assessment_id
+                    return stored
+                raise FrontierwrightError(
+                    "WORKLOAD_ACCEPTANCE_ASSESSMENT_CONFLICT",
+                    "Assessment ID already exists with different content.",
+                    13,
+                )
+
+            evidence_rows: list[tuple[str, str]] = []
+            for evidence in assessment.evidence_refs:
+                receipt_id = str(evidence.get("receipt_id", ""))
+                receipt_sha256 = str(evidence.get("receipt_sha256", ""))
+                receipt = connection.execute(
+                    "SELECT receipt_sha256 FROM evaluation_receipts WHERE receipt_id = ?",
+                    (receipt_id,),
+                ).fetchone()
+                if receipt is None:
+                    raise FrontierwrightError(
+                        "WORKLOAD_ACCEPTANCE_EVIDENCE_NOT_FOUND",
+                        f"Acceptance evidence receipt is not registered: {receipt_id}",
+                        12,
+                    )
+                if str(receipt["receipt_sha256"]) != receipt_sha256:
+                    raise FrontierwrightError(
+                        "WORKLOAD_ACCEPTANCE_EVIDENCE_MISMATCH",
+                        f"Acceptance evidence receipt digest changed: {receipt_id}",
+                        13,
+                    )
+                evidence_rows.append((receipt_id, receipt_sha256))
+
+            connection.execute(
+                "INSERT INTO workload_acceptance_assessments ("
+                "assessment_id, assessment_hash, contract_id, contract_hash, "
+                "workload_profile_hash, model_id, model_fingerprint, overall_status, "
+                "assessment_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    assessment.assessment_id,
+                    assessment.assessment_hash,
+                    assessment.contract_id,
+                    assessment.contract_hash,
+                    assessment.workload_profile_hash,
+                    assessment.model_id,
+                    assessment.model_fingerprint,
+                    assessment.overall_status.value,
+                    encoded,
+                    timestamp(),
+                ),
+            )
+            for receipt_id, receipt_sha256 in evidence_rows:
+                connection.execute(
+                    "INSERT INTO workload_acceptance_assessment_evidence "
+                    "(assessment_id, receipt_id, receipt_sha256) VALUES (?, ?, ?)",
+                    (assessment.assessment_id, receipt_id, receipt_sha256),
+                )
+            self.event(
+                connection,
+                "WORKLOAD_ACCEPTANCE_ASSESSED",
+                {
+                    "assessment_id": assessment.assessment_id,
+                    "assessment_hash": assessment.assessment_hash,
+                    "contract_id": assessment.contract_id,
+                    "contract_hash": assessment.contract_hash,
+                    "workload_profile_hash": assessment.workload_profile_hash,
+                    "model_id": assessment.model_id,
+                    "model_fingerprint": assessment.model_fingerprint,
+                    "overall_status": assessment.overall_status.value,
+                    "receipt_ids": [row[0] for row in evidence_rows],
+                },
+            )
+
+        persisted = self.get_workload_acceptance_assessment(assessment.assessment_id)
+        if persisted is None:
+            raise FrontierwrightError(
+                "REGISTRY_ERROR",
+                "Acceptance assessment was not readable after persistence.",
+                4,
+            )
+        return persisted
+
+    def get_workload_acceptance_assessment(
+        self,
+        assessment_ref: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workload_acceptance_assessments "
+                "WHERE assessment_id = ? OR assessment_hash = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (assessment_ref, assessment_ref),
+            ).fetchone()
+            if row is None:
+                return None
+            result = self._decode_acceptance_assessment_row(row)
+            evidence = connection.execute(
+                "SELECT receipt_id, receipt_sha256 FROM "
+                "workload_acceptance_assessment_evidence WHERE assessment_id = ? "
+                "ORDER BY receipt_id",
+                (str(result["assessment_id"]),),
+            ).fetchall()
+            result["evidence_refs"] = [dict(item) for item in evidence]
+            return result
+
+    def get_latest_workload_acceptance_assessment(
+        self,
+        contract_id: str,
+        model_id: str,
+        model_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workload_acceptance_assessments "
+                "WHERE contract_id = ? AND model_id = ? AND model_fingerprint = ? "
+                "ORDER BY created_at DESC, assessment_id DESC LIMIT 1",
+                (contract_id, model_id, model_fingerprint),
+            ).fetchone()
+            if row is None:
+                return None
+            result = self._decode_acceptance_assessment_row(row)
+            evidence = connection.execute(
+                "SELECT receipt_id, receipt_sha256 FROM "
+                "workload_acceptance_assessment_evidence WHERE assessment_id = ? "
+                "ORDER BY receipt_id",
+                (str(result["assessment_id"]),),
+            ).fetchall()
+            result["evidence_refs"] = [dict(item) for item in evidence]
+            return result
+
     def save_resource_snapshot(
         self,
         snapshot: ResourceSnapshot,
@@ -3771,8 +4339,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             )
 
             resource_row = connection.execute(
-                "SELECT * FROM resource_profiles WHERE active = 1 "
-                "ORDER BY created_at DESC LIMIT 1"
+                "SELECT * FROM resource_profiles WHERE active = 1 ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
             resource_profile = dict(resource_row) if resource_row else None
             if resource_profile is not None:
@@ -3780,15 +4347,12 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 resource_profile["active"] = bool(resource_profile["active"])
 
             workload_row = connection.execute(
-                "SELECT * FROM workload_profiles WHERE active = 1 "
-                "ORDER BY created_at DESC LIMIT 1"
+                "SELECT * FROM workload_profiles WHERE active = 1 ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
             workload_profile = dict(workload_row) if workload_row else None
             if workload_profile is not None:
                 workload_profile["active"] = bool(workload_profile["active"])
-                workload_profile["profile"] = json.loads(
-                    workload_profile.pop("profile_json")
-                )
+                workload_profile["profile"] = json.loads(workload_profile.pop("profile_json"))
 
             build_row = connection.execute(
                 "SELECT * FROM build_state WHERE singleton = 1"
@@ -3820,9 +4384,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 capability_profile = dict(profile_row) if profile_row else None
                 if capability_profile is not None:
                     capability_profile["active"] = bool(capability_profile["active"])
-                    capability_profile["stats"] = json.loads(
-                        capability_profile.pop("stats_json")
-                    )
+                    capability_profile["stats"] = json.loads(capability_profile.pop("stats_json"))
                     capability_profile["conditions"] = json.loads(
                         capability_profile.pop("conditions_json")
                     )
@@ -3840,9 +4402,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 datasets.append(dataset)
 
             plans: list[dict[str, Any]] = []
-            for plan_row in connection.execute(
-                "SELECT * FROM plans ORDER BY created_at, plan_id"
-            ):
+            for plan_row in connection.execute("SELECT * FROM plans ORDER BY created_at, plan_id"):
                 plan = dict(plan_row)
                 plan["budgets"] = json.loads(plan.pop("budgets_json"))
                 plan["config"] = json.loads(plan.pop("config_json"))
@@ -3854,9 +4414,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             ):
                 calibration = dict(calibration_row)
                 calibration["feasible"] = bool(calibration["feasible"])
-                calibration["backend_result"] = json.loads(
-                    calibration.pop("result_json")
-                )
+                calibration["backend_result"] = json.loads(calibration.pop("result_json"))
                 calibrations.append(calibration)
 
             runs: list[dict[str, Any]] = []

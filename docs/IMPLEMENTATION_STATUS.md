@@ -1,6 +1,6 @@
 # Frontierwright Implementation Status
 
-Updated: 2026-09-24
+Updated: 2026-09-25
 
 This document keeps the detailed engineering inventory out of the public README.
 The README explains the product and fastest path to trying it; this file records the
@@ -14,7 +14,7 @@ Implemented now:
 - Apache-2.0 `LICENSE` and `NOTICE`;
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
-- automatic registry migration through schema v20, including persisted edition profiles, zero-model birth provenance, trainable tokenizer artifacts, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, Lab adapter manifests, durable run-usage receipts, preference-dataset role support, and multi-parent model lineage edges;
+- automatic registry migration through schema v25, including persisted edition profiles, zero-model birth provenance, trainable tokenizer artifacts, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, Lab adapter manifests, durable run-usage receipts, preference-dataset role support, and multi-parent model lineage edges;
 - current-champion semantics: historical model states never inflate the current displayed stats;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
@@ -25,11 +25,12 @@ Implemented now:
 - actual local CPU/RAM/disk/NVIDIA GPU detection with `DETECTED` provenance;
 - detected resource profiles persisted in SQLite and shown through CLI/JSON/TUI;
 - versioned Workload Profiles persist explicit languages/domains/task mixture, context demand, latency/throughput constraints, privacy boundary, hard capability floors, and optional explicit decision-utility weights/scales;
-- Workload Fit evaluates explicit measurable requirements as PASS / FAIL / UNKNOWN from exact current-model evidence, keeps workload-evaluation coverage separate from success, and refuses to treat generic capability or complete coverage as proof of user-domain performance;
-- Candidate promotion now hard-gates configured measurable workload requirements: FAIL/UNKNOWN blocks default promotion, the exact Workload Profile/gate evidence is persisted with the decision, and profile/evidence changes invalidate the gate transactionally before Champion mutation;
-- an edition-aware evidence planner maps UNKNOWN constraints to the next required measurement and measured FAIL constraints to bounded, falsifiable experiments; it exposes the same logic through `frontierwright workload next` and the TUI while deliberately returning no predicted performance gain;
-- Candidate comparison includes a raw Pareto surface across comparable capability, serving latency/TTFT/TPOT/throughput, measured VRAM/RSS, and artifact-storage evidence; unknown or mismatched runtime conditions remain unknown;
-- optional user utility is computed only when the user supplies both a positive weight and normalization scale for every selected measured metric; missing evidence yields INCOMPLETE, raw Pareto evidence remains visible, and utility never auto-promotes a Candidate;
+- Workload Fit evaluates explicit measurable requirements as PASS / FAIL / INCONCLUSIVE / UNKNOWN from exact current-model evidence, keeps workload-evaluation coverage separate from success, and refuses to treat generic capability or complete coverage as proof of user-domain performance; human surfaces translate unresolved internal states into `MEASUREMENT NEEDED` / `MORE EVIDENCE NEEDED` with concrete next actions;
+- immutable Workload Acceptance v1 contracts bind exact workload revision, task/version/metric, unit, threshold direction, evaluator conditions, and deterministic-point or explicit-confidence-interval evidence rules; `frontierwright workload acceptance create/show/assess` persists auditable assessments without auto-promotion;
+- Candidate promotion hard-gates configured measurable workload requirements: FAIL/UNKNOWN/INCONCLUSIVE blocks default promotion, the exact Workload Profile/gate evidence is persisted with the decision, and profile/evidence changes invalidate the gate transactionally before Champion mutation;
+- an edition-aware evidence planner maps missing constraints to the next required measurement, INCONCLUSIVE constraints to additional compatible sampling, and measured FAIL constraints to bounded, falsifiable experiments; it exposes the same logic through `frontierwright workload next` and the TUI while deliberately returning no predicted performance gain;
+- Candidate comparison includes a raw Pareto surface across comparable capability, serving latency/TTFT/TPOT/throughput, measured VRAM/RSS, and artifact-storage evidence; incomplete material dimensions explicitly limit relation scope to measured evidence and block unqualified dominance claims;
+- optional user utility is computed only when the user supplies both a positive weight and normalization scale for every selected measured metric; missing evidence yields INCOMPLETE, regressions remain visible, utility never auto-promotes a Candidate, and practical improvement margins plus fit gates qualify local decision claims; adaptive candidate selection does not produce an unqualified scientific “better for this workload” statement without independent confirmation;
 - bf16/fp16 kept `UNKNOWN` until backend-specific capability calibration instead of hardware-name guessing;
 - raw benchmark `EvaluationReceipt` ingestion with exact model-id/fingerprint matching;
 - strict lm-evaluation-harness result import pins exact harness revision, source hash, task/version/metric identity, standard-error metadata and metric direction while keeping external results as raw evidence until an explicit frozen scale maps them;
@@ -107,26 +108,29 @@ Implemented now:
 - training creates a `PENDING` candidate and never silently changes the champion;
 - candidate compare/promote/reject surfaces preserve explicit human ownership of champion selection;
 - `frontierwright workload compare-models` compares any two registered models, including a historical stock/open baseline and an already-promoted descendant, without requiring Candidate status; it reuses measured capability/workload/serving/resource/storage/Pareto/user-utility evidence and never fills missing dimensions from parameter-count guesses;
-- privacy-minimal Usage Observations bind SUCCESS/FAILURE/CORRECTED/ABSTAINED outcomes to the exact model fingerprint and active workload hash without storing prompt/response content; optional idempotency keys make connector retries safe while repeated real uses remain distinct evidence;
-- real-use summaries expose task/failure-category counts and Wilson uncertainty for direct-success rates, and repeated failures/corrections feed the evidence-driven fit planner without being mislabeled as RL rewards or predicted gains;
+- privacy-minimal Usage Observations bind SUCCESS/FAILURE/CORRECTED/ABSTAINED outcomes to the exact model fingerprint and active workload hash without storing prompt/response content; schema v25 persists each observation plus idempotency identity atomically with its history event, concurrent identical retries collapse to one event, and conflicting payload reuse is rejected;
+- real-use summaries default to the exact active workload revision rather than pooling changed requirements, expose excluded older cohorts plus task/failure-category counts and Wilson uncertainty for direct-success rates, and feed repeated failures/corrections into the evidence planner without being mislabeled as RL rewards or predicted gains; the RL contract rejects operational observations as direct reward sources without a separate versioned transformation;
 - promotion re-checks current champion/build/evaluation state transactionally, enforces frozen-scale build floors by default, and records explicit override evidence when a user intentionally accepts an unmeasured or build-violating candidate;
-- stable JSON/non-interactive machine surfaces for project/model/birth/evolve/optimize/operate/export/generation/resource/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter operations;
-- mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / HISTORY / CANDIDATES;
+- a bounded Lab Slurm executor accepts only controlled-private manifests, forbids profile-embedded secrets, hash-pins scheduler/worker configuration, requires the v1 shared-filesystem contract, records scheduler/accounting evidence, blocks profile drift before submission, and is exposed through `frontierwright lab slurm inspect` / `frontierwright lab slurm backend-spec`; this is one validated scheduler bridge, not generic distributed-training support;
+- stable JSON/non-interactive machine surfaces for project/model/birth/evolve/optimize/operate/export/generation/resource/workload/acceptance/observation/build/stats/evaluation/data/path/plan/run/candidate/Lab-adapter/Slurm operations;
+- mandatory Textual keyboard TUI shell with CHARACTER / BUILD / PATHS / RESOURCES / DATA / WORKLOAD / HISTORY / CANDIDATES, with edition-specific workload/acceptance explanations while sharing identical evidence semantics;
 - English/Korean human-string structure;
 - automated domain, migration, evaluation, execution recovery/idempotency, artifact integrity, candidate, model fingerprint/history, resource, data, path, build, CLI JSON, lineage, and TUI keyboard tests.
 
 Not implemented yet:
 
 - broad arbitrary-Hugging-Face production adapters; the built-in QLoRA path is intentionally a narrow Frontierwright-reference implementation rather than a claim of arbitrary-architecture compatibility;
+- production external RL adapters such as verl/OpenRLHF with validated rollout/checkpoint/restart semantics; the built-in verifier-driven REINFORCE path remains a real but narrow reference implementation;
+- validated adaptive/IRT evaluation suitable for release decisions; current adaptive/IRT work remains a research direction rather than a production evaluator;
 - OS/filesystem-enforced storage quotas with zero polling overshoot, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
 - public dataset discovery/download adapters and richer prepared tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
-- remote/server/Slurm executor implementations and concrete private Lab adapters;
+- broader remote/server executors, multi-node framework-specific topology/checkpoint guarantees, and concrete production private Lab trainer integrations beyond the bounded Slurm v1 bridge;
 - stronger executor-boundary attestation beyond the current adapter-declared trust contract.
 
-Those surfaces remain explicitly `NOT_READY` / `UNKNOWN` rather than using fake data.
+Those unsupported surfaces remain explicitly `NOT_READY`; measurable gaps use actionable measurement states rather than pretending unmeasured values are known.
 
 ## Verification
 
-The canonical candidate gate is implemented in `tools/v1_release_gate.py`.
+The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc2 development-integrity gate is `tools/rc2_release_gate.py`; it covers workload acceptance, measurement resolution, promotion integrity, comparison claims, atomic observations, the RL boundary, edition UX, bounded Slurm execution, packaging, and real training/RL smokes.
 See the root README for current development status and verification commands.
 

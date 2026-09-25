@@ -62,6 +62,27 @@ def test_unknown_evidence_is_measured_before_intervention() -> None:
     assert "tasks=research" in plan.opportunities[-1].reason
 
 
+
+
+def test_inconclusive_fit_schedules_more_measurement_instead_of_stalling() -> None:
+    plan = plan_fit_opportunities(
+        edition=EditionProfile.STUDIO,
+        model_id="model-1",
+        workload_configured=True,
+        constraints=[_constraint("evaluation.workload_acceptance", "INCONCLUSIVE")],
+        model_fit={},
+        workload_evaluation_coverage={"complete": True},
+    )
+
+    assert [item.opportunity_id for item in plan.opportunities] == [
+        "reduce-decision-uncertainty"
+    ]
+    opportunity = plan.opportunities[0]
+    assert opportunity.opportunity_class is OpportunityClass.BLOCKING_EVIDENCE
+    assert "additional compatible" in opportunity.action
+    assert "budget" in opportunity.success_criterion.lower()
+    assert opportunity.improvement_prediction is None
+
 def test_failed_fit_creates_falsifiable_training_and_efficiency_experiments() -> None:
     plan = plan_fit_opportunities(
         edition=EditionProfile.LAB,

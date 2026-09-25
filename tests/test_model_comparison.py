@@ -206,6 +206,11 @@ def test_compare_models_keeps_stock_baseline_after_descendant_promotion(tmp_path
     assert utility["status"] == "COMPLETE"
     assert utility["relation"] == "CANDIDATE_PREFERRED"
     assert utility["utility_delta"] == pytest.approx(1.0)
+    claim = view.pareto["workload_decision_claim"]
+    assert isinstance(claim, dict)
+    assert claim["decision_eligible"] is False
+    assert claim["better_for_workload_statement_allowed"] is False
+    assert "PRACTICAL_IMPROVEMENT_MARGIN_MISSING" in claim["reasons"]
 
 
 def test_compare_models_cli_json_is_candidate_status_independent(tmp_path: Path) -> None:

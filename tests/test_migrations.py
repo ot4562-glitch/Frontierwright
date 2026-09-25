@@ -54,12 +54,10 @@ def test_previous_registry_versions_migrate_to_current(
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
 
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
     assert "model_artifacts" in tables
     assert "resource_profiles" in tables
     assert "build_state" in tables
@@ -127,7 +125,7 @@ def test_v7_running_attempt_migrates_to_incomplete(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
 
 
 def test_v7_migrated_plan_column_order_accepts_new_plan(tmp_path: Path) -> None:
@@ -292,7 +290,7 @@ def test_v9_project_migrates_to_origin_appropriate_edition_profile(
     assert state.project["edition_profile"] == "ACADEMY"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
 
 
 def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
@@ -310,18 +308,12 @@ def test_v11_migrates_data_recipe_schema(tmp_path: Path) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
-        dataset_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(datasets)")
-        }
-        plan_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(plans)")
-        }
+        dataset_columns = {row[1] for row in connection.execute("PRAGMA table_info(datasets)")}
+        plan_columns = {row[1] for row in connection.execute("PRAGMA table_info(plans)")}
 
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
     assert "data_recipes" in tables
     assert {
         "source_dataset_id",
@@ -383,7 +375,7 @@ def test_v12_backfills_intervention_identity_for_existing_plan(tmp_path: Path) -
     assert plan.intervention_family == "SPECIALIZE"
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
 
 
 def test_v13_binds_numeric_build_schema_without_inventing_scale(
@@ -408,8 +400,7 @@ def test_v13_binds_numeric_build_schema_without_inventing_scale(
             """
         )
         connection.execute(
-            "INSERT INTO build_state VALUES "
-            "(1, 'TARGETS_FLOORS', NULL, NULL, ?, ?, ?)",
+            "INSERT INTO build_state VALUES (1, 'TARGETS_FLOORS', NULL, NULL, ?, ?, ?)",
             (
                 '{"coding": 140}',
                 '{"general": 100}',
@@ -430,11 +421,9 @@ def test_v13_binds_numeric_build_schema_without_inventing_scale(
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(build_state)")
-        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(build_state)")}
 
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
     assert {"scale_hash", "scale_id", "scale_version"}.issubset(columns)
 
 
@@ -505,7 +494,7 @@ def test_v14_backfills_dataset_classification_and_plan_boundary(tmp_path: Path) 
         }
         version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
     assert rows == {
         "dataset-public": "PUBLIC",
         "dataset-internal": "INTERNAL",
@@ -527,11 +516,9 @@ def test_v16_adds_durable_run_usage_ledger(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(runs)")
-        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
 
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
     assert "usage_json" in columns
 
 
@@ -596,7 +583,7 @@ def test_v17_migration_preserves_datasets_and_allows_preference_role(
         )
         connection.commit()
 
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
     assert "PREFERENCE" in schema
     assert any(row[2] == "datasets" for row in self_fk)
 
@@ -656,7 +643,7 @@ def test_v18_migration_backfills_model_lineage_edges(tmp_path: Path) -> None:
 
     with sqlite3.connect(registry.path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
 
 
 def test_v19_adds_tokenizer_artifact_registry(tmp_path: Path) -> None:
@@ -674,16 +661,11 @@ def test_v19_adds_tokenizer_artifact_registry(tmp_path: Path) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         tables = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
-        columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(tokenizer_artifacts)")
-        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tokenizer_artifacts)")}
 
-    assert version == SCHEMA_VERSION == 23
+    assert version == SCHEMA_VERSION == 25
     assert "tokenizer_artifacts" in tables
     assert {
         "artifact_id",
@@ -697,3 +679,99 @@ def test_v19_adds_tokenizer_artifact_registry(tmp_path: Path) -> None:
         "path",
         "created_at",
     }.issubset(columns)
+
+
+def test_v23_adds_workload_acceptance_registry_without_inventing_contracts(
+    tmp_path: Path,
+) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("NOVA", ModelOrigin.IMPORTED_LOCAL)
+
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute("DROP TABLE workload_acceptance_assessment_evidence")
+        connection.execute("DROP TABLE workload_acceptance_assessments")
+        connection.execute("DROP TABLE workload_acceptance_contracts")
+        connection.execute("PRAGMA user_version = 23")
+        connection.commit()
+
+    state = registry.read()
+    assert state.workload_profile is None
+
+    with sqlite3.connect(registry.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        contract_count = connection.execute(
+            "SELECT COUNT(*) FROM workload_acceptance_contracts"
+        ).fetchone()[0]
+        assessment_count = connection.execute(
+            "SELECT COUNT(*) FROM workload_acceptance_assessments"
+        ).fetchone()[0]
+
+    assert version == SCHEMA_VERSION == 25
+    assert {
+        "workload_acceptance_contracts",
+        "workload_acceptance_assessments",
+        "workload_acceptance_assessment_evidence",
+    }.issubset(tables)
+    assert contract_count == 0
+    assert assessment_count == 0
+
+
+def test_v24_backfills_usage_observation_events_into_atomic_store(tmp_path: Path) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("OBS-MIGRATION", ModelOrigin.IMPORTED_LOCAL)
+    state = registry.read()
+
+    from frontierwright.domain import ModelState
+
+    model = ModelState(
+        model_id="model-observation-migration",
+        identity_id=str(state.project["identity_id"]),
+        origin=ModelOrigin.IMPORTED_LOCAL,
+        checkpoint="synthetic",
+        fingerprint="sha256:observation-migration-model",
+    )
+    registry.register_candidate(model)
+
+    payload = {
+        "schema_version": 1,
+        "observation_id": "observation-migrated",
+        "model_id": model.model_id,
+        "model_fingerprint": model.fingerprint,
+        "task": "research",
+        "outcome": "SUCCESS",
+        "workload_profile_hash": None,
+        "domain": None,
+        "language": None,
+        "failure_category": None,
+        "latency_seconds": 0.5,
+        "classification": "PRIVATE",
+        "source": "EXPLICIT_USER",
+        "idempotency_key": "legacy-use-1",
+        "content_stored": False,
+    }
+    with sqlite3.connect(registry.path) as connection:
+        connection.execute("DROP INDEX unique_usage_observation_retry")
+        connection.execute("DROP TABLE usage_observations")
+        connection.execute(
+            "INSERT INTO events(kind, recorded_at, details) VALUES (?, ?, ?)",
+            (
+                "USAGE_OBSERVATION_RECORDED",
+                "2026-09-25T00:00:00+00:00",
+                json.dumps(payload, sort_keys=True),
+            ),
+        )
+        connection.execute("PRAGMA user_version = 24")
+        connection.commit()
+
+    registry.read()
+    stored = registry.list_usage_observation_payloads(model_id=model.model_id)
+    assert stored == [payload]
+    with sqlite3.connect(registry.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        count = connection.execute("SELECT COUNT(*) FROM usage_observations").fetchone()[0]
+    assert version == SCHEMA_VERSION == 25
+    assert count == 1

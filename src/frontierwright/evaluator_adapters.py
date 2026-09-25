@@ -597,6 +597,7 @@ def import_external_evaluation_manifest(
 
     measurements: list[RawMeasurement] = []
     uncertainty: dict[str, dict[str, object]] = {}
+    measurement_units: dict[str, str] = {}
     seen: set[tuple[str, str, str]] = set()
     task_ids: set[tuple[str, str]] = set()
     for index, raw in enumerate(raw_measurements):
@@ -641,6 +642,20 @@ def import_external_evaluation_manifest(
             )
         seen.add(key)
         task_ids.add((task_id, task_version))
+        selector = json.dumps(
+            {"task_id": task_id, "task_version": task_version, "metric": metric},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        unit = raw.get("unit")
+        if unit is not None:
+            if not isinstance(unit, str) or not unit.strip() or "\x00" in unit:
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_INVALID",
+                    f"measurements[{index}].unit must be a nonempty NUL-free string.",
+                    2,
+                )
+            measurement_units[selector] = unit.strip()
         measurements.append(
             RawMeasurement(
                 task_id=task_id,
@@ -707,12 +722,27 @@ def import_external_evaluation_manifest(
                     2,
                 )
             stats["confidence_interval"] = [lower, upper]
+        confidence_level = raw.get("confidence_level")
+        if confidence_level is not None:
+            if (
+                isinstance(confidence_level, bool)
+                or not isinstance(confidence_level, (int, float))
+                or not math.isfinite(float(confidence_level))
+                or not 0 < float(confidence_level) < 1
+            ):
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_INVALID",
+                    f"measurements[{index}].confidence_level must be strictly between 0 and 1.",
+                    2,
+                )
+            if confidence_interval is None:
+                raise FrontierwrightError(
+                    "EXTERNAL_EVALUATION_INVALID",
+                    f"measurements[{index}].confidence_level requires confidence_interval.",
+                    2,
+                )
+            stats["confidence_level"] = float(confidence_level)
         if stats:
-            selector = json.dumps(
-                {"task_id": task_id, "task_version": task_version, "metric": metric},
-                sort_keys=True,
-                separators=(",", ":"),
-            )
             uncertainty[selector] = stats
 
     source_sha256 = hashlib.sha256(raw_bytes).hexdigest()
@@ -729,6 +759,7 @@ def import_external_evaluation_manifest(
             "source_filename": path.name,
             "source": source_metadata,
             "measurement_uncertainty": uncertainty,
+            "measurement_units": measurement_units,
             "privacy_note": (
                 "The manifest is explicitly imported by the user. Prefer aggregate evidence; "
                 "do not embed private prompts/responses unless the project boundary permits it."

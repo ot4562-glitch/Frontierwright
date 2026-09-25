@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -270,3 +271,71 @@ def test_pure_summary_handles_empty_observations() -> None:
     assert summary.total == 0
     assert summary.direct_success_rate is None
     assert summary.direct_success_rate_ci95 is None
+
+
+def test_usage_observation_concurrent_retry_is_atomic(tmp_path: Path) -> None:
+    project, model = _project_with_champion(tmp_path)
+
+    def record_once() -> bool:
+        return record_usage_observation(
+            project,
+            task="atomic-retry",
+            outcome=ObservationOutcome.FAILURE,
+            failure_category="fixture",
+            idempotency_key="retry-atomic-1",
+        ).replayed
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        replayed = list(pool.map(lambda _: record_once(), range(6)))
+
+    assert replayed.count(False) == 1
+    assert replayed.count(True) == 5
+    registry = Registry(project)
+    assert len(registry.list_usage_observation_payloads(model_id=model.model_id)) == 1
+    events = [
+        event
+        for event in registry.read().history
+        if event.get("kind") == "USAGE_OBSERVATION_RECORDED"
+    ]
+    assert len(events) == 1
+
+
+def test_usage_summary_defaults_to_exact_active_workload_revision(tmp_path: Path) -> None:
+    project, model = _project_with_champion(tmp_path)
+    first = set_workload_profile(
+        project,
+        WorkloadProfile(
+            name="Research v1",
+            task_weights={"research": 1.0},
+            privacy=DatasetClassification.PRIVATE,
+        ),
+    )
+    record_usage_observation(
+        project,
+        task="research",
+        outcome=ObservationOutcome.SUCCESS,
+    )
+
+    second = set_workload_profile(
+        project,
+        WorkloadProfile(
+            name="Research v2",
+            task_weights={"research": 2.0},
+            privacy=DatasetClassification.PRIVATE,
+        ),
+    )
+    assert first.profile_hash != second.profile_hash
+    record_usage_observation(
+        project,
+        task="research",
+        outcome=ObservationOutcome.FAILURE,
+        failure_category="new-contract-failure",
+    )
+
+    summary = get_usage_observation_summary(project, model.model_id)
+    assert summary.cohort_workload_profile_hash == second.profile_hash
+    assert summary.total == 1
+    assert summary.failures == 1
+    assert summary.direct_successes == 0
+    assert summary.excluded_other_workload_versions == 1
+    assert summary.workload_profile_hashes == (second.profile_hash,)

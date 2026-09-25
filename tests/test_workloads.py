@@ -15,18 +15,42 @@ from frontierwright.service import get_workload_fit, get_workload_view, set_work
 from frontierwright.workloads import (
     ExplicitUtilityRelation,
     ExplicitUtilityStatus,
+    MeasurementResolutionState,
     ParetoDirection,
     ParetoMetricInput,
     ParetoRelation,
     WorkloadConstraintStatus,
+    WorkloadDecisionClaimKind,
+    WorkloadDecisionClaimStatus,
     WorkloadProfile,
+    assess_workload_decision_claim,
     assess_workload_fit,
     compare_explicit_user_utility,
     compare_pareto_metrics,
+    human_fit_status,
     workload_profile_from_payload,
 )
 
 runner = CliRunner()
+
+
+def test_human_fit_status_turns_uncertainty_into_actionable_measurement_states() -> None:
+    assert human_fit_status(WorkloadConstraintStatus.UNKNOWN) == "MEASUREMENT NEEDED"
+    assert human_fit_status(WorkloadConstraintStatus.INCONCLUSIVE) == "MORE EVIDENCE NEEDED"
+    assert human_fit_status(WorkloadConstraintStatus.PASS) == "PASS"
+    assert human_fit_status(WorkloadConstraintStatus.FAIL) == "FAIL"
+
+    profile = WorkloadProfile(
+        name="Measured fit",
+        privacy=DatasetClassification.PUBLIC,
+        max_latency_seconds=1.0,
+    )
+    payload = assess_workload_fit(profile, capability_stats={}).to_payload()
+    assert payload["overall_resolution_state"] == MeasurementResolutionState.MEASUREMENT_NEEDED
+    assert payload["resolution_counts"][MeasurementResolutionState.MEASUREMENT_NEEDED.value] >= 1
+    constraint = payload["constraints"][0]
+    assert constraint["resolution_state"] == MeasurementResolutionState.MEASUREMENT_NEEDED
+
 
 
 def test_workload_profile_v1_payload_remains_readable_without_invented_utility() -> None:
@@ -339,7 +363,9 @@ def test_workload_fit_unknown_when_only_generic_capability_is_insufficient() -> 
     assert [item.status for item in assessment.constraints] == [
         WorkloadConstraintStatus.PASS,
         WorkloadConstraintStatus.UNKNOWN,
+        WorkloadConstraintStatus.UNKNOWN,
     ]
+    assert assessment.constraints[-1].key == "evaluation.workload_acceptance"
 
 
 def test_service_and_cli_workload_fit_use_current_champion(tmp_path: Path) -> None:
@@ -602,3 +628,114 @@ def test_workload_context_requirement_uses_profiled_model_capacity(tmp_path: Pat
     by_key = {item["key"]: item for item in failing.constraints}
     assert by_key["serving.context_p95"]["status"] == "FAIL"
     assert by_key["serving.context_p95"]["observed"] == 128
+
+
+def test_decision_claim_blocks_missing_material_measurement_and_never_certifies_better() -> None:
+    profile = WorkloadProfile(
+        name="Measured decision",
+        privacy=DatasetClassification.PUBLIC,
+        utility_weights={
+            "capability.general": 1.0,
+            "serving.latency_p50": 1.0,
+        },
+        utility_scales={
+            "capability.general": 10.0,
+            "serving.latency_p50": 0.25,
+        },
+        improvement_margins={
+            "capability.general": 2.0,
+            "serving.latency_p50": 0.05,
+        },
+    )
+    pareto = compare_pareto_metrics(
+        [
+            ParetoMetricInput(
+                key="capability.general",
+                category="CAPABILITY",
+                direction=ParetoDirection.HIGHER_BETTER,
+                champion_value=50.0,
+                candidate_value=60.0,
+                unit="score",
+                evidence_source="fixture",
+            ),
+            ParetoMetricInput(
+                key="serving.latency_p50",
+                category="SERVING",
+                direction=ParetoDirection.LOWER_BETTER,
+                champion_value=1.0,
+                candidate_value=None,
+                unit="seconds",
+                evidence_source=None,
+            ),
+        ]
+    )
+    utility = compare_explicit_user_utility(profile, pareto)
+    claim = assess_workload_decision_claim(
+        profile,
+        pareto,
+        utility,
+        mandatory_fit_eligible=True,
+    )
+
+    assert pareto.relation is ParetoRelation.CANDIDATE_DOMINATES
+    pareto_payload = pareto.to_payload()
+    assert pareto_payload["complete"] is False
+    assert pareto_payload["unqualified_dominance_claim_eligible"] is False
+    assert claim.status is WorkloadDecisionClaimStatus.INCOMPLETE
+    assert claim.kind is WorkloadDecisionClaimKind.NONE
+    assert claim.decision_eligible is False
+    assert claim.missing_metrics == ("serving.latency_p50",)
+    assert claim.to_payload()["better_for_workload_statement_allowed"] is False
+
+
+def test_decision_claim_exposes_regression_even_when_explicit_tradeoff_prefers_candidate() -> None:
+    profile = WorkloadProfile(
+        name="Explicit tradeoff",
+        privacy=DatasetClassification.PUBLIC,
+        utility_weights={
+            "capability.general": 3.0,
+            "capability.coding": 1.0,
+        },
+        utility_scales={
+            "capability.general": 10.0,
+            "capability.coding": 10.0,
+        },
+        improvement_margins={
+            "capability.general": 2.0,
+            "capability.coding": 2.0,
+        },
+    )
+    pareto = compare_pareto_metrics(
+        [
+            ParetoMetricInput(
+                key="capability.general",
+                category="CAPABILITY",
+                direction=ParetoDirection.HIGHER_BETTER,
+                champion_value=50.0,
+                candidate_value=60.0,
+            ),
+            ParetoMetricInput(
+                key="capability.coding",
+                category="CAPABILITY",
+                direction=ParetoDirection.HIGHER_BETTER,
+                champion_value=50.0,
+                candidate_value=45.0,
+            ),
+        ]
+    )
+    utility = compare_explicit_user_utility(profile, pareto)
+    claim = assess_workload_decision_claim(
+        profile,
+        pareto,
+        utility,
+        mandatory_fit_eligible=True,
+    )
+
+    assert utility.relation is ExplicitUtilityRelation.CANDIDATE_PREFERRED
+    assert claim.status is WorkloadDecisionClaimStatus.ELIGIBLE
+    assert claim.kind is WorkloadDecisionClaimKind.EXPLICIT_UTILITY_PREFERENCE
+    assert claim.decision_eligible is True
+    assert claim.regressions == ("capability.coding",)
+    payload = claim.to_payload()
+    assert payload["better_for_workload_statement_allowed"] is False
+    assert payload["claim_scope"] == "LOCAL_DECISION_EVIDENCE"

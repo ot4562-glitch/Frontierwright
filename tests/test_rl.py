@@ -232,3 +232,42 @@ def test_rl_plan_refuses_missing_reward_environment_identity(tmp_path: Path) -> 
             budgets=HardBudgets(max_runs=1),
             config={},
         )
+
+
+def test_rl_contract_rejects_usage_observation_as_direct_reward() -> None:
+    environment = RLIdentity(
+        "env",
+        "1",
+        REFERENCE_RL_ENVIRONMENT_KIND,
+        {},
+    )
+    direct_observation_reward = RLIdentity(
+        "usage-outcome",
+        "1",
+        "USAGE_OBSERVATION",
+        {"positive": "SUCCESS", "negative": "FAILURE"},
+    )
+    with pytest.raises(
+        FrontierwrightError,
+        match="cannot be used directly as RL rewards",
+    ) as direct_exc:
+        RLExperimentSpec(
+            algorithm_id="reinforce",
+            environment=environment,
+            reward=direct_observation_reward,
+        )
+    assert direct_exc.value.code == "RL_OBSERVATION_REWARD_REQUIRES_TRANSFORM"
+
+    disguised_source = RLIdentity(
+        "derived-but-unversioned",
+        "1",
+        "CUSTOM_REWARD",
+        {"source_kind": "OPERATIONAL_OUTCOME"},
+    )
+    with pytest.raises(FrontierwrightError) as source_exc:
+        RLExperimentSpec(
+            algorithm_id="reinforce",
+            environment=environment,
+            reward=disguised_source,
+        )
+    assert source_exc.value.code == "RL_OBSERVATION_REWARD_REQUIRES_TRANSFORM"

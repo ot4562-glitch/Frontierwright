@@ -12,7 +12,7 @@ from typing import Any
 from frontierwright.data import DatasetClassification
 from frontierwright.errors import FrontierwrightError
 
-WORKLOAD_PROFILE_SCHEMA_VERSION = 2
+WORKLOAD_PROFILE_SCHEMA_VERSION = 3
 WORKLOAD_PROFILE_SOURCE_EXPLICIT = "EXPLICIT_USER"
 
 SUPPORTED_UTILITY_METRICS: frozenset[str] = frozenset(
@@ -23,6 +23,7 @@ SUPPORTED_UTILITY_METRICS: frozenset[str] = frozenset(
         "capability.coding",
         "serving.latency_p50",
         "serving.throughput_p50",
+        "serving.context_p95",
         "serving.ttft_p50",
         "serving.tpot_p50",
         "serving.itl_p50",
@@ -93,6 +94,7 @@ class WorkloadProfile:
     critical_floors: dict[str, float] = field(default_factory=dict)
     utility_weights: dict[str, float] = field(default_factory=dict)
     utility_scales: dict[str, float] = field(default_factory=dict)
+    improvement_margins: dict[str, float] = field(default_factory=dict)
     source: str = WORKLOAD_PROFILE_SOURCE_EXPLICIT
     schema_version: int = WORKLOAD_PROFILE_SCHEMA_VERSION
 
@@ -261,6 +263,31 @@ class WorkloadProfile:
         object.__setattr__(self, "utility_weights", dict(sorted(utility_weights.items())))
         object.__setattr__(self, "utility_scales", dict(sorted(utility_scales.items())))
 
+        margins: dict[str, float] = {}
+        for raw_key, raw_value in self.improvement_margins.items():
+            key = str(raw_key).strip()
+            if key not in SUPPORTED_UTILITY_METRICS:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"unsupported improvement-margin metric: {key!r}",
+                    2,
+                )
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"improvement margin for {key!r} must be numeric.",
+                    2,
+                )
+            value = float(raw_value)
+            if not math.isfinite(value) or value <= 0:
+                raise FrontierwrightError(
+                    "INVALID_WORKLOAD_PROFILE",
+                    f"improvement margin for {key!r} must be finite and positive.",
+                    2,
+                )
+            margins[key] = value
+        object.__setattr__(self, "improvement_margins", dict(sorted(margins.items())))
+
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["languages"] = list(self.languages)
@@ -283,7 +310,44 @@ class WorkloadProfile:
 class WorkloadConstraintStatus(StrEnum):
     PASS = "PASS"
     FAIL = "FAIL"
+    INCONCLUSIVE = "INCONCLUSIVE"
     UNKNOWN = "UNKNOWN"
+
+
+class MeasurementResolutionState(StrEnum):
+    """User-facing resolution state for a conservative decision status."""
+
+    RESOLVED = "RESOLVED"
+    MEASUREMENT_NEEDED = "MEASUREMENT_NEEDED"
+    MORE_EVIDENCE_NEEDED = "MORE_EVIDENCE_NEEDED"
+
+
+def measurement_resolution_state(
+    status: WorkloadConstraintStatus,
+) -> MeasurementResolutionState:
+    if status is WorkloadConstraintStatus.UNKNOWN:
+        return MeasurementResolutionState.MEASUREMENT_NEEDED
+    if status is WorkloadConstraintStatus.INCONCLUSIVE:
+        return MeasurementResolutionState.MORE_EVIDENCE_NEEDED
+    return MeasurementResolutionState.RESOLVED
+
+
+def human_fit_status(status: WorkloadConstraintStatus | str) -> str:
+    """Translate conservative decision states into actionable human-facing copy."""
+
+    try:
+        normalized = (
+            status
+            if isinstance(status, WorkloadConstraintStatus)
+            else WorkloadConstraintStatus(str(status))
+        )
+    except ValueError:
+        return str(status)
+    if normalized is WorkloadConstraintStatus.UNKNOWN:
+        return "MEASUREMENT NEEDED"
+    if normalized is WorkloadConstraintStatus.INCONCLUSIVE:
+        return "MORE EVIDENCE NEEDED"
+    return normalized.value
 
 
 @dataclass(frozen=True)
@@ -300,6 +364,7 @@ class WorkloadFitConstraint:
     def to_payload(self) -> dict[str, object]:
         payload = asdict(self)
         payload["status"] = self.status.value
+        payload["resolution_state"] = measurement_resolution_state(self.status).value
         return payload
 
 
@@ -312,9 +377,16 @@ class WorkloadFitAssessment:
         counts = {status.value: 0 for status in WorkloadConstraintStatus}
         for item in self.constraints:
             counts[item.status.value] += 1
+        resolution_counts = {state.value: 0 for state in MeasurementResolutionState}
+        for item in self.constraints:
+            resolution_counts[measurement_resolution_state(item.status).value] += 1
         return {
             "overall_status": self.overall_status.value,
+            "overall_resolution_state": measurement_resolution_state(
+                self.overall_status
+            ).value,
             "counts": counts,
+            "resolution_counts": resolution_counts,
             "constraints": [item.to_payload() for item in self.constraints],
             "synthetic_utility_score": None,
             "note": (
@@ -402,6 +474,7 @@ def workload_profile_from_payload(payload: dict[str, object]) -> WorkloadProfile
         critical_floors=mapping("critical_floors"),
         utility_weights=mapping("utility_weights"),
         utility_scales=mapping("utility_scales"),
+        improvement_margins=mapping("improvement_margins"),
         source=str(payload.get("source", WORKLOAD_PROFILE_SOURCE_EXPLICIT)),
         schema_version=int(raw_schema_version),
     )
@@ -421,6 +494,7 @@ def assess_workload_fit(
     inference_metrics: dict[str, object] | None = None,
     supported_context_tokens: int | None = None,
     workload_eval_coverage: bool | None = None,
+    workload_acceptance_status: str | None = None,
     serving_boundary: str | None = None,
 ) -> WorkloadFitAssessment:
     """Compare declared requirements with measured evidence without inventing utility.
@@ -568,6 +642,46 @@ def assess_workload_fit(
             )
         )
 
+        normalized_acceptance = (workload_acceptance_status or "").upper()
+        if normalized_acceptance == "PASS":
+            acceptance_status = WorkloadConstraintStatus.PASS
+            acceptance_reason = (
+                "Every configured workload acceptance criterion passed under its declared "
+                "evidence rule."
+            )
+            acceptance_observed: object | None = "PASS"
+        elif normalized_acceptance == "FAIL":
+            acceptance_status = WorkloadConstraintStatus.FAIL
+            acceptance_reason = "At least one workload acceptance criterion failed."
+            acceptance_observed = "FAIL"
+        elif normalized_acceptance == "INCONCLUSIVE":
+            acceptance_status = WorkloadConstraintStatus.INCONCLUSIVE
+            acceptance_reason = (
+                "Workload acceptance evidence overlaps at least one configured threshold."
+            )
+            acceptance_observed = "INCONCLUSIVE"
+        else:
+            acceptance_status = WorkloadConstraintStatus.UNKNOWN
+            acceptance_reason = (
+                "Success criteria are not configured or have not been assessed with exact "
+                "compatible evidence."
+            )
+            acceptance_observed = None
+        constraints.append(
+            WorkloadFitConstraint(
+                key="evaluation.workload_acceptance",
+                category="EVALUATION",
+                requirement="versioned explicit workload success criteria",
+                observed=acceptance_observed,
+                unit=None,
+                status=acceptance_status,
+                evidence_source=(
+                    "WORKLOAD_ACCEPTANCE_ASSESSMENT" if acceptance_observed is not None else None
+                ),
+                reason=acceptance_reason,
+            )
+        )
+
     if profile.privacy is not DatasetClassification.PUBLIC:
         normalized_boundary = serving_boundary.upper() if serving_boundary else None
         allowed = {"LOCAL_MACHINE", "CONTROLLED_PRIVATE"}
@@ -593,24 +707,17 @@ def assess_workload_fit(
             )
         )
 
-    # Coverage answers only "did we measure the declared workload surface?" It does
-    # not establish that the model performs well on that surface. Keep coverage visible
-    # as evidence, but exclude it from the requirement-satisfaction verdict until the
-    # Workload Profile declares an explicit measurable threshold for that evidence.
-    decision_constraints = [
-        item for item in constraints if item.key != "evaluation.workload_coverage"
-    ]
+    # Coverage answers "did we measure the declared workload surface?" and acceptance
+    # answers "did the exact evidence satisfy the user's explicit success criteria?".
+    # A user-specific PASS requires both whenever the profile declares workload labels.
+    decision_constraints = constraints
     statuses = {item.status for item in decision_constraints}
     if WorkloadConstraintStatus.FAIL in statuses:
         overall = WorkloadConstraintStatus.FAIL
     elif WorkloadConstraintStatus.UNKNOWN in statuses:
         overall = WorkloadConstraintStatus.UNKNOWN
-    elif needs_workload_eval:
-        # Exact coverage can prove that the declared language/domain/task surface was
-        # measured, but the current Workload Profile has no threshold contract for
-        # those bound metrics. Do not turn coverage plus generic capability into a
-        # user-workload success claim.
-        overall = WorkloadConstraintStatus.UNKNOWN
+    elif WorkloadConstraintStatus.INCONCLUSIVE in statuses:
+        overall = WorkloadConstraintStatus.INCONCLUSIVE
     elif decision_constraints and statuses == {WorkloadConstraintStatus.PASS}:
         overall = WorkloadConstraintStatus.PASS
     else:
@@ -680,14 +787,24 @@ class ParetoComparison:
         counts = {status.value: 0 for status in ParetoMetricRelation}
         for metric in self.metrics:
             counts[metric.relation.value] += 1
+        unknown_count = counts[ParetoMetricRelation.UNKNOWN.value]
+        complete = unknown_count == 0 and bool(self.metrics)
         return {
             "relation": self.relation.value,
+            "relation_scope": ("ALL_LISTED_DIMENSIONS" if complete else "MEASURED_DIMENSIONS_ONLY"),
+            "complete": complete,
+            "known_metric_count": len(self.metrics) - unknown_count,
+            "unknown_metric_count": unknown_count,
+            "unqualified_dominance_claim_eligible": bool(
+                complete and self.relation is ParetoRelation.CANDIDATE_DOMINATES
+            ),
             "counts": counts,
             "metrics": [metric.to_payload() for metric in self.metrics],
             "synthetic_utility_score": None,
             "note": (
                 "Pareto relation uses only directly comparable measured point estimates. "
-                "It is not a statistical-significance claim and never hides per-axis evidence."
+                "When dimensions are UNKNOWN, dominance is limited to measured dimensions "
+                "and is not an unqualified superiority claim."
             ),
         }
 
@@ -874,4 +991,170 @@ def compare_explicit_user_utility(
         relation=relation,
         utility_delta=utility_delta,
         contributions=tuple(contributions),
+    )
+
+
+class WorkloadDecisionClaimStatus(StrEnum):
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    INELIGIBLE = "INELIGIBLE"
+    INCOMPLETE = "INCOMPLETE"
+    ELIGIBLE = "ELIGIBLE"
+
+
+class WorkloadDecisionClaimKind(StrEnum):
+    NONE = "NONE"
+    PARETO_IMPROVEMENT = "PARETO_IMPROVEMENT"
+    EXPLICIT_UTILITY_PREFERENCE = "EXPLICIT_UTILITY_PREFERENCE"
+
+
+@dataclass(frozen=True)
+class WorkloadDecisionClaim:
+    status: WorkloadDecisionClaimStatus
+    kind: WorkloadDecisionClaimKind
+    decision_eligible: bool
+    material_metrics: tuple[str, ...] = ()
+    improvements: tuple[str, ...] = ()
+    regressions: tuple[str, ...] = ()
+    within_margin: tuple[str, ...] = ()
+    missing_metrics: tuple[str, ...] = ()
+    missing_margins: tuple[str, ...] = ()
+    reasons: tuple[str, ...] = ()
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "status": self.status.value,
+            "kind": self.kind.value,
+            "decision_eligible": self.decision_eligible,
+            "material_metrics": list(self.material_metrics),
+            "improvements": list(self.improvements),
+            "regressions": list(self.regressions),
+            "within_margin": list(self.within_margin),
+            "missing_metrics": list(self.missing_metrics),
+            "missing_margins": list(self.missing_margins),
+            "reasons": list(self.reasons),
+            "better_for_workload_statement_allowed": False,
+            "claim_scope": "LOCAL_DECISION_EVIDENCE",
+            "note": (
+                "Decision eligibility is not a confirmatory scientific claim. Frontierwright "
+                "does not currently certify an unqualified 'better for this workload' statement "
+                "after adaptive candidate selection without independent confirmation evidence."
+            ),
+        }
+
+
+def workload_material_metric_keys(profile: WorkloadProfile) -> tuple[str, ...]:
+    """Return numeric dimensions the user explicitly made material to a decision."""
+
+    keys = set(profile.utility_weights)
+    keys.update(f"capability.{axis}" for axis in profile.critical_floors)
+    if profile.max_latency_seconds is not None:
+        keys.add("serving.latency_p50")
+    if profile.min_tokens_per_second is not None:
+        keys.add("serving.throughput_p50")
+    if profile.context_tokens_p95 is not None:
+        keys.add("serving.context_p95")
+    return tuple(sorted(keys))
+
+
+def assess_workload_decision_claim(
+    profile: WorkloadProfile,
+    pareto: ParetoComparison,
+    utility: ExplicitUtilityComparison,
+    *,
+    mandatory_fit_eligible: bool,
+) -> WorkloadDecisionClaim:
+    """Qualify a local user-fit decision without turning partial evidence into superiority."""
+
+    material = workload_material_metric_keys(profile)
+    reasons: list[str] = []
+    if not mandatory_fit_eligible:
+        reasons.append("MANDATORY_WORKLOAD_GATE_NOT_PASS")
+    if profile.languages or profile.domains or profile.task_weights:
+        reasons.append("WORKLOAD_RESULT_THRESHOLD_UNDECLARED")
+    if not material:
+        reasons.append("NO_MATERIAL_COMPARISON_METRICS")
+
+    missing_margins = tuple(key for key in material if key not in profile.improvement_margins)
+    if missing_margins:
+        reasons.append("PRACTICAL_IMPROVEMENT_MARGIN_MISSING")
+
+    by_key = {item.key: item for item in pareto.metrics}
+    missing_metrics = tuple(
+        key for key in material if key not in by_key or by_key[key].improvement_delta is None
+    )
+    if missing_metrics:
+        return WorkloadDecisionClaim(
+            status=WorkloadDecisionClaimStatus.INCOMPLETE,
+            kind=WorkloadDecisionClaimKind.NONE,
+            decision_eligible=False,
+            material_metrics=material,
+            missing_metrics=missing_metrics,
+            missing_margins=missing_margins,
+            reasons=tuple(dict.fromkeys(reasons + ["MATERIAL_EVIDENCE_MISSING"])),
+        )
+
+    if reasons:
+        return WorkloadDecisionClaim(
+            status=WorkloadDecisionClaimStatus.INELIGIBLE,
+            kind=WorkloadDecisionClaimKind.NONE,
+            decision_eligible=False,
+            material_metrics=material,
+            missing_margins=missing_margins,
+            reasons=tuple(dict.fromkeys(reasons)),
+        )
+
+    improvements: list[str] = []
+    regressions: list[str] = []
+    within_margin: list[str] = []
+    for key in material:
+        delta = by_key[key].improvement_delta
+        assert delta is not None
+        margin = profile.improvement_margins[key]
+        if delta >= margin:
+            improvements.append(key)
+        elif delta <= -margin:
+            regressions.append(key)
+        else:
+            within_margin.append(key)
+
+    if not improvements:
+        return WorkloadDecisionClaim(
+            status=WorkloadDecisionClaimStatus.INELIGIBLE,
+            kind=WorkloadDecisionClaimKind.NONE,
+            decision_eligible=False,
+            material_metrics=material,
+            regressions=tuple(regressions),
+            within_margin=tuple(within_margin),
+            reasons=("NO_PRACTICALLY_MEANINGFUL_IMPROVEMENT",),
+        )
+
+    if regressions:
+        utility_covers_material = set(material).issubset(profile.utility_weights)
+        if not (
+            utility.status is ExplicitUtilityStatus.COMPLETE
+            and utility.relation is ExplicitUtilityRelation.CANDIDATE_PREFERRED
+            and utility_covers_material
+        ):
+            return WorkloadDecisionClaim(
+                status=WorkloadDecisionClaimStatus.INELIGIBLE,
+                kind=WorkloadDecisionClaimKind.NONE,
+                decision_eligible=False,
+                material_metrics=material,
+                improvements=tuple(improvements),
+                regressions=tuple(regressions),
+                within_margin=tuple(within_margin),
+                reasons=("REGRESSION_WITHOUT_COMPLETE_EXPLICIT_TRADEOFF_RULE",),
+            )
+        kind = WorkloadDecisionClaimKind.EXPLICIT_UTILITY_PREFERENCE
+    else:
+        kind = WorkloadDecisionClaimKind.PARETO_IMPROVEMENT
+
+    return WorkloadDecisionClaim(
+        status=WorkloadDecisionClaimStatus.ELIGIBLE,
+        kind=kind,
+        decision_eligible=True,
+        material_metrics=material,
+        improvements=tuple(improvements),
+        regressions=tuple(regressions),
+        within_margin=tuple(within_margin),
     )

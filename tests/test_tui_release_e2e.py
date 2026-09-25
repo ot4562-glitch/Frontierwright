@@ -408,7 +408,7 @@ async def test_keyboard_tui_studio_import_immediately_exposes_real_character_she
         assert "YOUR MODEL / YOUR MACHINE / YOUR WORKLOAD" in sheet
         assert "Champion: " in sheet
         assert app.view.champion_model_id[:20] in sheet
-        assert "Measured machine fit: UNKNOWN" in sheet
+        assert "Measured machine fit: MEASUREMENT NEEDED" in sheet
         assert "Workload fit: NOT DEFINED" in sheet
         assert "General    ?" in sheet
         assert "Reasoning  ?" in sheet

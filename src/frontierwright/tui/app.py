@@ -30,6 +30,7 @@ from frontierwright.service import (
     PathsView,
     ResourceView,
     StatusView,
+    WorkloadAcceptanceView,
     WorkloadFitView,
     WorkloadView,
     add_local_dataset,
@@ -50,6 +51,7 @@ from frontierwright.service import (
     get_status,
     get_tokenizers_view,
     get_usage_observation_summary,
+    get_workload_acceptance_view,
     get_workload_fit,
     get_workload_view,
     import_local_model,
@@ -65,7 +67,7 @@ from frontierwright.service import (
     set_workload_profile,
     train_project_tokenizer,
 )
-from frontierwright.workloads import WorkloadProfile
+from frontierwright.workloads import WorkloadProfile, human_fit_status
 
 TAB_KEYS = (
     ("1", "character"),
@@ -663,6 +665,7 @@ class FrontierwrightApp(App[None]):
         build: BuildView | None = None,
         data: DataView | None = None,
         workload: WorkloadView | None = None,
+        workload_acceptance: WorkloadAcceptanceView | None = None,
         workload_fit: WorkloadFitView | None = None,
         usage_observations: ObservationSummary | None = None,
         fit_opportunities: FitOpportunityPlan | None = None,
@@ -679,6 +682,7 @@ class FrontierwrightApp(App[None]):
         self.build = build or BuildView(mode=view.build_mode)
         self.data = data or DataView()
         self.workload = workload or WorkloadView()
+        self.workload_acceptance = workload_acceptance or WorkloadAcceptanceView()
         self.workload_fit = workload_fit or WorkloadFitView()
         self.usage_observations = usage_observations or ObservationSummary(
             model_id=view.champion_model_id
@@ -813,11 +817,11 @@ class FrontierwrightApp(App[None]):
                 [
                     "",
                     "EVIDENCE STATUS",
-                    f"Workload fit: {self.workload_fit.overall_status}",
+                    f"Workload fit: {human_fit_status(self.workload_fit.overall_status)}",
                     (
                         "Inference profile: MEASURED"
                         if self.resources.model_fit
-                        else "Inference profile: UNKNOWN"
+                        else "Inference profile: MEASUREMENT NEEDED"
                     ),
                     f"Pending candidates: {pending_count}",
                 ]
@@ -835,7 +839,11 @@ class FrontierwrightApp(App[None]):
                 lines.append("Champion: " + _compact_identity(self.view.champion_model_id, keep=20))
             lines.append(
                 "Workload fit: "
-                + (self.workload_fit.overall_status if self.workload.configured else "NOT DEFINED")
+                + (
+                    human_fit_status(self.workload_fit.overall_status)
+                    if self.workload.configured
+                    else "NOT DEFINED"
+                )
             )
             model_fit = self.resources.model_fit
             if model_fit:
@@ -854,7 +862,7 @@ class FrontierwrightApp(App[None]):
                     + (" · ".join(profile_parts) if profile_parts else "PARTIAL EVIDENCE")
                 )
             else:
-                lines.append("Measured machine fit: UNKNOWN — profile the Champion")
+                lines.append("Measured machine fit: MEASUREMENT NEEDED — profile the Champion")
             if self.workload_fit.configured and self.workload_fit.constraints:
                 gap = next(
                     (
@@ -865,7 +873,10 @@ class FrontierwrightApp(App[None]):
                     None,
                 )
                 if isinstance(gap, dict):
-                    lines.append(f"Next fit gap: {gap.get('key')} · {gap.get('status')}")
+                    lines.append(
+                        f"Next fit gap: {gap.get('key')} · "
+                        f"{human_fit_status(str(gap.get('status') or 'UNKNOWN'))}"
+                    )
 
         lines.extend(["", "CAPABILITY"])
         for axis in ("general", "reasoning", "math", "coding"):
@@ -1233,32 +1244,84 @@ class FrontierwrightApp(App[None]):
                 lines.append(f"  {key}: weight={weight} · scale={utility_scales.get(key)}")
             lines.append("  Missing comparable evidence keeps utility INCOMPLETE.")
 
+        acceptance = self.workload_acceptance
+        if edition is EditionProfile.ACADEMY:
+            lines.extend(["", "WHAT COUNTS AS SUCCESS?"])
+            if not acceptance.configured:
+                lines.append(
+                    "No measurable success criteria yet. Add thresholds so evaluation can answer "
+                    "whether the model actually meets your goal."
+                )
+            else:
+                lines.append(
+                    "Success check: " + human_fit_status(acceptance.overall_status)
+                )
+                contract_label = acceptance.contract_name or acceptance.contract_id
+                lines.append(
+                    f"Criteria: {len(acceptance.criteria)} · contract {contract_label}"
+                )
+                if acceptance.overall_status in {"UNKNOWN", "INCONCLUSIVE", "NOT_ASSESSED"}:
+                    lines.append(
+                        "Next lesson: collect the exact evidence needed to resolve the criteria."
+                    )
+        elif edition is EditionProfile.LAB:
+            lines.extend(["", "ACCEPTANCE CONTRACT"])
+            if not acceptance.configured:
+                lines.append("NOT CONFIGURED — workload success claims remain unavailable.")
+            else:
+                active_label = "YES" if acceptance.active else "NO"
+                lines.append(
+                    f"Status: {human_fit_status(acceptance.overall_status)} · "
+                    f"contract={acceptance.contract_id} · active={active_label}"
+                )
+                lines.append(f"Contract hash: {acceptance.contract_hash}")
+                lines.append(f"Assessment: {acceptance.assessment_id or 'MEASUREMENT NEEDED'}")
+        else:
+            lines.extend(["", "SUCCESS CRITERIA"])
+            if not acceptance.configured:
+                lines.append(
+                    "MEASUREMENT NEEDED — define the thresholds that make this model good enough "
+                    "for your real work."
+                )
+            else:
+                lines.append(
+                    f"{human_fit_status(acceptance.overall_status)} · "
+                    f"{len(acceptance.criteria)} measurable requirement(s)"
+                )
+                if acceptance.overall_status == "INCONCLUSIVE":
+                    lines.append(
+                        "More compatible samples are needed before the decision is stable."
+                    )
+
         fit = self.workload_fit
-        lines.extend(["", f"FIT EVIDENCE: {fit.overall_status}"])
+        lines.extend(["", f"FIT EVIDENCE: {human_fit_status(fit.overall_status)}"])
         if fit.configured:
             counts = fit.counts
             lines.append(
                 "PASS "
                 f"{counts.get('PASS', 0)} · FAIL {counts.get('FAIL', 0)} · "
-                f"UNKNOWN {counts.get('UNKNOWN', 0)}"
+                f"MEASURE {counts.get('UNKNOWN', 0)} · MORE EVIDENCE "
+                f"{counts.get('INCONCLUSIVE', 0)}"
             )
-            glyphs = {"PASS": "✓", "FAIL": "×", "UNKNOWN": "?"}
+            glyphs = {"PASS": "✓", "FAIL": "×", "UNKNOWN": "◇", "INCONCLUSIVE": "…"}
             for item in fit.constraints:
                 status = str(item.get("status") or "UNKNOWN")
+                display_status = human_fit_status(status)
                 glyph = glyphs.get(status, "?")
                 key = str(item.get("key") or "constraint")
                 observed = item.get("observed")
                 required = item.get("requirement")
                 if edition is EditionProfile.ACADEMY:
-                    lines.append(f"  {glyph} {status} · {item.get('reason')}")
+                    lines.append(f"  {glyph} {display_status} · {item.get('reason')}")
                 elif edition is EditionProfile.LAB:
                     lines.append(
-                        f"  {glyph} {status} {key} · required={required} · "
+                        f"  {glyph} {display_status} {key} · required={required} · "
                         f"observed={observed} · evidence={item.get('evidence_source')}"
                     )
                 else:
                     lines.append(
-                        f"  {glyph} {status} {key} · required={required} · observed={observed}"
+                        f"  {glyph} {display_status} {key} · required={required} · "
+                        f"observed={observed}"
                     )
         elif fit.note:
             lines.append(fit.note)
@@ -1402,6 +1465,7 @@ class FrontierwrightApp(App[None]):
         self.build = get_build_view(self.root)
         self.data = get_data_view(self.root)
         self.workload = get_workload_view(self.root)
+        self.workload_acceptance = get_workload_acceptance_view(self.root)
         self.workload_fit = get_workload_fit(self.root)
         self.usage_observations = get_usage_observation_summary(self.root)
         self.fit_opportunities = get_fit_opportunities(self.root)

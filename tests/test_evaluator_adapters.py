@@ -349,9 +349,11 @@ def write_generic_eval_manifest(
                         "metric": "pass_rate",
                         "value": 0.81,
                         "higher_is_better": True,
+                        "unit": "fraction",
                         "stderr": 0.025,
                         "sample_count": 200,
                         "confidence_interval": [0.76, 0.86],
+                        "confidence_level": 0.95,
                     },
                     {
                         "task_id": "private-code-eval:python",
@@ -359,6 +361,7 @@ def write_generic_eval_manifest(
                         "metric": "mean_runtime_seconds",
                         "value": 0.14,
                         "higher_is_better": False,
+                        "unit": "seconds",
                         "sample_count": 200,
                     },
                 ],
@@ -427,7 +430,9 @@ def test_cli_import_generic_manifest_preserves_explicit_uncertainty_and_directio
         "stderr": 0.025,
         "sample_count": 200,
         "confidence_interval": [0.76, 0.86],
+        "confidence_level": 0.95,
     }
+    assert receipt["conditions"]["measurement_units"][pass_selector] == "fraction"
 
     second = runner.invoke(
         app,

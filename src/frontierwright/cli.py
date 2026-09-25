@@ -55,9 +55,11 @@ from frontierwright.service import (
     StatusView,
     TokenizersView,
     TokenizerView,
+    WorkloadAcceptanceView,
     WorkloadFitView,
     WorkloadView,
     add_local_dataset,
+    assess_workload_acceptance_evidence,
     bind_workload_evaluation,
     birth_zero_model,
     calibrate_training_plan,
@@ -89,6 +91,7 @@ from frontierwright.service import (
     get_status,
     get_tokenizers_view,
     get_usage_observation_summary,
+    get_workload_acceptance_view,
     get_workload_fit,
     get_workload_view,
     import_external_evaluation_evidence,
@@ -99,6 +102,7 @@ from frontierwright.service import (
     import_vllm_serving_evidence,
     ingest_stats,
     initialize_project,
+    load_and_set_workload_acceptance_contract,
     merge_reference_models,
     preflight_capability_v1,
     preflight_evaluation_pack,
@@ -128,7 +132,12 @@ from frontierwright.service import (
     train_project_tokenizer,
     verify_export_bundle,
 )
-from frontierwright.workloads import WorkloadProfile
+from frontierwright.slurm_executor import (
+    inspect_slurm_availability,
+    load_slurm_executor_profile,
+    slurm_backend_spec_payload,
+)
+from frontierwright.workloads import WorkloadProfile, human_fit_status
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -138,7 +147,8 @@ app = typer.Typer(
 project_app = typer.Typer(help="Create and inspect Frontierwright project state.")
 resources_app = typer.Typer(help="Detect and inspect project compute resources.")
 workload_app = typer.Typer(help="Describe the user workload the model should fit.")
-observe_app = typer.Typer(help="Record privacy-minimal evidence from real model use.")
+workload_acceptance_app = typer.Typer(help="Define and assess versioned workload success criteria.")
+workload_app.add_typer(workload_acceptance_app, name="acceptance")
 observe_app = typer.Typer(help="Record privacy-minimal evidence from real model use.")
 build_app = typer.Typer(help="Inspect and edit the desired model build.")
 stats_app = typer.Typer(help="Inspect or ingest capability evaluation evidence.")
@@ -152,11 +162,14 @@ optimize_app = typer.Typer(help="Optimize model artifacts for deployment/inferen
 operate_app = typer.Typer(help="Export and operate accepted model artifacts.")
 lab_app = typer.Typer(help="Connect and inspect controlled private Lab infrastructure.")
 lab_adapters_app = typer.Typer(help="Manage Lab adapter manifests.")
+lab_slurm_app = typer.Typer(
+    help="Inspect and package a bounded controlled-private Slurm executor profile."
+)
 lab_app.add_typer(lab_adapters_app, name="adapters")
+lab_app.add_typer(lab_slurm_app, name="slurm")
 app.add_typer(project_app, name="project")
 app.add_typer(resources_app, name="resources")
 app.add_typer(workload_app, name="workload")
-app.add_typer(observe_app, name="observe")
 app.add_typer(observe_app, name="observe")
 app.add_typer(build_app, name="build")
 app.add_typer(stats_app, name="stats")
@@ -245,6 +258,10 @@ def _workload_payload(view: WorkloadView) -> dict[str, object]:
 
 
 def _workload_fit_payload(view: WorkloadFitView) -> dict[str, object]:
+    return {"ok": True, **view.to_dict()}
+
+
+def _workload_acceptance_payload(view: WorkloadAcceptanceView) -> dict[str, object]:
     return {"ok": True, **view.to_dict()}
 
 
@@ -554,18 +571,61 @@ def _print_workload(view: WorkloadView) -> None:
         console.print("  Missing comparable evidence keeps the relative utility result INCOMPLETE.")
 
 
+def _print_workload_acceptance(view: WorkloadAcceptanceView) -> None:
+    console.print("[bold]WORKLOAD ACCEPTANCE[/bold]")
+    if not view.configured:
+        console.print(view.note or "Success criteria are not configured.")
+        return
+    console.print(f"Contract: {view.contract_name or view.contract_id}")
+    console.print(f"Contract ID: {view.contract_id}")
+    console.print(f"Workload revision: {view.workload_profile_hash}")
+    console.print(f"Active: {'YES' if view.active else 'NO'}")
+    console.print(f"Decision: {human_fit_status(view.overall_status)}")
+    if view.overall_status in {"UNKNOWN", "INCONCLUSIVE"}:
+        console.print(f"Internal decision state: {view.overall_status}")
+    criteria = view.assessment_criteria or view.criteria
+    if criteria:
+        console.print("Criteria:")
+        for item in criteria:
+            status = str(item.get("status") or "NOT_ASSESSED")
+            display_status = human_fit_status(status)
+            criterion_id = item.get("criterion_id") or "criterion"
+            selector = item.get("selector")
+            metric = selector.get("metric") if isinstance(selector, dict) else None
+            observed = item.get("observed_value")
+            threshold = item.get("threshold")
+            operator = item.get("operator")
+            unit = item.get("unit")
+            console.print(
+                f"  [{display_status}] {criterion_id} · metric={metric} · "
+                f"observed={observed} · {operator} {threshold} {unit or ''}".rstrip()
+            )
+            interval = item.get("confidence_interval")
+            if isinstance(interval, list) and len(interval) == 2:
+                console.print(f"    interval={interval[0]}..{interval[1]}")
+            reason = item.get("reason")
+            if reason:
+                console.print(f"    {reason}")
+    if view.note:
+        console.print(view.note)
+
+
 def _print_workload_fit(view: WorkloadFitView) -> None:
-    console.print(f"[bold]WORKLOAD FIT: {view.overall_status}[/bold]")
+    console.print(f"[bold]WORKLOAD FIT: {human_fit_status(view.overall_status)}[/bold]")
     if not view.configured:
         console.print(view.note or "No workload profile configured.")
         return
     if view.model_id:
         console.print(f"Model: {view.model_id}")
     for item in view.constraints:
+        raw_status = str(item.get("status", "UNKNOWN"))
+        display_status = str(item.get("resolution_state") or human_fit_status(raw_status))
         console.print(
-            f"[{item.get('status', 'UNKNOWN')}] {item.get('key')} · "
+            f"[{display_status}] {item.get('key')} · "
             f"required={item.get('requirement')} · observed={item.get('observed')}"
         )
+        if raw_status in {"UNKNOWN", "INCONCLUSIVE"}:
+            console.print(f"  Decision state: {raw_status}")
         if item.get("reason"):
             console.print(f"  {item['reason']}")
     coverage = view.workload_evaluation_coverage
@@ -1301,6 +1361,101 @@ def project_edition(
         console.print(view.edition_tagline)
     if view.edition_starting_point:
         console.print(f"Starting point: {view.edition_starting_point}")
+
+
+@lab_slurm_app.command("inspect")
+def lab_slurm_inspect(
+    profile: Annotated[Path, typer.Argument(help="Controlled-private Slurm profile JSON.")],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        parsed = load_slurm_executor_profile(profile)
+        availability = inspect_slurm_availability(parsed)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    payload = {
+        "ok": True,
+        "adapter_id": parsed.adapter_id,
+        "adapter_version": parsed.adapter_version,
+        "adapter_ref": parsed.adapter_ref,
+        "profile_hash": parsed.sha256,
+        "supported_paths": [item.value for item in parsed.supported_paths],
+        "network_scope": parsed.network_scope.value,
+        "shared_filesystem": parsed.shared_filesystem,
+        "availability": availability,
+        "maturity": "BOUNDED_V1",
+        "note": (
+            "This validates one explicit Slurm submission contract; it is not a claim of "
+            "generic cluster or arbitrary framework support."
+        ),
+    }
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print("[bold]SLURM LAB EXECUTOR · BOUNDED V1[/bold]")
+    console.print(f"Adapter: {parsed.adapter_ref}")
+    console.print(f"Profile hash: {parsed.sha256}")
+    console.print("Paths: " + ", ".join(item.value for item in parsed.supported_paths))
+    console.print(f"Network: {parsed.network_scope.value}")
+    console.print(f"Shared filesystem: {'YES' if parsed.shared_filesystem else 'NO'}")
+    console.print(f"Ready on this submit host: {'YES' if availability.get('ready') else 'NO'}")
+    console.print(str(payload["note"]))
+
+
+@lab_slurm_app.command("backend-spec")
+def lab_slurm_backend_spec(
+    profile: Annotated[Path, typer.Argument(help="Controlled-private Slurm profile JSON.")],
+    output: Annotated[Path, typer.Option("--output", help="Write Command Backend spec JSON.")],
+    python_executable: Annotated[
+        str,
+        typer.Option(
+            "--python-executable",
+            help="Python executable visible on the submit host; defaults to this CLI runtime.",
+        ),
+    ] = sys.executable,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        parsed = load_slurm_executor_profile(profile)
+        payload = slurm_backend_spec_payload(
+            profile,
+            parsed,
+            python_executable=python_executable,
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(payload, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, UnicodeError):
+        _fail(
+            FrontierwrightError(
+                "SLURM_BACKEND_SPEC_WRITE_FAILED",
+                f"Could not write Slurm backend spec: {output}",
+                4,
+            ),
+            json_output=json_output,
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    result = {
+        "ok": True,
+        "output": str(output.resolve()),
+        "profile_hash": parsed.sha256,
+        "backend_spec": payload,
+    }
+    if json_output:
+        _emit_json(result)
+        return
+    console.print("[bold]SLURM BACKEND SPEC WRITTEN[/bold]")
+    console.print(f"Output: {output.resolve()}")
+    console.print(f"Profile: {parsed.sha256}")
+    console.print("Connect the same Lab adapter manifest before creating controlled-private plans.")
 
 
 @lab_adapters_app.command("list")
@@ -2277,6 +2432,88 @@ def workload_show(
         _emit_json(_workload_payload(view))
         return
     _print_workload(view)
+
+
+@workload_acceptance_app.command("create")
+def workload_acceptance_create(
+    file: Annotated[
+        Path,
+        typer.Option("--file", help="Versioned workload acceptance contract JSON."),
+    ],
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = load_and_set_workload_acceptance_contract(path, file)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json(_workload_acceptance_payload(view))
+        return
+    _print_workload_acceptance(view)
+
+
+@workload_acceptance_app.command("show")
+def workload_acceptance_show(
+    contract: Annotated[
+        str | None,
+        typer.Option("--contract", help="Contract ID/hash; defaults to active workload contract."),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        view = get_workload_acceptance_view(path, contract, model)
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json(_workload_acceptance_payload(view))
+        return
+    _print_workload_acceptance(view)
+
+
+@workload_acceptance_app.command("assess")
+def workload_acceptance_assess(
+    contract: Annotated[str, typer.Argument(help="Contract ID or hash.")],
+    evidence: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--evidence",
+            help="Exact stored evaluation receipt ID; repeat for multiple receipts.",
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = assess_workload_acceptance_evidence(
+            path,
+            contract_ref=contract,
+            model_id=model,
+            receipt_ids=tuple(evidence or ()),
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json(_workload_acceptance_payload(view))
+        return
+    _print_workload_acceptance(view)
 
 
 @workload_app.command("compare-models")
@@ -3925,6 +4162,7 @@ def play(
     build = get_build_view(path)
     data = get_data_view(path)
     workload = get_workload_view(path)
+    workload_acceptance = get_workload_acceptance_view(path)
     workload_fit = get_workload_fit(path)
     usage_observations = get_usage_observation_summary(path)
     fit_opportunities = get_fit_opportunities(path)
@@ -3940,6 +4178,7 @@ def play(
         build=build,
         data=data,
         workload=workload,
+        workload_acceptance=workload_acceptance,
         workload_fit=workload_fit,
         usage_observations=usage_observations,
         fit_opportunities=fit_opportunities,

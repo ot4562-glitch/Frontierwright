@@ -152,7 +152,12 @@ def plan_fit_opportunities(
             note="No performance gain is predicted; establish the model under test first.",
         )
 
-    by_status: dict[str, list[dict[str, object]]] = {"FAIL": [], "UNKNOWN": [], "PASS": []}
+    by_status: dict[str, list[dict[str, object]]] = {
+        "FAIL": [],
+        "UNKNOWN": [],
+        "INCONCLUSIVE": [],
+        "PASS": [],
+    }
     for constraint in constraints:
         status = str(constraint.get("status") or "UNKNOWN")
         by_status.setdefault(status, []).append(constraint)
@@ -165,6 +170,11 @@ def plan_fit_opportunities(
     fail_keys = {
         str(item.get("key"))
         for item in by_status.get("FAIL", [])
+        if isinstance(item.get("key"), str)
+    }
+    inconclusive_keys = {
+        str(item.get("key"))
+        for item in by_status.get("INCONCLUSIVE", [])
         if isinstance(item.get("key"), str)
     }
 
@@ -208,8 +218,9 @@ def plan_fit_opportunities(
                     lab="Capture comparable serving/resource evidence",
                 ),
                 reason=(
-                    "Latency, throughput, context capacity, or memory fit is UNKNOWN; "
-                    "parameter count alone is not enough to claim feasibility."
+                    "Latency, throughput, context capacity, or memory fit has not been "
+                    "measured under compatible conditions; parameter count alone is not enough "
+                    "to claim feasibility."
                 ),
                 evidence_keys=tuple(serving_unknown),
                 success_criterion=(
@@ -275,6 +286,36 @@ def plan_fit_opportunities(
                 evidence_keys=("privacy.serving_boundary",),
                 success_criterion=(
                     "Serving evidence proves LOCAL_MACHINE or CONTROLLED_PRIVATE execution."
+                ),
+            ),
+        )
+
+    if inconclusive_keys:
+        _append_unique(
+            items,
+            seen,
+            FitOpportunity(
+                opportunity_id="reduce-decision-uncertainty",
+                opportunity_class=OpportunityClass.BLOCKING_EVIDENCE,
+                action=(
+                    "collect additional compatible evaluation/profile samples, then reassess "
+                    "the exact workload criteria"
+                ),
+                title=_edition_title(
+                    edition,
+                    academy="Measure a little more until the result is clear",
+                    studio="Reduce uncertainty on the unresolved workload decision",
+                    lab="Increase decision evidence under the same protocol",
+                ),
+                reason=(
+                    "At least one measured criterion overlaps its decision threshold. "
+                    "The result is not treated as a permanent unknown; gather more compatible "
+                    "evidence until the criterion resolves or the measurement budget is exhausted."
+                ),
+                evidence_keys=tuple(sorted(inconclusive_keys)),
+                success_criterion=(
+                    "The configured uncertainty rule places every listed criterion wholly on one "
+                    "side of its threshold, or the measurement budget is explicitly exhausted."
                 ),
             ),
         )

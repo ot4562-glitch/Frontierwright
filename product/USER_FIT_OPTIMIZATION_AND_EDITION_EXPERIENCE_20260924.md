@@ -149,6 +149,25 @@ Frontierwright must not claim feasibility from parameter count alone. Calibratio
 
 ## 7. Evaluation truthfulness requirements
 
+### Measurement completeness is a product requirement
+
+Displayed stats must never imply more precision than the evidence supports, but honesty must not become an excuse for leaving ordinary users in a sea of `UNKNOWN` states.
+
+Frontierwright therefore treats `UNKNOWN` as an **internal safety state and a transient measurement backlog**, not a desirable user experience.
+
+For every user-relevant metric Frontierwright should, whenever technically possible:
+- measure directly rather than infer from model size, hardware name, or architecture labels;
+- automatically identify the exact missing measurement;
+- offer or execute a bounded measurement path when permissions/budgets allow;
+- repeat or enlarge a measurement when uncertainty overlaps a decision threshold;
+- preserve the exact runtime/workload/evaluator conditions that make the result valid;
+- show a concrete user-facing state such as `MEASUREMENT NEEDED`, `MORE EVIDENCE NEEDED`, `UNSUPPORTED HERE`, `PASS`, or `FAIL` instead of a bare generic `UNKNOWN`;
+- reserve long-lived `UNKNOWN` for genuinely unavailable or unsupported evidence, and explain what would be required to resolve it.
+
+A measurement is not "accurate" merely because it has many decimal places. Accuracy requires a defined estimand, exact conditions, suitable sample size, uncertainty evidence where applicable, and reproducibility.
+
+`INCONCLUSIVE` is likewise not a terminal state. When the decision matters and additional measurement is feasible, Frontierwright should gather enough additional evidence to narrow the uncertainty interval until the criterion is decided or the configured measurement budget is exhausted.
+
 Displayed stats must never imply more precision than the evidence supports.
 
 Every capability result should, where technically possible, expose:

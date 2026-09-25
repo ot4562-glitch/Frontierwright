@@ -171,6 +171,8 @@ class ObservationSummary:
     by_task: tuple[TaskObservationSummary, ...] = ()
     failure_categories: dict[str, int] = field(default_factory=dict)
     workload_profile_hashes: tuple[str, ...] = ()
+    cohort_workload_profile_hash: str | None = None
+    excluded_other_workload_versions: int = 0
     note: str = (
         "Usage observations are operational evidence, not RL rewards. Raw prompt/response "
         "content is not stored by this observation contract."
@@ -246,8 +248,21 @@ def summarize_observations(
     observations: list[UsageObservation],
     *,
     model_id: str | None,
+    workload_profile_hash: str | None = None,
 ) -> ObservationSummary:
-    selected = [item for item in observations if model_id is None or item.model_id == model_id]
+    model_selected = [
+        item for item in observations if model_id is None or item.model_id == model_id
+    ]
+    if workload_profile_hash is None:
+        selected = model_selected
+        excluded_other_workload_versions = 0
+    else:
+        selected = [
+            item
+            for item in model_selected
+            if item.workload_profile_hash == workload_profile_hash
+        ]
+        excluded_other_workload_versions = len(model_selected) - len(selected)
     counts = {outcome: 0 for outcome in ObservationOutcome}
     by_task_raw: dict[str, dict[ObservationOutcome, int]] = {}
     failure_categories: dict[str, int] = {}
@@ -318,4 +333,6 @@ def summarize_observations(
         by_task=tuple(by_task),
         failure_categories=ordered_categories,
         workload_profile_hashes=tuple(sorted(workload_hashes)),
+        cohort_workload_profile_hash=workload_profile_hash,
+        excluded_other_workload_versions=excluded_other_workload_versions,
     )

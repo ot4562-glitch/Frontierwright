@@ -107,7 +107,6 @@ from frontierwright.local_executor import (
 )
 from frontierwright.models import discover_history_evidence, inspect_local_model
 from frontierwright.observations import (
-    OBSERVATION_EVENT_KIND,
     OBSERVATION_SOURCE_EXPLICIT,
     ObservationOutcome,
     ObservationSummary,
@@ -146,6 +145,13 @@ from frontierwright.serving_adapters import (
     import_serving_resource_manifest,
     import_vllm_bench_serve,
 )
+from frontierwright.workload_acceptance import (
+    AcceptanceEvidenceReceipt,
+    WorkloadAcceptanceContractV1,
+    acceptance_contract_from_payload,
+    assess_workload_acceptance,
+    load_workload_acceptance_contract,
+)
 from frontierwright.workload_evaluations import (
     WORKLOAD_EVAL_BINDING_KIND,
     WorkloadEvaluationBinding,
@@ -157,6 +163,7 @@ from frontierwright.workloads import (
     ParetoDirection,
     ParetoMetricInput,
     WorkloadProfile,
+    assess_workload_decision_claim,
     assess_workload_fit,
     compare_explicit_user_utility,
     compare_pareto_metrics,
@@ -290,7 +297,31 @@ class WorkloadFitView:
     counts: dict[str, int] = field(default_factory=dict)
     constraints: list[dict[str, object]] = field(default_factory=list)
     workload_evaluation_coverage: dict[str, object] = field(default_factory=dict)
+    workload_acceptance: dict[str, object] = field(default_factory=dict)
     synthetic_utility_score: None = None
+    note: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WorkloadAcceptanceView:
+    schema_version: int = 1
+    configured: bool = False
+    contract_id: str | None = None
+    contract_hash: str | None = None
+    workload_profile_hash: str | None = None
+    contract_name: str | None = None
+    active: bool = False
+    criteria: list[dict[str, object]] = field(default_factory=list)
+    assessment_id: str | None = None
+    assessment_hash: str | None = None
+    model_id: str | None = None
+    model_fingerprint: str | None = None
+    overall_status: str = "NOT_CONFIGURED"
+    assessment_criteria: list[dict[str, object]] = field(default_factory=list)
+    evidence_refs: list[dict[str, str]] = field(default_factory=list)
     note: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -5269,14 +5300,13 @@ def detect_resources(root: Path) -> ResourceView:
     return get_resource_view(root)
 
 
-def _usage_observations_from_state(state: ProjectState) -> list[UsageObservation]:
+def _usage_observations_from_registry(
+    registry: Registry,
+    *,
+    model_id: str | None,
+) -> list[UsageObservation]:
     observations: list[UsageObservation] = []
-    for event in state.history:
-        if event.get("kind") != OBSERVATION_EVENT_KIND:
-            continue
-        details = event.get("details")
-        if not isinstance(details, dict):
-            continue
+    for details in registry.list_usage_observation_payloads(model_id=model_id):
         observation = observation_from_event(details)
         if observation is not None:
             observations.append(observation)
@@ -5293,9 +5323,16 @@ def get_usage_observation_summary(root: Path, model_id: str | None = None) -> Ob
         target_model_id = state.champion.model.model_id
     if target_model_id is not None:
         registry.get_model(target_model_id)
+    workload = registry.get_active_workload_profile()
+    profile_hash = (
+        str(workload["profile_hash"])
+        if workload is not None and isinstance(workload.get("profile_hash"), str)
+        else None
+    )
     return summarize_observations(
-        _usage_observations_from_state(state),
+        _usage_observations_from_registry(registry, model_id=target_model_id),
         model_id=target_model_id,
+        workload_profile_hash=profile_hash,
     )
 
 
@@ -5369,20 +5406,8 @@ def record_usage_observation(
     )
     payload = observation.to_payload()
 
-    if clean_key:
-        for existing in _usage_observations_from_state(state):
-            if existing.observation_id != observation.observation_id:
-                continue
-            if existing.to_payload() != payload:
-                raise FrontierwrightError(
-                    "USAGE_OBSERVATION_IDEMPOTENCY_CONFLICT",
-                    "The idempotency key already identifies different usage evidence.",
-                    13,
-                )
-            return UsageObservationRecordView(replayed=True, observation=existing.to_payload())
-
-    registry.record_event(OBSERVATION_EVENT_KIND, payload)
-    return UsageObservationRecordView(replayed=False, observation=payload)
+    replayed, stored_payload = registry.record_usage_observation_atomic(payload)
+    return UsageObservationRecordView(replayed=replayed, observation=stored_payload)
 
 
 def get_workload_view(root: Path) -> WorkloadView:
@@ -5423,6 +5448,295 @@ def set_workload_profile(root: Path, profile: WorkloadProfile) -> WorkloadView:
         )
     registry.save_workload_profile(profile)
     return get_workload_view(root)
+
+
+def _acceptance_evidence_from_registry(
+    stored: dict[str, object],
+) -> AcceptanceEvidenceReceipt:
+    raw_conditions = stored.get("conditions")
+    raw_measurements = stored.get("measurements")
+    if not isinstance(raw_conditions, dict) or not isinstance(raw_measurements, list):
+        raise FrontierwrightError(
+            "WORKLOAD_ACCEPTANCE_EVIDENCE_INVALID",
+            "Stored evaluation receipt lacks structured conditions/measurements.",
+            4,
+        )
+    measurements: list[RawMeasurement] = []
+    for index, raw in enumerate(raw_measurements):
+        if not isinstance(raw, dict) or not isinstance(raw.get("higher_is_better"), bool):
+            raise FrontierwrightError(
+                "WORKLOAD_ACCEPTANCE_EVIDENCE_INVALID",
+                f"Stored evaluation measurement {index} lacks explicit metric direction.",
+                4,
+            )
+        try:
+            measurements.append(
+                RawMeasurement(
+                    task_id=str(raw["task_id"]),
+                    task_version=str(raw["task_version"]),
+                    metric=str(raw["metric"]),
+                    value=float(raw["value"]),
+                    higher_is_better=bool(raw["higher_is_better"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FrontierwrightError(
+                "WORKLOAD_ACCEPTANCE_EVIDENCE_INVALID",
+                f"Stored evaluation measurement {index} is invalid.",
+                4,
+            ) from exc
+    required_text = (
+        "receipt_id",
+        "receipt_sha256",
+        "model_id",
+        "model_fingerprint",
+        "evaluator_id",
+        "evaluator_version",
+    )
+    values: dict[str, str] = {}
+    for key in required_text:
+        value = stored.get(key)
+        if not isinstance(value, str) or not value:
+            raise FrontierwrightError(
+                "WORKLOAD_ACCEPTANCE_EVIDENCE_INVALID",
+                f"Stored evaluation receipt is missing {key}.",
+                4,
+            )
+        values[key] = value
+    return AcceptanceEvidenceReceipt(
+        receipt_id=values["receipt_id"],
+        receipt_sha256=values["receipt_sha256"],
+        model_id=values["model_id"],
+        model_fingerprint=values["model_fingerprint"],
+        evaluator_id=values["evaluator_id"],
+        evaluator_version=values["evaluator_version"],
+        conditions=dict(raw_conditions),
+        measurements=tuple(measurements),
+    )
+
+
+def get_workload_acceptance_view(
+    root: Path,
+    contract_ref: str | None = None,
+    model_id: str | None = None,
+) -> WorkloadAcceptanceView:
+    registry = Registry(root)
+    if not registry.exists:
+        return WorkloadAcceptanceView(note="Project is not initialized.")
+
+    contract_row: dict[str, object] | None
+    if contract_ref is not None:
+        contract_row = registry.get_workload_acceptance_contract(contract_ref)
+    else:
+        workload = registry.get_active_workload_profile()
+        if workload is None or not isinstance(workload.get("profile_hash"), str):
+            return WorkloadAcceptanceView(
+                note="Define a workload profile before configuring success criteria."
+            )
+        contract_row = registry.get_active_workload_acceptance_contract(
+            str(workload["profile_hash"])
+        )
+    if contract_row is None:
+        return WorkloadAcceptanceView(
+            note=(
+                "Success criteria are not configured. Exact workload coverage alone does not "
+                "prove that the model satisfies the user's workload."
+            )
+        )
+
+    raw_contract = contract_row.get("contract")
+    if not isinstance(raw_contract, dict):
+        raise FrontierwrightError(
+            "REGISTRY_ERROR",
+            "Stored workload acceptance contract payload is invalid.",
+            4,
+        )
+    contract = acceptance_contract_from_payload(dict(raw_contract))
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None and state.champion is not None:
+        target_model_id = state.champion.model.model_id
+
+    criteria_payload = [item.to_payload() for item in contract.criteria]
+    active = bool(contract_row.get("active"))
+    if target_model_id is None:
+        return WorkloadAcceptanceView(
+            configured=True,
+            contract_id=contract.contract_id,
+            contract_hash=contract.contract_hash,
+            workload_profile_hash=contract.workload_profile_hash,
+            contract_name=contract.name,
+            active=active,
+            criteria=criteria_payload,
+            overall_status="NOT_ASSESSED",
+            note="No model exists yet, so workload acceptance cannot be assessed.",
+        )
+
+    model = registry.get_model(target_model_id)
+    stored_assessment = registry.get_latest_workload_acceptance_assessment(
+        contract.contract_id,
+        model.model_id,
+        model.fingerprint,
+    )
+    if stored_assessment is None:
+        return WorkloadAcceptanceView(
+            configured=True,
+            contract_id=contract.contract_id,
+            contract_hash=contract.contract_hash,
+            workload_profile_hash=contract.workload_profile_hash,
+            contract_name=contract.name,
+            active=active,
+            criteria=criteria_payload,
+            model_id=model.model_id,
+            model_fingerprint=model.fingerprint,
+            overall_status="NOT_ASSESSED",
+            note=(
+                "The success contract exists, but this exact model has not been assessed "
+                "against an explicit evidence set."
+            ),
+        )
+
+    raw_assessment = stored_assessment.get("assessment")
+    if not isinstance(raw_assessment, dict):
+        raise FrontierwrightError(
+            "REGISTRY_ERROR",
+            "Stored workload acceptance assessment payload is invalid.",
+            4,
+        )
+    raw_criteria = raw_assessment.get("criteria")
+    raw_evidence = raw_assessment.get("evidence_refs")
+    return WorkloadAcceptanceView(
+        configured=True,
+        contract_id=contract.contract_id,
+        contract_hash=contract.contract_hash,
+        workload_profile_hash=contract.workload_profile_hash,
+        contract_name=contract.name,
+        active=active,
+        criteria=criteria_payload,
+        assessment_id=(
+            str(stored_assessment["assessment_id"])
+            if isinstance(stored_assessment.get("assessment_id"), str)
+            else None
+        ),
+        assessment_hash=(
+            str(stored_assessment["assessment_hash"])
+            if isinstance(stored_assessment.get("assessment_hash"), str)
+            else None
+        ),
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        overall_status=str(raw_assessment.get("overall_status") or "UNKNOWN"),
+        assessment_criteria=(
+            [dict(item) for item in raw_criteria if isinstance(item, dict)]
+            if isinstance(raw_criteria, list)
+            else []
+        ),
+        evidence_refs=(
+            [
+                {str(key): str(value) for key, value in item.items()}
+                for item in raw_evidence
+                if isinstance(item, dict)
+            ]
+            if isinstance(raw_evidence, list)
+            else []
+        ),
+        note=(
+            str(raw_assessment.get("note")) if isinstance(raw_assessment.get("note"), str) else None
+        ),
+    )
+
+
+def set_workload_acceptance_contract(
+    root: Path,
+    contract: WorkloadAcceptanceContractV1,
+) -> WorkloadAcceptanceView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before setting success criteria.",
+            10,
+        )
+    registry.save_workload_acceptance_contract(contract)
+    return get_workload_acceptance_view(root, contract.contract_id)
+
+
+def load_and_set_workload_acceptance_contract(
+    root: Path,
+    path: Path,
+) -> WorkloadAcceptanceView:
+    return set_workload_acceptance_contract(root, load_workload_acceptance_contract(path))
+
+
+def assess_workload_acceptance_evidence(
+    root: Path,
+    *,
+    contract_ref: str,
+    model_id: str | None,
+    receipt_ids: tuple[str, ...],
+) -> WorkloadAcceptanceView:
+    registry = Registry(root)
+    if not registry.exists:
+        raise FrontierwrightError(
+            "NOT_INITIALIZED",
+            "Initialize a Frontierwright project before assessing workload acceptance.",
+            10,
+        )
+    contract_row = registry.get_workload_acceptance_contract(contract_ref)
+    if contract_row is None:
+        raise FrontierwrightError(
+            "WORKLOAD_ACCEPTANCE_CONTRACT_NOT_FOUND",
+            "The requested workload acceptance contract is not registered.",
+            12,
+        )
+    raw_contract = contract_row.get("contract")
+    if not isinstance(raw_contract, dict):
+        raise FrontierwrightError(
+            "REGISTRY_ERROR",
+            "Stored workload acceptance contract payload is invalid.",
+            4,
+        )
+    contract = acceptance_contract_from_payload(dict(raw_contract))
+
+    state = registry.read()
+    target_model_id = model_id
+    if target_model_id is None:
+        if state.champion is None:
+            raise FrontierwrightError(
+                "NO_CHAMPION_MODEL",
+                "Specify --model or establish a Champion before acceptance assessment.",
+                12,
+            )
+        target_model_id = state.champion.model.model_id
+    model = registry.get_model(target_model_id)
+    _verify_model_artifact_integrity(registry, model.model_id)
+
+    clean_receipt_ids = tuple(dict.fromkeys(item.strip() for item in receipt_ids if item.strip()))
+    if not clean_receipt_ids:
+        raise FrontierwrightError(
+            "WORKLOAD_ACCEPTANCE_EVIDENCE_REQUIRED",
+            "Select at least one exact evaluation receipt for acceptance assessment.",
+            2,
+        )
+    receipts: list[AcceptanceEvidenceReceipt] = []
+    for receipt_id in clean_receipt_ids:
+        stored_receipt = registry.get_evaluation_receipt(receipt_id)
+        if stored_receipt is None:
+            raise FrontierwrightError(
+                "WORKLOAD_ACCEPTANCE_EVIDENCE_NOT_FOUND",
+                f"Evaluation receipt is not registered: {receipt_id}",
+                12,
+            )
+        receipts.append(_acceptance_evidence_from_registry(stored_receipt))
+
+    assessment = assess_workload_acceptance(
+        contract,
+        model_id=model.model_id,
+        model_fingerprint=model.fingerprint,
+        receipts=tuple(receipts),
+    )
+    registry.store_workload_acceptance_assessment(assessment)
+    return get_workload_acceptance_view(root, contract.contract_id, model.model_id)
 
 
 def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView:
@@ -5475,6 +5789,7 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
         and raw_context_length > 0
         else None
     )
+    acceptance = get_workload_acceptance_view(root, model_id=target_model_id)
     assessment = assess_workload_fit(
         profile,
         capability_stats=stats,
@@ -5483,6 +5798,7 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
         workload_eval_coverage=(
             True if workload_evaluation_coverage.get("complete") is True else None
         ),
+        workload_acceptance_status=(acceptance.overall_status if acceptance.configured else None),
         serving_boundary=(
             str(model_fit["execution_boundary"])
             if isinstance(model_fit.get("execution_boundary"), str)
@@ -5510,6 +5826,7 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
             else []
         ),
         workload_evaluation_coverage=workload_evaluation_coverage,
+        workload_acceptance=acceptance.to_dict(),
         note=str(payload.get("note")) if payload.get("note") else None,
     )
 
@@ -7974,6 +8291,137 @@ def _paired_capability_evidence(
     }
 
 
+def _holm_bonferroni(
+    p_values: dict[str, float], *, alpha: float = 0.05
+) -> dict[str, dict[str, object]]:
+    """Step-down Holm correction for the capability axes used in one decision claim."""
+
+    ordered = sorted(p_values.items(), key=lambda item: (item[1], item[0]))
+    result: dict[str, dict[str, object]] = {}
+    still_rejecting = True
+    total = len(ordered)
+    for index, (key, p_value) in enumerate(ordered):
+        threshold = alpha / (total - index)
+        significant = bool(still_rejecting and p_value <= threshold)
+        if not significant:
+            still_rejecting = False
+        result[key] = {
+            "p_value_two_sided": p_value,
+            "holm_threshold": threshold,
+            "significant_after_holm": significant,
+        }
+    return result
+
+
+def _qualify_workload_decision_claim(
+    registry: Registry,
+    *,
+    profile: WorkloadProfile,
+    profile_hash: str,
+    baseline_model_id: str,
+    contender_model_id: str,
+    comparison: object,
+    utility: object,
+) -> dict[str, object]:
+    # The concrete types are produced by workloads.py; keeping this helper at the service
+    # boundary avoids turning claim policy into persistence or trainer policy.
+    from frontierwright.workloads import ExplicitUtilityComparison, ParetoComparison
+
+    if not isinstance(comparison, ParetoComparison) or not isinstance(
+        utility, ExplicitUtilityComparison
+    ):
+        raise TypeError("invalid workload comparison objects")
+
+    contender_fit = get_workload_fit(registry.root, contender_model_id)
+    workload_blockers, _ = _workload_promotion_gate(contender_fit)
+    claim = assess_workload_decision_claim(
+        profile,
+        comparison,
+        utility,
+        mandatory_fit_eligible=not workload_blockers,
+    )
+    payload = claim.to_payload()
+
+    def append_claim_reason(code: str) -> None:
+        raw_reasons = payload.get("reasons")
+        reasons = [str(item) for item in raw_reasons] if isinstance(raw_reasons, list) else []
+        payload["reasons"] = reasons + [code]
+
+    capability_improvements = [key for key in claim.improvements if key.startswith("capability.")]
+    statistical_confirmation: dict[str, object] = {
+        "required_for_capability_improvement": bool(capability_improvements),
+        "method": "holm-bonferroni-over-material-improving-capability-axes-v1",
+        "alpha": 0.05,
+        "axes": {},
+    }
+    if claim.decision_eligible and capability_improvements:
+        paired = _paired_capability_evidence(
+            registry,
+            champion_model_id=baseline_model_id,
+            candidate_model_id=contender_model_id,
+        )
+        if paired.get("available") is not True:
+            payload["status"] = "INCOMPLETE"
+            payload["kind"] = "NONE"
+            payload["decision_eligible"] = False
+            append_claim_reason("CAPABILITY_PAIRED_EVIDENCE_MISSING")
+            statistical_confirmation["reason"] = paired.get("reason")
+        else:
+            raw_axes = paired.get("axes")
+            p_values: dict[str, float] = {}
+            if isinstance(raw_axes, dict):
+                for metric_key in capability_improvements:
+                    axis = metric_key.split(".", 1)[1]
+                    evidence = raw_axes.get(axis)
+                    p_value = (
+                        evidence.get("p_value_two_sided") if isinstance(evidence, dict) else None
+                    )
+                    if isinstance(p_value, (int, float)) and not isinstance(p_value, bool):
+                        p_values[metric_key] = float(p_value)
+            if set(p_values) != set(capability_improvements):
+                payload["status"] = "INCOMPLETE"
+                payload["kind"] = "NONE"
+                payload["decision_eligible"] = False
+                append_claim_reason("CAPABILITY_PAIRED_EVIDENCE_MISMATCH")
+            else:
+                corrected = _holm_bonferroni(p_values)
+                statistical_confirmation["axes"] = corrected
+                if not all(bool(item.get("significant_after_holm")) for item in corrected.values()):
+                    payload["status"] = "INCOMPLETE"
+                    payload["kind"] = "NONE"
+                    payload["decision_eligible"] = False
+                    append_claim_reason(
+                        "CAPABILITY_IMPROVEMENT_NOT_CONFIRMED_AFTER_MULTIPLE_TESTING"
+                    )
+
+    payload["statistical_confirmation"] = statistical_confirmation
+    baseline = registry.get_model(baseline_model_id)
+    contender = registry.get_model(contender_model_id)
+    payload["workload_profile_hash"] = profile_hash
+    payload["baseline_model_id"] = baseline.model_id
+    payload["baseline_fingerprint"] = baseline.fingerprint
+    payload["contender_model_id"] = contender.model_id
+    payload["contender_fingerprint"] = contender.fingerprint
+    payload["selection_confirmation"] = {
+        "independent_confirmation_available": False,
+        "better_for_workload_statement_allowed": False,
+        "reason": (
+            "Independent post-selection confirmation is not implemented; this result is "
+            "decision evidence, not a confirmatory superiority claim."
+        ),
+    }
+    digest_payload = dict(payload)
+    encoded = json.dumps(
+        digest_payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload["claim_digest"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return payload
+
+
 def _candidate_pareto_evidence(
     registry: Registry,
     *,
@@ -8062,6 +8510,15 @@ def _candidate_pareto_evidence(
                 evidence_source=inference_source,
             ),
             ParetoMetricInput(
+                key="serving.context_p95",
+                category="SERVING",
+                direction=ParetoDirection.HIGHER_BETTER,
+                champion_value=measured(champion_profile, "context_length"),
+                candidate_value=measured(candidate_profile, "context_length"),
+                unit="tokens",
+                evidence_source=inference_source,
+            ),
+            ParetoMetricInput(
                 key="serving.ttft_p50",
                 category="SERVING",
                 direction=ParetoDirection.LOWER_BETTER,
@@ -8145,9 +8602,24 @@ def _candidate_pareto_evidence(
     workload_row = state.workload_profile
     if workload_row is not None and isinstance(workload_row.get("profile"), dict):
         profile = workload_profile_from_payload(dict(workload_row["profile"]))
-        payload["explicit_user_utility"] = compare_explicit_user_utility(
-            profile, comparison
-        ).to_payload()
+        utility = compare_explicit_user_utility(profile, comparison)
+        payload["explicit_user_utility"] = utility.to_payload()
+        profile_hash = workload_row.get("profile_hash")
+        if not isinstance(profile_hash, str) or not profile_hash:
+            raise FrontierwrightError(
+                "REGISTRY_ERROR",
+                "Active workload profile is missing its immutable hash.",
+                4,
+            )
+        payload["workload_decision_claim"] = _qualify_workload_decision_claim(
+            registry,
+            profile=profile,
+            profile_hash=profile_hash,
+            baseline_model_id=champion_model_id,
+            contender_model_id=candidate_model_id,
+            comparison=comparison,
+            utility=utility,
+        )
     else:
         payload["explicit_user_utility"] = {
             "status": "NOT_CONFIGURED",
@@ -8156,6 +8628,14 @@ def _candidate_pareto_evidence(
             "contributions": [],
             "missing_metrics": [],
             "note": "No active workload profile defines explicit user utility settings.",
+        }
+        payload["workload_decision_claim"] = {
+            "status": "NOT_CONFIGURED",
+            "kind": "NONE",
+            "decision_eligible": False,
+            "better_for_workload_statement_allowed": False,
+            "reasons": ["NO_WORKLOAD_PROFILE"],
+            "note": "Define a versioned workload contract before making user-fit claims.",
         }
     payload["inference_profile_comparable"] = inference_comparable
     if not champion_profile or not candidate_profile:
