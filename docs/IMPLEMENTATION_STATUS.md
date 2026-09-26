@@ -1,6 +1,6 @@
 # Frontierwright Implementation Status
 
-Updated: 2026-09-25
+Updated: 2026-09-26
 
 This document keeps the detailed engineering inventory out of the public README.
 The README explains the product and fastest path to trying it; this file records the
@@ -15,7 +15,7 @@ Implemented now:
 - immutable domain primitives for model origin, capability evidence, candidates/champion, build mode, and history confidence;
 - authoritative `.frontierwright/registry.sqlite` project state plus human-readable `project.toml`;
 - automatic registry migration through schema v26, including persisted edition profiles, zero-model birth provenance, trainable tokenizer artifacts, data-preparation recipes, intervention identity backfill, frozen-scale Build binding, dataset/backend data-boundary policy, Lab adapter manifests, durable run-usage receipts, preference-dataset role support, multi-parent model lineage edges, and a permanent `origin_model_id` that is backfilled from historical root evidence when possible;
-- current-champion semantics: historical model states never inflate the current displayed stats, while RC4 persists the first root/current model as a permanent project origin so later Champion promotion never re-zeros project-relative growth;
+- current-champion semantics: historical model states never inflate the current displayed stats, while v1 persists the first root/current model as a permanent project origin so later Champion promotion never re-zeros project-relative growth;
 - local Hugging Face model import with content-based SHA-256 fingerprinting of config/tokenizer/weight artifacts;
 - GGUF inspection/import as explicitly non-trainable rather than pretending an inference artifact is trainable;
 - history evidence states `UNKNOWN / PARTIAL / VERIFIED / COMPLETE`;
@@ -29,10 +29,10 @@ Implemented now:
 - immutable Workload Acceptance v1 contracts bind exact workload revision, task/version/metric, unit, threshold direction, evaluator conditions, and deterministic-point or explicit-confidence-interval evidence rules; `frontierwright workload acceptance schema/example/create/show/assess` exposes the public JSON contract, emits an active-workload-bound example, reports field-specific enum/numeric errors, and persists auditable assessments without auto-promotion;
 - Candidate promotion hard-gates configured measurable workload requirements: FAIL/UNKNOWN/INCONCLUSIVE blocks default promotion, the exact Workload Profile/gate evidence is persisted with the decision, and profile/evidence changes invalidate the gate transactionally before Champion mutation;
 - an edition-aware evidence planner maps missing constraints to the next required measurement, explicitly routes missing `evaluation.workload_acceptance` to the public acceptance-example/create workflow, maps INCONCLUSIVE constraints to additional compatible sampling, and maps measured FAIL constraints to bounded, falsifiable experiments; it exposes the same logic through `frontierwright workload next` and the TUI while deliberately returning no predicted performance gain;
-- Candidate comparison includes a raw Pareto surface across comparable capability, serving latency/TTFT/TPOT/throughput, measured VRAM/RSS, and artifact-storage evidence; RC4 accepts explicit improvement intervals and marks overlapping runtime evidence as `UNCERTAIN`, while UNKNOWN/UNCERTAIN material dimensions block unqualified dominance claims;
+- Candidate comparison includes a raw Pareto surface across comparable capability, serving latency/TTFT/TPOT/throughput, measured VRAM/RSS, and artifact-storage evidence; v1 accepts explicit improvement intervals and marks overlapping runtime evidence as `UNCERTAIN`, while UNKNOWN/UNCERTAIN material dimensions block unqualified dominance claims;
 - optional user utility is computed only when the user supplies both a positive weight and normalization scale for every selected measured metric; missing evidence yields INCOMPLETE, regressions remain visible, utility never auto-promotes a Candidate, and practical improvement margins plus fit gates qualify local decision claims; adaptive candidate selection does not produce an unqualified scientific “better for this workload” statement without independent confirmation;
 - bf16/fp16 kept `UNKNOWN` until backend-specific capability calibration instead of hardware-name guessing;
-- RC4 introduces stable Stat v2 axes (`KNOWLEDGE / REASONING / MATH / CODING / INSTRUCTION / LANGUAGE / CONTEXT`), an origin-relative stat primitive with explicit `BETTER / WORSE / SAME / UNCERTAIN / UNMEASURED` relations, and a curated external benchmark metadata registry that separates pure-model, system/agent, and framework sources without vendoring third-party benchmark data;
+- v1 introduces stable Stat v2 axes (`KNOWLEDGE / REASONING / MATH / CODING / INSTRUCTION / LANGUAGE / CONTEXT`), an origin-relative stat primitive with explicit `BETTER / WORSE / SAME / UNCERTAIN / UNMEASURED` relations, and a curated external benchmark metadata registry that separates pure-model, system/agent, and framework sources without vendoring third-party benchmark data;
 - raw benchmark `EvaluationReceipt` ingestion with exact model-id/fingerprint matching;
 - strict lm-evaluation-harness result import pins exact harness revision, source hash, task/version/metric identity, standard-error metadata and metric direction while keeping external results as raw evidence until an explicit frozen scale maps them;
 - Hugging Face LightEval saved-result import pins an explicit evaluator version/revision, source hash, declared task version and metric direction from `config_tasks`, skips the mixed aggregate `all` row, preserves standard-error evidence, and imports only aggregate result JSON rather than copying detail Parquet prompts/responses;
@@ -74,7 +74,7 @@ Implemented now:
 - Academy tokenizer birth via `frontierwright birth tokenizer DATASET_ID`, training deterministic byte-level BPE merge rules from an exact registered PRETRAIN dataset fingerprint, publishing an immutable managed tokenizer artifact with replay semantics, and blocking dataset drift or tokenizer changes after model birth;
 - Academy zero-model birth via `frontierwright birth zero`, with deterministic `zero-8m` / `zero-25m` root checkpoint materialization, exact fingerprinting, runtime provenance, idempotent repeated birth requests, and optional `--tokenizer-artifact` binding that changes the real embedding/lm-head vocabulary size while pinning tokenizer identity into birth provenance;
 - from-scratch pretraining now requires and pins a materialized zero-model birth root instead of silently reinitializing weights;
-- hard-missing prerequisites show `LOCKED`; RC4 plan views separate calibration readiness from new-attempt admission and expose `calibration_ready / new_attempt_allowed / replay_available / run_count / remaining_runs`, so a consumed `max_runs` budget no longer advertises a new attempt as `READY` even when the existing completed request remains idempotently replayable;
+- hard-missing prerequisites show `LOCKED`; v1 plan views separate calibration readiness from new-attempt admission and expose `calibration_ready / new_attempt_allowed / replay_available / run_count / remaining_runs`, so a consumed `max_runs` budget no longer advertises a new attempt as `READY` even when the existing completed request remains idempotently replayable;
 - immutable `TrainingPlan` identity with pinned intervention ID/version/family, model fingerprint, dataset/recipe fingerprint, dataset classification, backend spec hash/data boundary, resource profile, config, permission, and hard budgets;
 - representative calibration receipts with step time, throughput, peak memory, projected storage, and projected wall time;
 - idempotent durable local run attempts with worker/process identity, liveness reconciliation, durable executor results, explicit rerun semantics, and repairable run-receipt export;
@@ -122,9 +122,9 @@ Not implemented yet:
 
 - broad arbitrary-Hugging-Face production adapters; the built-in QLoRA path is intentionally a narrow Frontierwright-reference implementation rather than a claim of arbitrary-architecture compatibility;
 - production external RL adapters such as verl/OpenRLHF with validated rollout/checkpoint/restart semantics; the built-in verifier-driven REINFORCE path remains a real but narrow reference implementation;
-- executable multi-source Capability/Stat v2 adapters and frozen benchmark-to-axis mappings; RC4 currently ships the stable axes, source registry, origin-relative primitive, and uncertainty semantics but does not claim that cataloged external suites are already runnable;
-- consent-driven additional held-out-item measurement and statistically stronger interleaved runtime remeasurement beyond the current conservative observed-range guard;
-- persisted Studio growth-goal rules integrated with the existing Build/Workload authority, including direct Build -> Workload Acceptance synthesis;
+- executable multi-source Capability/Stat v2 adapters and frozen benchmark-to-axis mappings; v1 ships the stable axes, source registry, origin-relative primitive, and uncertainty semantics but does not claim that cataloged external suites are already runnable;
+- consent-driven additional held-out-item capability measurement beyond Capability v1; runtime uncertainty can already be remeasured through an interleaved Champion/Candidate ABBA-style service path;
+- automatic Build -> Workload Acceptance contract synthesis; persisted Studio growth-goal rules and Candidate promotion gating are implemented, while explicit acceptance contracts remain independently versioned evidence;
 - validated adaptive/IRT evaluation suitable for release decisions; current adaptive/IRT work remains a research direction rather than a production evaluator;
 - OS/filesystem-enforced storage quotas with zero polling overshoot, real GPU-utilization telemetry beyond accounted GPU-hours, and runtime monetary metering/enforcement;
 - public dataset discovery/download adapters and richer prepared tokenization/sharding formats beyond the implemented uint8 byte-ID shards;
@@ -135,6 +135,6 @@ Those unsupported surfaces remain explicitly `NOT_READY`; measurable gaps use ac
 
 ## Verification
 
-The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The current rc4 candidate-integrity gate is `tools/rc4_release_gate.py`; it inherits the rc3 lifecycle/edition checks and additionally requires permanent-origin persistence/migration, acceptance schema/example discoverability and next-actions, UNCERTAIN-aware comparison, explicit run-admission/replay semantics, and the RC4 benchmark-source registry.
-See the root README for current development status and verification commands.
+The stable v1 release retains `tools/v1_release_gate.py` and the stricter `tools/rc4_release_gate.py` candidate-integrity gate. The final release additionally received direct three-edition public-surface playtesting, complete 81-command help traversal, clean package verification, and the normal CI matrix.
+See the root README for v1 usage and verification commands.
 

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from frontierwright.benchmark_sources import BENCHMARK_SOURCES, StatAxisV2
+from frontierwright.domain import ModelOrigin, ModelState
+from frontierwright.registry import Registry
+from frontierwright.service import get_stat_v2_growth
 from frontierwright.stat_v2 import (
     BenchmarkEstimate,
     StatRelation,
@@ -77,3 +82,46 @@ def test_benchmark_catalog_separates_model_system_and_framework_sources() -> Non
     assert by_id["terminal-bench"].kind.value == "SYSTEM"
     assert by_id["lm-eval"].kind.value == "FRAMEWORK"
     assert by_id["inspect-ai"].kind.value == "FRAMEWORK"
+    payload = by_id["livebench"].to_payload()
+    assert payload["integration_status"] == "CATALOG_ONLY"
+    assert payload["license_status"] == "VERIFY_UPSTREAM"
+    assert payload["next_action"]
+
+
+def test_origin_model_is_displayed_as_zero_without_fake_absolute_measurement(
+    tmp_path: Path,
+) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("Studio", ModelOrigin.IMPORTED_LOCAL)
+    state = registry.read()
+    origin = ModelState(
+        model_id="origin-model",
+        identity_id=str(state.project["identity_id"]),
+        origin=ModelOrigin.IMPORTED_LOCAL,
+        checkpoint="origin",
+        fingerprint="sha256:origin-model",
+    )
+    registry.register_candidate(origin)
+    registry.promote_candidate(origin.model_id)
+
+    payload = get_stat_v2_growth(tmp_path)
+
+    assert payload["origin_model_id"] == origin.model_id
+    assert payload["model_id"] == origin.model_id
+    stats = payload["stats"]
+    assert isinstance(stats, dict)
+    assert set(stats) == {
+        "knowledge",
+        "reasoning",
+        "math",
+        "coding",
+        "instruction",
+        "language",
+        "context",
+    }
+    for stat in stats.values():
+        assert stat["display_delta"] == 0.0
+        assert stat["relation"] == "SAME"
+        assert stat["source"] == "ORIGIN_BASELINE"
+        assert stat["source_count"] == 0
+    assert "reference point rather than an absolute capability claim" in payload["note"]

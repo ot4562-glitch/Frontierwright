@@ -211,6 +211,72 @@ def _identity_from_payload(raw: object, label: str) -> RLIdentity:
     )
 
 
+def rl_config_schema() -> dict[str, object]:
+    identity = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["id", "version", "kind", "config"],
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "version": {"type": "string", "minLength": 1},
+            "kind": {"type": "string", "minLength": 1},
+            "config": {"type": "object"},
+        },
+    }
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Frontierwright RL_POLICY_OPTIMIZATION config",
+        "description": (
+            "The built-in reference path is bounded verifiable-choice REINFORCE. "
+            "It is not an open-ended RLHF, agentic-environment, or distributed production RL "
+            "implementation."
+        ),
+        "type": "object",
+        "additionalProperties": True,
+        "required": ["rl"],
+        "properties": {
+            "rl": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["algorithm_id", "environment", "reward"],
+                "properties": {
+                    "schema_version": {"const": RL_SPEC_SCHEMA_VERSION},
+                    "algorithm_id": {"type": "string", "minLength": 1},
+                    "environment": identity,
+                    "reward": identity,
+                    "rollout_temperature": {"type": "number", "exclusiveMinimum": 0},
+                    "entropy_coefficient": {"type": "number", "minimum": 0},
+                    "algorithm_config": {"type": "object"},
+                },
+            }
+        },
+    }
+
+
+def rl_config_example() -> dict[str, object]:
+    return {
+        "rl": {
+            "schema_version": RL_SPEC_SCHEMA_VERSION,
+            "algorithm_id": REFERENCE_RL_ALGORITHM,
+            "environment": {
+                "id": "frontierwright-reference-mc",
+                "version": "1",
+                "kind": REFERENCE_RL_ENVIRONMENT_KIND,
+                "config": {},
+            },
+            "reward": {
+                "id": "frontierwright-exact-choice",
+                "version": "1",
+                "kind": REFERENCE_RL_REWARD_KIND,
+                "config": {},
+            },
+            "rollout_temperature": 1.0,
+            "entropy_coefficient": 0.0,
+            "algorithm_config": {},
+        }
+    }
+
+
 def rl_spec_from_config(config: dict[str, object]) -> RLExperimentSpec:
     """Parse the nested rl object pinned inside a TrainingPlan config."""
 

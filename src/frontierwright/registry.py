@@ -30,6 +30,7 @@ from frontierwright.domain import (
     CandidateStatus,
     CapabilityStat,
     Champion,
+    GrowthGoal,
     HistoryConfidence,
     LineageRelation,
     ModelFormat,
@@ -65,7 +66,7 @@ from frontierwright.workload_acceptance import (
 )
 from frontierwright.workloads import WorkloadProfile
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 STATE_DIR = ".frontierwright"
 REGISTRY_NAME = "registry.sqlite"
 
@@ -193,6 +194,7 @@ CREATE TABLE build_state (
     priorities_json TEXT,
     targets_json TEXT,
     floors_json TEXT,
+    growth_goals_json TEXT,
     scale_hash TEXT,
     scale_id TEXT,
     scale_version TEXT,
@@ -690,6 +692,10 @@ WHERE idempotency_key IS NOT NULL;
 
 MIGRATION_25_TO_26 = """
 ALTER TABLE project ADD COLUMN origin_model_id TEXT REFERENCES models(model_id);
+"""
+
+MIGRATION_26_TO_27 = """
+ALTER TABLE build_state ADD COLUMN growth_goals_json TEXT;
 """
 
 MIGRATION_10_TO_11 = """
@@ -1420,6 +1426,26 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 )
                 connection.commit()
                 version = 26
+
+            if version == 26:
+                build_columns = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(build_state)")
+                }
+                if "growth_goals_json" not in build_columns:
+                    connection.executescript(
+                        "BEGIN IMMEDIATE;" + chr(10) + MIGRATION_26_TO_27
+                    )
+                else:
+                    connection.execute("BEGIN IMMEDIATE")
+                connection.execute("PRAGMA user_version = 27")
+                self.event(
+                    connection,
+                    "SCHEMA_MIGRATED",
+                    {"from_version": 26, "to_version": 27},
+                )
+                connection.commit()
+                version = 27
 
             if version != SCHEMA_VERSION:
                 raise FrontierwrightError(
@@ -2645,7 +2671,12 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 },
             )
 
-    def reject_candidate(self, model_id: str) -> None:
+    def reject_candidate(
+        self,
+        model_id: str,
+        *,
+        decision_details: dict[str, Any] | None = None,
+    ) -> None:
         with self.connect(write=True) as connection:
             row = connection.execute(
                 "SELECT status FROM candidates WHERE model_id = ?",
@@ -2668,7 +2699,14 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     CandidateStatus.PENDING.value,
                 ),
             )
-            self.event(connection, "CANDIDATE_REJECTED", {"model_id": model_id})
+            self.event(
+                connection,
+                "CANDIDATE_REJECTED",
+                {
+                    "model_id": model_id,
+                    **(decision_details or {}),
+                },
+            )
 
     def register_lab_adapter(
         self,
@@ -3876,8 +3914,8 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             connection.execute(
                 "INSERT INTO build_state ("
                 "singleton, mode, archetype, priorities_json, targets_json, floors_json, "
-                "scale_hash, scale_id, scale_version, updated_at"
-                ") VALUES (1, 'INTENT', ?, ?, NULL, NULL, NULL, NULL, NULL, ?)",
+                "growth_goals_json, scale_hash, scale_id, scale_version, updated_at"
+                ") VALUES (1, 'INTENT', ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?)",
                 (
                     intent.archetype,
                     json.dumps(payload["priorities"], sort_keys=True),
@@ -3917,8 +3955,8 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
             connection.execute(
                 "INSERT INTO build_state ("
                 "singleton, mode, archetype, priorities_json, targets_json, floors_json, "
-                "scale_hash, scale_id, scale_version, updated_at"
-                ") VALUES (1, 'TARGETS_FLOORS', NULL, NULL, ?, ?, ?, ?, ?, ?)",
+                "growth_goals_json, scale_hash, scale_id, scale_version, updated_at"
+                ") VALUES (1, 'TARGETS_FLOORS', NULL, NULL, ?, ?, NULL, ?, ?, ?, ?)",
                 (
                     json.dumps(payload["targets"], sort_keys=True),
                     json.dumps(payload["floors"], sort_keys=True),
@@ -3933,6 +3971,63 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                 "BUILD_TARGETS_SET",
                 {
                     **payload,
+                    "scale_hash": scale_hash,
+                    "scale_id": scale_id,
+                    "scale_version": scale_version,
+                },
+            )
+
+    def set_growth_goals(
+        self,
+        goals: tuple[GrowthGoal, ...],
+        *,
+        scale_hash: str,
+        scale_id: str,
+        scale_version: str,
+    ) -> None:
+        payload = [goal.to_dict() for goal in goals]
+        with self.connect(write=True) as connection:
+            mode = self._current_build_mode(connection)
+            if mode.value != "TARGETS_FLOORS":
+                raise FrontierwrightError(
+                    "BUILD_MODE_MISMATCH",
+                    "Growth goals require a measured Champion.",
+                    13,
+                )
+            row = connection.execute(
+                "SELECT * FROM build_state WHERE singleton = 1"
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO build_state ("
+                    "singleton, mode, archetype, priorities_json, targets_json, floors_json, "
+                    "growth_goals_json, scale_hash, scale_id, scale_version, updated_at"
+                    ") VALUES (1, 'TARGETS_FLOORS', NULL, NULL, '{}', '{}', ?, ?, ?, ?, ?)",
+                    (
+                        json.dumps(payload, sort_keys=True),
+                        scale_hash,
+                        scale_id,
+                        scale_version,
+                        timestamp(),
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE build_state SET growth_goals_json = ?, scale_hash = ?, "
+                    "scale_id = ?, scale_version = ?, updated_at = ? WHERE singleton = 1",
+                    (
+                        json.dumps(payload, sort_keys=True),
+                        scale_hash,
+                        scale_id,
+                        scale_version,
+                        timestamp(),
+                    ),
+                )
+            self.event(
+                connection,
+                "BUILD_GROWTH_GOALS_SET",
+                {
+                    "goals": payload,
                     "scale_hash": scale_hash,
                     "scale_id": scale_id,
                     "scale_version": scale_version,
@@ -4422,6 +4517,7 @@ CREATE TABLE IF NOT EXISTS tokenizer_artifacts (
                     ("priorities_json", "priorities"),
                     ("targets_json", "targets"),
                     ("floors_json", "floors"),
+                    ("growth_goals_json", "growth_goals"),
                 ):
                     raw = build_state.pop(stored)
                     build_state[public] = json.loads(raw) if raw else {}

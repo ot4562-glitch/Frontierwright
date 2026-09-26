@@ -7,7 +7,9 @@ import json
 import math
 import os
 import shutil
+import statistics
 import subprocess
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import cast
@@ -18,6 +20,7 @@ from frontierwright.artifact_store import (
     verify_manifest_digest,
     verify_sealed_artifact,
 )
+from frontierwright.benchmark_sources import StatAxisV2
 from frontierwright.capability_v1 import (
     CAPABILITY_V1_BUNDLE_ID,
     CAPABILITY_V1_BUNDLE_VERSION,
@@ -44,6 +47,8 @@ from frontierwright.domain import (
     BuildMode,
     BuildTargets,
     CandidateStatus,
+    GrowthGoal,
+    GrowthGoalKind,
     HistoryConfidence,
     LineageRelation,
     ModelFormat,
@@ -107,8 +112,8 @@ from frontierwright.local_executor import (
 )
 from frontierwright.models import discover_history_evidence, inspect_local_model
 from frontierwright.observations import (
-    OBSERVATION_SOURCE_EXPLICIT,
     ObservationOutcome,
+    ObservationSource,
     ObservationSummary,
     UsageObservation,
     observation_from_event,
@@ -145,6 +150,7 @@ from frontierwright.serving_adapters import (
     import_serving_resource_manifest,
     import_vllm_bench_serve,
 )
+from frontierwright.stat_v2 import BenchmarkEstimate, StatRelation, compare_origin_estimates
 from frontierwright.workload_acceptance import (
     AcceptanceEvidenceReceipt,
     WorkloadAcceptanceContractV1,
@@ -199,6 +205,8 @@ class StatusView:
     candidate_count: int = 0
     stats: dict[str, float | None] = field(default_factory=dict)
     stat_uncertainty: dict[str, dict[str, object]] = field(default_factory=dict)
+    stat_v2: dict[str, dict[str, object]] = field(default_factory=dict)
+    stat_v2_note: str | None = None
     resource_profile_available: bool = False
 
     def to_dict(self) -> dict[str, object]:
@@ -299,6 +307,8 @@ class WorkloadFitView:
     constraints: list[dict[str, object]] = field(default_factory=list)
     workload_evaluation_coverage: dict[str, object] = field(default_factory=dict)
     workload_acceptance: dict[str, object] = field(default_factory=dict)
+    privacy_semantics: str | None = None
+    privacy_scope_note: str | None = None
     synthetic_utility_score: None = None
     note: str | None = None
 
@@ -346,8 +356,9 @@ class BuildView:
     configured: bool = False
     archetype: str | None = None
     priorities: dict[str, int] = field(default_factory=dict)
-    targets: dict[str, int] = field(default_factory=dict)
-    floors: dict[str, int] = field(default_factory=dict)
+    targets: dict[str, float] = field(default_factory=dict)
+    floors: dict[str, float] = field(default_factory=dict)
+    growth_goals: list[dict[str, object]] = field(default_factory=list)
     scale_bound: bool = False
     scale_hash: str | None = None
     scale_id: str | None = None
@@ -705,6 +716,7 @@ class CompareView:
     candidate_stats: dict[str, float | None] = field(default_factory=dict)
     deltas: dict[str, float | None] = field(default_factory=dict)
     build_constraints: list[dict[str, object]] = field(default_factory=list)
+    growth_goal_results: list[dict[str, object]] = field(default_factory=list)
     promotion_eligible: bool = False
     promotion_blockers: list[dict[str, object]] = field(default_factory=list)
     build_scale_hash: str | None = None
@@ -773,6 +785,217 @@ def _capability_uncertainty_from_profile(
     return result
 
 
+def _profile_stat_values(profile: dict[str, object] | None) -> dict[str, float]:
+    if profile is None:
+        return {}
+    raw_stats = profile.get("stats")
+    if not isinstance(raw_stats, list):
+        return {}
+    values: dict[str, float] = {}
+    for item in raw_stats:
+        if not isinstance(item, dict):
+            continue
+        axis = item.get("axis")
+        value = item.get("value")
+        if (
+            isinstance(axis, str)
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        ):
+            values[axis.lower()] = float(value)
+    return values
+
+
+def _stat_v2_growth_payload(
+    registry: Registry,
+    *,
+    origin_model_id: str | None,
+    current_model_id: str | None,
+) -> tuple[dict[str, dict[str, object]], str]:
+    result: dict[str, dict[str, object]] = {
+        axis.value.lower(): {
+            "axis": axis.value,
+            "display_delta": None,
+            "relation": StatRelation.UNMEASURED.value,
+            "delta_interval": None,
+            "source_count": 0,
+            "source": None,
+        }
+        for axis in StatAxisV2
+    }
+    note = (
+        "Stat v2 is origin-relative: the permanent project origin is display baseline 0.0, "
+        "which is a reference point rather than an absolute capability claim. "
+        "Reasoning/Math/Coding currently use Capability v1 only as a legacy smoke bridge; "
+        "Knowledge/Instruction/Language/Context stay UNMEASURED on descendants until compatible "
+        "versioned Stat v2 benchmark evidence exists."
+    )
+    if origin_model_id is None or current_model_id is None:
+        return result, note
+    if current_model_id == origin_model_id:
+        for axis in StatAxisV2:
+            result[axis.value.lower()] = {
+                "axis": axis.value,
+                "display_delta": 0.0,
+                "relation": StatRelation.SAME.value,
+                "delta_interval": [0.0, 0.0],
+                "source_count": 0,
+                "source": "ORIGIN_BASELINE",
+            }
+        return result, note
+
+    origin_profile = registry.get_active_capability_profile(origin_model_id)
+    current_profile = registry.get_active_capability_profile(current_model_id)
+    if origin_profile is None or current_profile is None:
+        return result, note
+    if origin_profile.get("scale_hash") != current_profile.get("scale_hash"):
+        return result, note
+
+    origin_values = _profile_stat_values(origin_profile)
+    current_values = _profile_stat_values(current_profile)
+    origin_uncertainty = {
+        key.lower(): value
+        for key, value in _capability_uncertainty_from_profile(origin_profile).items()
+    }
+    current_uncertainty = {
+        key.lower(): value
+        for key, value in _capability_uncertainty_from_profile(current_profile).items()
+    }
+    bridge = {
+        "reasoning": StatAxisV2.REASONING,
+        "math": StatAxisV2.MATH,
+        "coding": StatAxisV2.CODING,
+    }
+    for legacy_axis, stat_axis in bridge.items():
+        origin_value = origin_values.get(legacy_axis)
+        current_value = current_values.get(legacy_axis)
+        if origin_value is None or current_value is None:
+            continue
+        origin_u = origin_uncertainty.get(legacy_axis, {})
+        current_u = current_uncertainty.get(legacy_axis, {})
+        origin_ci = None
+        current_ci = None
+        origin_lower = origin_u.get("stat_lower")
+        origin_upper = origin_u.get("stat_upper")
+        if (
+            isinstance(origin_lower, (int, float))
+            and not isinstance(origin_lower, bool)
+            and isinstance(origin_upper, (int, float))
+            and not isinstance(origin_upper, bool)
+        ):
+            origin_ci = (
+                float(origin_lower) / 200.0,
+                float(origin_upper) / 200.0,
+            )
+        current_lower = current_u.get("stat_lower")
+        current_upper = current_u.get("stat_upper")
+        if (
+            isinstance(current_lower, (int, float))
+            and not isinstance(current_lower, bool)
+            and isinstance(current_upper, (int, float))
+            and not isinstance(current_upper, bool)
+        ):
+            current_ci = (
+                float(current_lower) / 200.0,
+                float(current_upper) / 200.0,
+            )
+        if origin_model_id == current_model_id:
+            sample_count = current_u.get("sample_size")
+            result[stat_axis.value.lower()] = {
+                "axis": stat_axis.value,
+                "display_delta": 0.0,
+                "relation": StatRelation.SAME.value,
+                "delta_interval": [0.0, 0.0],
+                "source_count": (
+                    int(sample_count)
+                    if isinstance(sample_count, int) and not isinstance(sample_count, bool)
+                    else 0
+                ),
+                "source": "CAPABILITY_V1_LEGACY_SMOKE",
+            }
+            continue
+        origin_estimate = BenchmarkEstimate(
+            benchmark_id=CAPABILITY_V1_BUNDLE_ID,
+            benchmark_version=CAPABILITY_V1_BUNDLE_VERSION,
+            metric=legacy_axis,
+            value=origin_value / 200.0,
+            confidence_interval=origin_ci,
+            sample_count=(
+                cast(int, origin_u.get("sample_size"))
+                if isinstance(origin_u.get("sample_size"), int)
+                and not isinstance(origin_u.get("sample_size"), bool)
+                else None
+            ),
+        )
+        current_estimate = BenchmarkEstimate(
+            benchmark_id=CAPABILITY_V1_BUNDLE_ID,
+            benchmark_version=CAPABILITY_V1_BUNDLE_VERSION,
+            metric=legacy_axis,
+            value=current_value / 200.0,
+            confidence_interval=current_ci,
+            sample_count=(
+                cast(int, current_u.get("sample_size"))
+                if isinstance(current_u.get("sample_size"), int)
+                and not isinstance(current_u.get("sample_size"), bool)
+                else None
+            ),
+        )
+        stat = compare_origin_estimates(
+            axis=stat_axis,
+            origin=origin_estimate,
+            current=current_estimate,
+            display_scale=100.0,
+        )
+        payload = stat.to_payload()
+        payload["source"] = "CAPABILITY_V1_LEGACY_SMOKE"
+        result[stat_axis.value.lower()] = payload
+    return result, note
+
+
+def get_stat_v2_growth(root: Path, model_id: str | None = None) -> dict[str, object]:
+    registry = Registry(root)
+    if not registry.exists:
+        return {
+            "schema_version": 1,
+            "origin_model_id": None,
+            "model_id": None,
+            "stats": {
+                axis.value.lower(): {
+                    "axis": axis.value,
+                    "display_delta": None,
+                    "relation": StatRelation.UNMEASURED.value,
+                    "delta_interval": None,
+                    "source_count": 0,
+                    "source": None,
+                }
+                for axis in StatAxisV2
+            },
+            "note": "Project is not initialized.",
+        }
+    state = registry.read()
+    origin_model_id = (
+        str(state.project["origin_model_id"]) if state.project.get("origin_model_id") else None
+    )
+    current_model_id = model_id or (
+        state.champion.model.model_id if state.champion is not None else None
+    )
+    if current_model_id is not None:
+        registry.get_model(current_model_id)
+    stats, note = _stat_v2_growth_payload(
+        registry,
+        origin_model_id=origin_model_id,
+        current_model_id=current_model_id,
+    )
+    return {
+        "schema_version": 1,
+        "origin_model_id": origin_model_id,
+        "model_id": current_model_id,
+        "stats": stats,
+        "note": note,
+    }
+
+
 def get_status(root: Path) -> StatusView:
     registry = Registry(root)
     if not registry.exists:
@@ -801,6 +1024,14 @@ def get_status(root: Path) -> StatusView:
     else:
         mode = build_mode(origin, state.champion)
     artifact = state.champion_artifact or {}
+    current_model_id = state.champion.model.model_id if state.champion else None
+    stat_v2, stat_v2_note = _stat_v2_growth_payload(
+        registry,
+        origin_model_id=(
+            str(project["origin_model_id"]) if project.get("origin_model_id") else None
+        ),
+        current_model_id=current_model_id,
+    )
 
     return StatusView(
         initialized=True,
@@ -834,6 +1065,8 @@ def get_status(root: Path) -> StatusView:
         candidate_count=len(state.candidates),
         stats=stats,
         stat_uncertainty=_capability_uncertainty_from_profile(state.capability_profile),
+        stat_v2=stat_v2,
+        stat_v2_note=stat_v2_note,
         resource_profile_available=state.resource_profile is not None,
     )
 
@@ -3093,6 +3326,15 @@ def profile_reference_inference(
             14,
         )
 
+    metrics = dict(metrics)
+    metrics["profile_shape"] = "FIXED_REFERENCE_PROMPT"
+    metrics["workload_shape_bound"] = False
+    metrics["profile_shape_note"] = (
+        "This local reference profile uses a fixed prompt/output shape. It is comparable runtime "
+        "evidence under matching conditions, not proof of latency/throughput for the user's "
+        "declared workload context and output distribution."
+    )
+
     history_metrics = {
         key: value
         for key, value in metrics.items()
@@ -3121,6 +3363,118 @@ def profile_reference_inference(
         model_format=model.model_format.value,
         metrics=dict(metrics),
     )
+
+
+def remeasure_runtime_pair(
+    root: Path,
+    candidate_model_id: str,
+    *,
+    python_executable: str,
+    rounds: int = 2,
+    max_new_tokens: int = 16,
+    device: str = "auto",
+    timeout_seconds: float = 120.0,
+) -> CompareView:
+    """Run a consented ABBA runtime remeasurement and return a fresh comparison."""
+
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds <= 0:
+        raise FrontierwrightError(
+            "INFERENCE_PROFILE_CONFIG_INVALID",
+            "remeasure rounds must be a positive integer.",
+            2,
+        )
+    registry = Registry(root)
+    state = registry.read()
+    if state.champion is None:
+        raise FrontierwrightError(
+            "NO_CHAMPION_MODEL",
+            "A current Champion is required before paired runtime remeasurement.",
+            12,
+        )
+    champion_id = state.champion.model.model_id
+    candidate = registry.get_candidate(candidate_model_id)
+    model_ids = (champion_id, candidate.model.model_id)
+    collected: dict[str, dict[str, object]] = {
+        model_id: {"latency": [], "throughput": [], "last": None}
+        for model_id in model_ids
+    }
+
+    for _ in range(rounds):
+        for model_id in (
+            champion_id,
+            candidate.model.model_id,
+            candidate.model.model_id,
+            champion_id,
+        ):
+            view = profile_reference_inference(
+                root,
+                python_executable=python_executable,
+                model_id=model_id,
+                max_new_tokens=max_new_tokens,
+                warmup_runs=1,
+                measured_runs=1,
+                device=device,
+                timeout_seconds=timeout_seconds,
+            )
+            metrics = dict(view.metrics)
+            latency = metrics.get("latency_seconds_p50")
+            throughput = metrics.get("tokens_per_second_p50")
+            if not isinstance(latency, (int, float)) or isinstance(latency, bool):
+                raise FrontierwrightError(
+                    "INFERENCE_PROFILE_RESULT_INVALID",
+                    "Paired remeasurement did not return latency evidence.",
+                    14,
+                )
+            if not isinstance(throughput, (int, float)) or isinstance(throughput, bool):
+                raise FrontierwrightError(
+                    "INFERENCE_PROFILE_RESULT_INVALID",
+                    "Paired remeasurement did not return throughput evidence.",
+                    14,
+                )
+            cast(list[float], collected[model_id]["latency"]).append(float(latency))
+            cast(list[float], collected[model_id]["throughput"]).append(float(throughput))
+            collected[model_id]["last"] = metrics
+
+    for model_id in model_ids:
+        raw_last = collected[model_id]["last"]
+        if not isinstance(raw_last, dict):
+            raise FrontierwrightError(
+                "INFERENCE_PROFILE_RESULT_INVALID",
+                "Paired remeasurement produced no aggregate evidence.",
+                14,
+            )
+        latency_runs = cast(list[float], collected[model_id]["latency"])
+        throughput_runs = cast(list[float], collected[model_id]["throughput"])
+        aggregate = dict(raw_last)
+        aggregate["latency_seconds_runs"] = latency_runs
+        aggregate["tokens_per_second_runs"] = throughput_runs
+        aggregate["latency_seconds_mean"] = statistics.fmean(latency_runs)
+        aggregate["latency_seconds_p50"] = statistics.median(latency_runs)
+        aggregate["tokens_per_second_mean"] = statistics.fmean(throughput_runs)
+        aggregate["tokens_per_second_p50"] = statistics.median(throughput_runs)
+        aggregate["measured_runs"] = len(latency_runs)
+        aggregate["measurement_scope"] = "REFERENCE_INTERLEAVED_ABBA"
+        aggregate["remeasure_protocol"] = "ABBA"
+        model = registry.get_model(model_id)
+        registry.record_event(
+            "INFERENCE_PROFILE_MEASURED",
+            {
+                "intervention_id": "frontierwright.operate.profile-reference",
+                "intervention_version": "1",
+                "model_id": model.model_id,
+                "model_fingerprint": model.fingerprint,
+                "config": {
+                    "max_new_tokens": max_new_tokens,
+                    "measured_runs": len(latency_runs),
+                    "device": device,
+                    "order": "ABBA",
+                    "rounds": rounds,
+                },
+                "metrics": aggregate,
+                "provenance": "CONSENTED_INTERLEAVED_REMEASUREMENT",
+            },
+        )
+    return compare_candidate(root, candidate_model_id)
 
 
 def get_stats_view(root: Path, model_id: str | None = None) -> StatsView:
@@ -5152,6 +5506,9 @@ def _latest_model_fit_from_state(
         "max_new_tokens": merged.get("max_new_tokens"),
         "measured_runs": merged.get("measured_runs"),
         "context_length": merged.get("context_length"),
+        "profile_shape": merged.get("profile_shape"),
+        "workload_shape_bound": merged.get("workload_shape_bound"),
+        "profile_shape_note": merged.get("profile_shape_note"),
         "note": (
             "Measured inference evidence for this exact model. Multiple receipts are "
             "combined only when serving-condition hash, execution boundary, and runtime "
@@ -5358,6 +5715,7 @@ def record_usage_observation(
     failure_category: str | None = None,
     latency_seconds: float | None = None,
     classification: DatasetClassification | None = None,
+    source: ObservationSource = ObservationSource.HUMAN_CONFIRMED,
     idempotency_key: str | None = None,
 ) -> UsageObservationRecordView:
     registry = Registry(root)
@@ -5412,7 +5770,7 @@ def record_usage_observation(
         failure_category=failure_category,
         latency_seconds=latency_seconds,
         classification=resolved_classification,
-        source=OBSERVATION_SOURCE_EXPLICIT,
+        source=source,
         idempotency_key=clean_key,
     )
     payload = observation.to_payload()
@@ -5768,6 +6126,19 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
             4,
         )
     profile = workload_profile_from_payload(dict(raw_profile))
+    privacy_semantics = (
+        "FRONTIERWRIGHT_APPLICATION_BOUNDARY_POLICY"
+        if profile.privacy is DatasetClassification.PRIVATE
+        else "WORKLOAD_DATA_CLASSIFICATION"
+    )
+    privacy_scope_note = (
+        (
+            "PRIVATE means Frontierwright admission/data-boundary and declared serving-boundary "
+            "policy. It does not attest OS, process, kernel, hypervisor, or network isolation."
+        )
+        if profile.privacy is DatasetClassification.PRIVATE
+        else None
+    )
 
     state = registry.read()
     target_model_id = model_id
@@ -5779,6 +6150,8 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
             workload_profile_id=str(stored.get("profile_id")),
             workload_profile_hash=str(stored.get("profile_hash")),
             overall_status="UNKNOWN",
+            privacy_semantics=privacy_semantics,
+            privacy_scope_note=privacy_scope_note,
             note="No model exists yet, so workload fit cannot be measured.",
         )
 
@@ -5838,6 +6211,8 @@ def get_workload_fit(root: Path, model_id: str | None = None) -> WorkloadFitView
         ),
         workload_evaluation_coverage=workload_evaluation_coverage,
         workload_acceptance=acceptance.to_dict(),
+        privacy_semantics=privacy_semantics,
+        privacy_scope_note=privacy_scope_note,
         note=str(payload.get("note")) if payload.get("note") else None,
     )
 
@@ -5873,6 +6248,7 @@ def get_fit_opportunities(
     model_fit = (
         _latest_model_fit_from_state(state, target_model_id) if target_model_id is not None else {}
     )
+    acceptance = get_workload_acceptance_view(root, model_id=target_model_id)
     return plan_fit_opportunities(
         edition=edition,
         model_id=target_model_id,
@@ -5880,6 +6256,9 @@ def get_fit_opportunities(
         constraints=fit.constraints,
         model_fit=model_fit,
         workload_evaluation_coverage=fit.workload_evaluation_coverage,
+        workload_acceptance_status=(
+            acceptance.overall_status if acceptance.configured else "NOT_CONFIGURED"
+        ),
         observation_summary=get_usage_observation_summary(root, target_model_id).to_payload(),
     )
 
@@ -5940,8 +6319,12 @@ def import_local_model(
     return get_status(root)
 
 
-def _axis_pairs(values: dict[str, int]) -> tuple[tuple[Axis, int], ...]:
-    pairs: list[tuple[Axis, int]] = []
+def _axis_pairs(
+    values: Mapping[str, int | float],
+    *,
+    integer_only: bool = False,
+) -> tuple[tuple[Axis, int | float], ...]:
+    pairs: list[tuple[Axis, int | float]] = []
     for raw_axis, value in values.items():
         try:
             axis = Axis(raw_axis.upper())
@@ -5951,13 +6334,20 @@ def _axis_pairs(values: dict[str, int]) -> tuple[tuple[Axis, int], ...]:
                 f"Unknown capability axis: {raw_axis}",
                 2,
             ) from exc
-        if isinstance(value, bool) or not isinstance(value, int):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or (integer_only and not isinstance(value, int))
+        ):
+            expected = "an integer" if integer_only else "a finite number"
             raise FrontierwrightError(
                 "INVALID_BUILD_VALUE",
-                f"Build value for {raw_axis} must be an integer.",
+                f"Build value for {raw_axis} must be {expected}.",
                 2,
             )
-        pairs.append((axis, value))
+        normalized: int | float = int(value) if integer_only else float(value)
+        pairs.append((axis, normalized))
     return tuple(sorted(pairs, key=lambda item: item[0].value))
 
 
@@ -6010,6 +6400,11 @@ def get_build_view(root: Path) -> BuildView:
             configured=True,
             targets=saved.get("targets", {}),
             floors=saved.get("floors", {}),
+            growth_goals=(
+                [dict(item) for item in saved.get("growth_goals", []) if isinstance(item, dict)]
+                if isinstance(saved.get("growth_goals"), list)
+                else []
+            ),
             scale_bound=bound,
             scale_hash=scale_hash if isinstance(scale_hash, str) else None,
             scale_id=scale_id if isinstance(scale_id, str) else None,
@@ -6035,7 +6430,13 @@ def set_build_intent(
 ) -> BuildView:
     registry = Registry(root)
     try:
-        intent = BuildIntent(archetype=archetype, priorities=_axis_pairs(priorities))
+        intent = BuildIntent(
+            archetype=archetype,
+            priorities=cast(
+                tuple[tuple[Axis, int], ...],
+                _axis_pairs(priorities, integer_only=True),
+            ),
+        )
     except ValueError as exc:
         raise FrontierwrightError("INVALID_BUILD", str(exc), 2) from exc
     registry.set_build_intent(intent)
@@ -6045,8 +6446,8 @@ def set_build_intent(
 def set_build_targets(
     root: Path,
     *,
-    targets: dict[str, int],
-    floors: dict[str, int],
+    targets: dict[str, float],
+    floors: dict[str, float],
 ) -> BuildView:
     registry = Registry(root)
     current_build = get_build_view(root)
@@ -6061,8 +6462,8 @@ def set_build_targets(
         )
     try:
         build = BuildTargets(
-            targets=_axis_pairs(targets),
-            floors=_axis_pairs(floors),
+            targets=cast(tuple[tuple[Axis, float], ...], _axis_pairs(targets)),
+            floors=cast(tuple[tuple[Axis, float], ...], _axis_pairs(floors)),
         )
     except ValueError as exc:
         raise FrontierwrightError("INVALID_BUILD", str(exc), 2) from exc
@@ -6084,6 +6485,67 @@ def set_build_targets(
         )
     registry.set_build_targets(
         build,
+        scale_hash=stats.scale_hash,
+        scale_id=stats.scale_id,
+        scale_version=stats.scale_version,
+    )
+    return get_build_view(root)
+
+
+def set_growth_goals(
+    root: Path,
+    *,
+    improve: tuple[str, ...] = (),
+    protect: tuple[str, ...] = (),
+    tolerance: dict[str, tuple[float, str]] | None = None,
+    absolute_requirements: dict[str, float] | None = None,
+    hard_constraints: dict[str, str] | None = None,
+) -> BuildView:
+    registry = Registry(root)
+    stats = get_stats_view(root)
+    if (
+        not stats.measured
+        or stats.scale_hash is None
+        or stats.scale_id is None
+        or stats.scale_version is None
+    ):
+        raise FrontierwrightError(
+            "BUILD_SCALE_REQUIRED",
+            "Growth goals require a measured Champion with exact scale identity.",
+            13,
+        )
+    goals: list[GrowthGoal] = []
+    for metric in improve:
+        goals.append(GrowthGoal(GrowthGoalKind.IMPROVE, metric))
+    for metric in protect:
+        goals.append(GrowthGoal(GrowthGoalKind.PROTECT, metric))
+    for metric, (value, unit) in (tolerance or {}).items():
+        goals.append(GrowthGoal(GrowthGoalKind.TOLERANCE, metric, value, unit))
+    for metric, requirement_value in (absolute_requirements or {}).items():
+        goals.append(
+            GrowthGoal(
+                GrowthGoalKind.ABSOLUTE_REQUIREMENT,
+                metric,
+                requirement_value,
+            )
+        )
+    for metric, hard_value in (hard_constraints or {}).items():
+        goals.append(GrowthGoal(GrowthGoalKind.HARD_CONSTRAINT, metric, hard_value))
+    if not goals:
+        raise FrontierwrightError(
+            "INVALID_BUILD_GOALS",
+            "Declare at least one IMPROVE, PROTECT, TOLERANCE, requirement, or hard constraint.",
+            2,
+        )
+    seen = {(goal.kind.value, goal.metric) for goal in goals}
+    if len(seen) != len(goals):
+        raise FrontierwrightError(
+            "INVALID_BUILD_GOALS",
+            "The same growth-goal kind cannot repeat a metric.",
+            2,
+        )
+    registry.set_growth_goals(
+        tuple(goals),
         scale_hash=stats.scale_hash,
         scale_id=stats.scale_id,
         scale_version=stats.scale_version,
@@ -8233,6 +8695,141 @@ def _promotion_blockers(
     return blockers
 
 
+def _growth_goal_results(
+    build: dict[str, object] | None,
+    pareto: dict[str, object],
+    workload_fit: WorkloadFitView,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    raw_goals = build.get("growth_goals") if build is not None else None
+    if not isinstance(raw_goals, list) or not raw_goals:
+        return [], []
+    raw_metrics = pareto.get("metrics")
+    by_key: dict[str, dict[str, object]] = {}
+    if isinstance(raw_metrics, list):
+        for raw_metric in raw_metrics:
+            if isinstance(raw_metric, dict) and isinstance(raw_metric.get("key"), str):
+                by_key[str(raw_metric["key"])] = raw_metric
+    results: list[dict[str, object]] = []
+    blockers: list[dict[str, object]] = []
+
+    for raw_goal in raw_goals:
+        if not isinstance(raw_goal, dict):
+            continue
+        kind = str(raw_goal.get("kind") or "")
+        metric = str(raw_goal.get("metric") or "")
+        value = raw_goal.get("value")
+        unit = raw_goal.get("unit")
+        passed = False
+        status = "UNKNOWN"
+        observed: object = None
+        reason = "Comparable evidence is missing."
+
+        if kind == GrowthGoalKind.HARD_CONSTRAINT.value and metric == "privacy":
+            privacy_constraint = next(
+                (
+                    item
+                    for item in workload_fit.constraints
+                    if item.get("key") == "privacy.serving_boundary"
+                ),
+                None,
+            )
+            if privacy_constraint is not None:
+                status = str(privacy_constraint.get("status") or "UNKNOWN")
+                observed = privacy_constraint.get("observed")
+                passed = status == "PASS"
+                reason = (
+                    "Private serving-boundary evidence passes."
+                    if passed
+                    else "Private serving-boundary evidence does not pass."
+                )
+        else:
+            evidence = by_key.get(metric)
+            if evidence is not None:
+                relation = str(evidence.get("relation") or "UNKNOWN")
+                candidate_value = evidence.get("candidate_value")
+                champion_value = evidence.get("champion_value")
+                improvement_delta = evidence.get("improvement_delta")
+                direction = str(evidence.get("direction") or "")
+                observed = candidate_value
+                status = relation
+                if kind == GrowthGoalKind.IMPROVE.value:
+                    passed = relation == "BETTER"
+                    reason = (
+                        "Measured candidate improvement is positive."
+                        if passed
+                        else "The metric is not measured as a clear improvement."
+                    )
+                elif kind == GrowthGoalKind.PROTECT.value:
+                    passed = relation in {"BETTER", "SAME"}
+                    reason = (
+                        "The protected metric did not regress."
+                        if passed
+                        else "A protected metric regressed or remains uncertain."
+                    )
+                elif kind == GrowthGoalKind.TOLERANCE.value:
+                    if (
+                        isinstance(improvement_delta, (int, float))
+                        and not isinstance(improvement_delta, bool)
+                        and isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                    ):
+                        allowed = float(value)
+                        if unit == "PERCENT":
+                            if (
+                                isinstance(champion_value, (int, float))
+                                and not isinstance(champion_value, bool)
+                            ):
+                                allowed = abs(float(champion_value)) * allowed / 100.0
+                            else:
+                                allowed = float("nan")
+                        passed = math.isfinite(allowed) and float(improvement_delta) >= -allowed
+                        reason = (
+                            f"Regression is within allowed tolerance ({allowed:g} in metric units)."
+                            if passed
+                            else (
+                                "Regression exceeds allowed tolerance "
+                                f"({allowed:g} in metric units)."
+                            )
+                        )
+                elif kind == GrowthGoalKind.ABSOLUTE_REQUIREMENT.value:
+                    if (
+                        isinstance(candidate_value, (int, float))
+                        and not isinstance(candidate_value, bool)
+                        and isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                    ):
+                        if direction == ParetoDirection.LOWER_BETTER.value:
+                            passed = float(candidate_value) <= float(value)
+                        else:
+                            passed = float(candidate_value) >= float(value)
+                        reason = (
+                            "Absolute requirement is satisfied."
+                            if passed
+                            else "Absolute requirement is not satisfied."
+                        )
+        result = {
+            "kind": kind,
+            "metric": metric,
+            "value": value,
+            "unit": unit,
+            "status": "PASS" if passed else status,
+            "observed": observed,
+            "reason": reason,
+        }
+        results.append(result)
+        if not passed:
+            blockers.append(
+                {
+                    "code": "BUILD_GROWTH_GOAL_NOT_MET",
+                    "message": f"{kind} goal for {metric} is not satisfied: {reason}",
+                    "metric": metric,
+                    "goal_kind": kind,
+                    "override": "--allow-build-violations",
+                }
+            )
+    return results, blockers
+
+
 def _paired_capability_evidence(
     registry: Registry,
     *,
@@ -8978,6 +9575,12 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
         candidate_stats=candidate_stats,
         scale_comparable=comparable,
     )
+    growth_goal_results, growth_goal_blockers = _growth_goal_results(
+        build,
+        pareto,
+        candidate_workload,
+    )
+    promotion_blockers.extend(growth_goal_blockers)
 
     run = next(
         (
@@ -9005,6 +9608,7 @@ def compare_candidate(root: Path, candidate_model_id: str) -> CompareView:
         candidate_stats=candidate_stats.stats,
         deltas=deltas,
         build_constraints=constraints,
+        growth_goal_results=growth_goal_results,
         promotion_eligible=not promotion_blockers,
         promotion_blockers=promotion_blockers,
         build_scale_hash=(
@@ -9063,6 +9667,26 @@ def promote_candidate(
     candidate_workload = get_workload_fit(root, candidate_model_id)
     workload_blockers, workload_gate = _workload_promotion_gate(candidate_workload)
     blockers.extend(workload_blockers)
+    comparable = bool(
+        champion_stats.measured
+        and candidate_stats.measured
+        and champion_stats.scale_hash is not None
+        and champion_stats.scale_hash == candidate_stats.scale_hash
+    )
+    pareto = _candidate_pareto_evidence(
+        registry,
+        champion_model_id=state.champion.model.model_id,
+        candidate_model_id=candidate.model.model_id,
+        champion_stats=champion_stats,
+        candidate_stats=candidate_stats,
+        scale_comparable=comparable,
+    )
+    _, growth_goal_blockers = _growth_goal_results(
+        state.build_state,
+        pareto,
+        candidate_workload,
+    )
+    blockers.extend(growth_goal_blockers)
 
     overridden: list[dict[str, object]] = []
     unresolved: list[dict[str, object]] = []
@@ -9147,9 +9771,69 @@ def promote_candidate(
     return get_status(root)
 
 
-def reject_candidate(root: Path, candidate_model_id: str) -> CandidateView:
+def reject_candidate(
+    root: Path,
+    candidate_model_id: str,
+    *,
+    reason: str | None = None,
+) -> CandidateView:
     registry = Registry(root)
-    registry.reject_candidate(candidate_model_id)
+    state = registry.read()
+    candidate = registry.get_candidate(candidate_model_id)
+
+    clean_reason = reason.strip() if isinstance(reason, str) else None
+    if clean_reason == "":
+        clean_reason = None
+    if clean_reason is not None and ("\x00" in clean_reason or len(clean_reason) > 500):
+        raise FrontierwrightError(
+            "INVALID_REJECTION_REASON",
+            "Rejection reason must be at most 500 characters and NUL-free.",
+            2,
+        )
+
+    champion_id = state.champion.model.model_id if state.champion is not None else None
+    champion_profile = (
+        registry.get_active_capability_profile(champion_id) if champion_id is not None else None
+    )
+    candidate_profile = registry.get_active_capability_profile(candidate.model.model_id)
+    comparable_scale_hash = None
+    if (
+        champion_profile is not None
+        and candidate_profile is not None
+        and champion_profile.get("scale_hash") == candidate_profile.get("scale_hash")
+    ):
+        comparable_scale_hash = candidate_profile.get("scale_hash")
+
+    workload = registry.get_active_workload_profile()
+    workload_hash = (
+        str(workload["profile_hash"])
+        if workload is not None and isinstance(workload.get("profile_hash"), str)
+        else None
+    )
+    acceptance = (
+        registry.get_active_workload_acceptance_contract(workload_hash)
+        if workload_hash is not None
+        else None
+    )
+    decision_details: dict[str, object] = {
+        "reason": clean_reason,
+        "comparison_identity": {
+            "champion_model_id": champion_id,
+            "candidate_model_id": candidate.model.model_id,
+            "champion_profile_id": (
+                champion_profile.get("profile_id") if champion_profile is not None else None
+            ),
+            "candidate_profile_id": (
+                candidate_profile.get("profile_id") if candidate_profile is not None else None
+            ),
+            "scale_hash": comparable_scale_hash,
+        },
+        "workload_profile_hash": workload_hash,
+        "acceptance_contract_hash": (
+            acceptance.get("contract_hash") if acceptance is not None else None
+        ),
+    }
+    registry.reject_candidate(candidate_model_id, decision_details=decision_details)
     return get_candidates_view(root)
 
 
@@ -9239,7 +9923,37 @@ def get_paths_view(root: Path) -> PathsView:
 
         paths.append(payload)
 
-    if not confidence.allows_recommendation:
+    try:
+        edition = EditionProfile(
+            str(state.project.get("edition_profile") or EditionProfile.STUDIO.value)
+        )
+    except ValueError:
+        edition = EditionProfile.STUDIO
+
+    recommended_path: str | None = None
+    if edition is EditionProfile.STUDIO and not confidence.allows_recommendation:
+        available = [
+            str(item["path_id"])
+            for item in paths
+            if item.get("availability")
+            in {PathAvailability.READY.value, PathAvailability.PLANNABLE.value}
+            and isinstance(item.get("path_id"), str)
+        ]
+        if available:
+            recommendation_reason = (
+                "Imported-model history is UNKNOWN. Frontierwright shows factual READY/PLANNABLE "
+                "paths but does not choose one as likely to improve the model without calibration "
+                "or comparable evidence. History-aware ranking requires COMPLETE or VERIFIED "
+                "history. Available paths: "
+                + ", ".join(available)
+                + "."
+            )
+        else:
+            recommendation_reason = (
+                "Imported-model history is UNKNOWN and no path is currently READY or PLANNABLE. "
+                "Register suitable data/resources and calibrate before choosing an intervention."
+            )
+    elif not confidence.allows_recommendation:
         recommendation_reason = (
             "History-aware recommendation is withheld until history is COMPLETE or VERIFIED."
         )
@@ -9251,7 +9965,7 @@ def get_paths_view(root: Path) -> PathsView:
 
     return PathsView(
         paths=paths,
-        recommended_path=None,
+        recommended_path=recommended_path,
         recommendation_reason=recommendation_reason,
     )
 

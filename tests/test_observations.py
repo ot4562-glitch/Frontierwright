@@ -9,7 +9,11 @@ from frontierwright.cli import app
 from frontierwright.data import DatasetClassification
 from frontierwright.domain import ModelOrigin, ModelState
 from frontierwright.errors import FrontierwrightError
-from frontierwright.observations import ObservationOutcome, summarize_observations
+from frontierwright.observations import (
+    ObservationOutcome,
+    ObservationSource,
+    summarize_observations,
+)
 from frontierwright.registry import Registry
 from frontierwright.service import (
     get_fit_opportunities,
@@ -68,6 +72,7 @@ def test_usage_observation_inherits_workload_privacy_and_never_stores_content(
     assert payload["model_fingerprint"] == model.fingerprint
     assert payload["workload_profile_hash"] == workload.profile_hash
     assert payload["classification"] == "CONFIDENTIAL"
+    assert payload["source"] == "HUMAN_CONFIRMED"
     assert payload["content_stored"] is False
     assert "prompt" not in payload
     assert "response" not in payload
@@ -220,6 +225,7 @@ def test_observe_cli_json_contract(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert payload["observation"]["outcome"] == "FAILURE"
+    assert payload["observation"]["source"] == "HUMAN_CONFIRMED"
     assert payload["observation"]["content_stored"] is False
 
     replay = runner.invoke(
@@ -339,3 +345,48 @@ def test_usage_summary_defaults_to_exact_active_workload_revision(tmp_path: Path
     assert summary.direct_successes == 0
     assert summary.excluded_other_workload_versions == 1
     assert summary.workload_profile_hashes == (second.profile_hash,)
+
+
+
+def test_synthetic_observation_provenance_is_explicit_and_persisted(
+    tmp_path: Path,
+) -> None:
+    project, model = _project_with_champion(tmp_path)
+
+    view = record_usage_observation(
+        project,
+        task="synthetic-qa",
+        outcome=ObservationOutcome.FAILURE,
+        failure_category="fixture",
+        source=ObservationSource.SYNTHETIC_TEST,
+    )
+    assert view.observation["source"] == "SYNTHETIC_TEST"
+
+    events = [
+        event
+        for event in Registry(project).read().history
+        if event["kind"] == "USAGE_OBSERVATION_RECORDED"
+    ]
+    assert events[-1]["details"]["source"] == "SYNTHETIC_TEST"
+
+    cli = runner.invoke(
+        app,
+        [
+            "observe",
+            "record",
+            "synthetic-cli",
+            "--outcome",
+            "SUCCESS",
+            "--source",
+            "SYNTHETIC_TEST",
+            "--path",
+            str(project),
+            "--model",
+            model.model_id,
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert cli.exit_code == 0, cli.output
+    assert json.loads(cli.stdout)["observation"]["source"] == "SYNTHETIC_TEST"

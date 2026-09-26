@@ -80,6 +80,32 @@ def test_missing_acceptance_maps_to_public_runnable_next_action() -> None:
     opportunity = plan.opportunities[0]
     assert opportunity.action == "frontierwright workload acceptance example --json"
     assert opportunity.evidence_keys == ("evaluation.workload_acceptance",)
+    assert opportunity.argv_steps == (
+        ("frontierwright", "workload", "acceptance", "example", "--json"),
+        ("frontierwright", "workload", "acceptance", "create", "--help"),
+    )
+
+
+def test_existing_acceptance_contract_moves_next_action_to_assess() -> None:
+    plan = plan_fit_opportunities(
+        edition=EditionProfile.LAB,
+        model_id="model-1",
+        workload_configured=True,
+        constraints=[_constraint("evaluation.workload_acceptance", "UNKNOWN")],
+        model_fit={},
+        workload_evaluation_coverage={"complete": True},
+        workload_acceptance_status="NOT_ASSESSED",
+    )
+
+    assert [item.opportunity_id for item in plan.opportunities] == [
+        "assess-workload-acceptance"
+    ]
+    opportunity = plan.opportunities[0]
+    assert opportunity.action == "frontierwright workload acceptance assess --help"
+    assert opportunity.argv_steps == (
+        ("frontierwright", "workload", "acceptance", "assess", "--help"),
+    )
+    assert "already exists" in opportunity.reason
 
 
 def test_inconclusive_fit_schedules_more_measurement_instead_of_stalling() -> None:

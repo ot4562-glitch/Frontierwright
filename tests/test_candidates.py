@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import frontierwright.service as service_module
 from frontierwright.capability_v1 import (
     CAPABILITY_V1_BUNDLE_ID,
     CAPABILITY_V1_BUNDLE_VERSION,
@@ -18,6 +19,7 @@ from frontierwright.errors import FrontierwrightError
 from frontierwright.evaluations import EvaluationReceipt, RawMeasurement, apply_scale
 from frontierwright.registry import Registry
 from frontierwright.service import (
+    InferenceProfileView,
     compare_candidate,
     get_candidates_view,
     get_history_view,
@@ -25,9 +27,20 @@ from frontierwright.service import (
     ingest_stats,
     promote_candidate,
     reject_candidate,
+    remeasure_runtime_pair,
     set_build_targets,
+    set_growth_goals,
+    set_workload_acceptance_contract,
     set_workload_profile,
 )
+from frontierwright.workload_acceptance import (
+    AcceptanceEvidenceRule,
+    AcceptanceEvidenceRuleKind,
+    AcceptanceOperator,
+    WorkloadAcceptanceContractV1,
+    WorkloadAcceptanceCriterion,
+)
+from frontierwright.workload_evaluations import WorkloadEvidenceSelector
 from frontierwright.workloads import WorkloadProfile
 
 
@@ -675,3 +688,223 @@ def test_compare_exposes_same_item_paired_capability_flips(tmp_path: Path) -> No
     assert overall["improvements"] == 6
     assert overall["regressions"] == 2
     assert paired["method"] == "mcnemar-exact-binomial-two-sided-v1"
+
+
+
+def test_growth_rules_gate_candidate_without_collapsing_to_one_score(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+
+    set_growth_goals(
+        project,
+        improve=("capability.coding",),
+        protect=("capability.general",),
+    )
+    view = compare_candidate(project, candidate.model_id)
+
+    by_metric = {item["metric"]: item for item in view.growth_goal_results}
+    assert by_metric["capability.coding"]["status"] == "PASS"
+    assert by_metric["capability.general"]["status"] == "WORSE"
+    assert view.promotion_eligible is False
+    assert any(
+        item["code"] == "BUILD_GROWTH_GOAL_NOT_MET"
+        and item["metric"] == "capability.general"
+        and item["goal_kind"] == "PROTECT"
+        for item in view.promotion_blockers
+    )
+
+
+def test_growth_tolerance_can_allow_bounded_regression(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+
+    set_growth_goals(
+        project,
+        tolerance={"capability.general": (15.0, "ABSOLUTE")},
+    )
+    view = compare_candidate(project, candidate.model_id)
+
+    result = view.growth_goal_results[0]
+    assert result["metric"] == "capability.general"
+    assert result["status"] == "PASS"
+    assert not any(
+        item["code"] == "BUILD_GROWTH_GOAL_NOT_MET"
+        for item in view.promotion_blockers
+    )
+
+
+
+def test_passing_growth_rule_allows_normal_promotion(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+
+    set_growth_goals(project, improve=("capability.coding",))
+    view = compare_candidate(project, candidate.model_id)
+
+    assert view.growth_goal_results == [
+        {
+            "kind": "IMPROVE",
+            "metric": "capability.coding",
+            "value": None,
+            "unit": None,
+            "status": "PASS",
+            "observed": view.candidate_stats["coding"],
+            "reason": "Measured candidate improvement is positive.",
+        }
+    ]
+    assert view.promotion_eligible is True
+
+    promoted = promote_candidate(project, candidate.model_id)
+    assert promoted.champion_model_id == candidate.model_id
+    event = next(
+        item
+        for item in reversed(registry.read().history)
+        if item["kind"] == "CANDIDATE_PROMOTED"
+    )
+    assert event["details"]["gate_default_eligible"] is True
+    assert event["details"]["overridden_blockers"] == []
+
+
+def test_runtime_remeasurement_uses_abba_order_and_persists_aggregate_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+
+    calls: list[str] = []
+    samples = {
+        champion.model_id: iter([(0.20, 100.0), (0.22, 95.0)]),
+        candidate.model_id: iter([(0.19, 105.0), (0.21, 100.0)]),
+    }
+
+    def fake_profile(
+        root: Path,
+        *,
+        python_executable: str,
+        model_id: str | None = None,
+        max_new_tokens: int = 16,
+        warmup_runs: int = 1,
+        measured_runs: int = 1,
+        device: str = "auto",
+        timeout_seconds: float = 120.0,
+    ) -> InferenceProfileView:
+        del root, python_executable, warmup_runs, measured_runs, timeout_seconds
+        assert model_id is not None
+        calls.append(model_id)
+        latency, throughput = next(samples[model_id])
+        model = registry.get_model(model_id)
+        return InferenceProfileView(
+            model_id=model_id,
+            model_fingerprint=model.fingerprint,
+            model_format=model.model_format.value,
+            metrics={
+                "measurement_scope": "steady_state_generation_excludes_model_load",
+                "execution_boundary": "LOCAL_MACHINE",
+                "device": device,
+                "max_new_tokens": max_new_tokens,
+                "context_length": 128,
+                "latency_seconds_p50": latency,
+                "tokens_per_second_p50": throughput,
+            },
+        )
+
+    monkeypatch.setattr(service_module, "profile_reference_inference", fake_profile)
+
+    view = remeasure_runtime_pair(
+        project,
+        candidate.model_id,
+        python_executable="fixture-python",
+        rounds=1,
+        max_new_tokens=16,
+        device="cpu",
+    )
+
+    assert calls == [
+        champion.model_id,
+        candidate.model_id,
+        candidate.model_id,
+        champion.model_id,
+    ]
+    assert view.pareto["inference_profile_comparable"] is True
+    metrics = {item["key"]: item for item in view.pareto["metrics"]}
+    assert metrics["serving.latency_p50"]["relation"] == "UNCERTAIN"
+    assert metrics["serving.throughput_p50"]["relation"] == "UNCERTAIN"
+
+    aggregate_events = [
+        item
+        for item in registry.read().history
+        if item["kind"] == "INFERENCE_PROFILE_MEASURED"
+        and item["details"].get("provenance") == "CONSENTED_INTERLEAVED_REMEASUREMENT"
+    ]
+    assert len(aggregate_events) == 2
+    by_model = {item["details"]["model_id"]: item["details"] for item in aggregate_events}
+    assert by_model[champion.model_id]["config"]["order"] == "ABBA"
+    assert by_model[candidate.model_id]["config"]["order"] == "ABBA"
+    assert by_model[champion.model_id]["metrics"]["measured_runs"] == 2
+    assert by_model[candidate.model_id]["metrics"]["measured_runs"] == 2
+    assert by_model[champion.model_id]["metrics"]["measurement_scope"] == (
+        "REFERENCE_INTERLEAVED_ABBA"
+    )
+
+
+
+def test_rejection_audit_pins_reason_and_current_comparison_contract_identity(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    registry, champion, candidate = create_project(project)
+    measure_pair(tmp_path, champion, candidate)
+    workload = set_workload_profile(
+        project,
+        WorkloadProfile(
+            name="Audited coding workload",
+            privacy=DatasetClassification.PUBLIC,
+            task_weights={"coding": 1.0},
+        ),
+    )
+    contract = WorkloadAcceptanceContractV1(
+        name="Coding acceptance",
+        workload_profile_hash=workload.profile_hash,
+        criteria=(
+            WorkloadAcceptanceCriterion(
+                criterion_id="coding-quality",
+                selector=WorkloadEvidenceSelector(
+                    task_id="coding-eval",
+                    task_version="v1",
+                    metric="accuracy",
+                ),
+                unit="fraction",
+                operator=AcceptanceOperator.AT_LEAST,
+                threshold=0.8,
+                evidence_rule=AcceptanceEvidenceRule(
+                    AcceptanceEvidenceRuleKind.DETERMINISTIC_POINT
+                ),
+                evaluator_id="fixture-eval",
+                evaluator_version="1",
+            ),
+        ),
+    )
+    acceptance = set_workload_acceptance_contract(project, contract)
+
+    reject_candidate(project, candidate.model_id, reason="Coding improved, general regressed.")
+
+    event = next(
+        item
+        for item in reversed(registry.read().history)
+        if item["kind"] == "CANDIDATE_REJECTED"
+    )
+    details = event["details"]
+    assert details["reason"] == "Coding improved, general regressed."
+    identity = details["comparison_identity"]
+    assert identity["champion_model_id"] == champion.model_id
+    assert identity["candidate_model_id"] == candidate.model_id
+    assert identity["champion_profile_id"] is not None
+    assert identity["candidate_profile_id"] is not None
+    assert identity["scale_hash"] is not None
+    assert details["workload_profile_hash"] == workload.profile_hash
+    assert details["acceptance_contract_hash"] == acceptance.contract_hash

@@ -11,6 +11,7 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, Static, TabbedContent, TabPane
 
+from frontierwright.benchmark_sources import benchmark_source_payloads
 from frontierwright.data import DatasetClassification, DatasetRole
 from frontierwright.domain import ModelOrigin
 from frontierwright.editions import EditionProfile, policy_for
@@ -18,7 +19,7 @@ from frontierwright.errors import FrontierwrightError
 from frontierwright.execution import HardBudgets, PermissionLevel
 from frontierwright.fit_planner import FitOpportunityPlan, plan_fit_opportunities
 from frontierwright.i18n import tr
-from frontierwright.observations import ObservationOutcome, ObservationSummary
+from frontierwright.observations import ObservationOutcome, ObservationSource, ObservationSummary
 from frontierwright.paths import TrainingPathId
 from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.service import (
@@ -64,10 +65,17 @@ from frontierwright.service import (
     run_capability_v1,
     set_build_intent,
     set_build_targets,
+    set_growth_goals,
     set_workload_profile,
     train_project_tokenizer,
 )
 from frontierwright.workloads import WorkloadProfile, human_fit_status
+
+BRAND_BANNER = (
+    "+-- FRONTIERWRIGHT ----------------------------------+",
+    "|  MEASURE -> CHANGE -> PROVE -> KEEP THE CHAMPION  |",
+    "+----------------------------------------------------+",
+)
 
 TAB_IDS = (
     "character",
@@ -357,6 +365,10 @@ def _compare_text(view: CompareView) -> str:
     return "\n".join(lines)
 
 
+def _ui(language: str, en: str, ko: str) -> str:
+    return ko if language == "ko" else en
+
+
 def _edition_help_text(language: str, edition_profile: str | None) -> str:
     try:
         profile = EditionProfile(edition_profile or EditionProfile.STUDIO.value)
@@ -364,66 +376,208 @@ def _edition_help_text(language: str, edition_profile: str | None) -> str:
         profile = EditionProfile.STUDIO
     keys = tr(language, "help")
     separator = chr(10) * 2
+
     if profile is EditionProfile.ACADEMY:
+        if language == "ko":
+            start_here = chr(10).join(
+                [
+                    "시작 순서",
+                    "1. 학습 데이터를 등록",
+                    "2. 토크나이저를 학습하고 첫 모델 생성",
+                    "3. 학습·측정·비교 후 Candidate를 Champion으로 승격할지 결정",
+                ]
+            )
+            return separator.join(
+                [
+                    "ACADEMY — 직접 만들면서 이해하기",
+                    (
+                        "실제 흐름을 따라갑니다: 데이터 → 토크나이저 → 모델 탄생 → 학습 → "
+                        "평가 → Candidate → Champion. 측정하지 않은 근거는 모르는 상태로 "
+                        "남고, 학습이 성공해도 Candidate 성능은 나빠질 수 있습니다."
+                    ),
+                    (
+                        "Actions에서 다음 실제 작업을 실행하세요. 매 단계마다 모델에서 무엇이 "
+                        "바뀌었는지, 어떤 근거를 측정했는지, 아직 무엇을 모르는지 확인합니다."
+                    ),
+                    start_here,
+                    keys,
+                ]
+            )
+        start_here = chr(10).join(
+            [
+                "START HERE",
+                "1. Add learning data",
+                "2. Train a tokenizer and create the model",
+                "3. Train, measure, compare, then decide whether a Candidate becomes Champion",
+            ]
+        )
         return separator.join(
             [
                 "ACADEMY — UNDERSTAND BY DOING",
                 (
                     "Follow the real lifecycle: data → tokenizer → birth → training → "
-                    "evaluation → candidate → champion. Unknown stats stay unknown until "
+                    "evaluation → candidate → champion. Unknown evidence stays unknown until "
                     "measured. Successful training can still produce a worse candidate."
                 ),
                 (
-                    "Use Actions for the next real operation. Ask yourself after each step: "
-                    "what changed in the model, what evidence was measured, and what is still "
-                    "unknown?"
+                    "Use Actions for the next real operation. Ask after each step what changed, "
+                    "what was measured, and what is still unknown."
                 ),
-                (
-                    "START HERE\n"
-                    "1. Add learning data\n"
-                    "2. Train a tokenizer and create the model\n"
-                    "3. Train, measure, compare, then decide whether a Candidate becomes Champion"
-                ),
+                start_here,
                 keys,
             ]
         )
+
     if profile is EditionProfile.LAB:
+        if language == "ko":
+            start_here = chr(10).join(
+                [
+                    "시작 순서",
+                    "1. 통제된 PRIVATE 인프라 연결",
+                    "2. 모델·데이터·workload acceptance·평가기/보상·예산 고정",
+                    "3. bounded experiment를 실행하고 비교 가능한 근거를 통해서만 승격",
+                ]
+            )
+            return separator.join(
+                [
+                    "LAB — 통제된 프런티어 개발",
+                    (
+                        "모델·데이터셋·평가기·보상원·백엔드·자원 프로필·Candidate를 모두 "
+                        "버전이 고정된 근거로 취급합니다. 비교 가능한 평가, 불확실성, 하드 예산, "
+                        "재현 가능한 intervention을 우선하고 PRIVATE 경계는 하드 제약입니다."
+                    ),
+                    start_here,
+                    keys,
+                ]
+            )
+        start_here = chr(10).join(
+            [
+                "START HERE",
+                "1. Connect controlled private infrastructure",
+                "2. Pin model, data, workload acceptance, evaluator/reward, and budgets",
+                "3. Run bounded experiments and promote only through comparable evidence",
+            ]
+        )
         return separator.join(
             [
                 "LAB — CONTROLLED FRONTIER DEVELOPMENT",
                 (
                     "Treat every model, dataset, evaluator, reward source, backend, resource "
                     "profile, and candidate as versioned evidence. Prefer comparable evals, "
-                    "explicit uncertainty, hard budgets, and reproducible intervention "
-                    "recipes. Private boundaries are hard constraints."
+                    "explicit uncertainty, hard budgets, and reproducible interventions. "
+                    "Private boundaries are hard constraints."
                 ),
-                (
-                    "START HERE\n"
-                    "1. Connect controlled private infrastructure\n"
-                    "2. Pin model, data, workload acceptance, evaluator/reward, and budgets\n"
-                    "3. Run bounded experiments and promote only through comparable evidence"
-                ),
+                start_here,
                 keys,
             ]
         )
+
+    if language == "ko":
+        start_here = chr(10).join(
+            [
+                "시작 순서",
+                "1. 내가 가진 모델을 가져오거나 이어서 사용",
+                "2. workload와 내 PC에서의 실제 동작을 측정",
+                "3. 튜닝/최적화 → Candidate 비교 → Champion 승격 또는 거절",
+            ]
+        )
+        return separator.join(
+            [
+                "STUDIO — 내 모델을 내 환경에 맞추기",
+                (
+                    "가지고 있는 로컬 모델에서 시작해 내 PC와 실제 사용 환경에서 측정하고, "
+                    "원하는 성장 목표를 정한 뒤 Candidate를 반복해서 만듭니다. 시작 모델의 "
+                    "성장 Stat은 0이고 이후 변화량이 올라가거나 내려갑니다."
+                ),
+                start_here,
+                keys,
+            ]
+        )
+
+    start_here = chr(10).join(
+        [
+            "START HERE",
+            "1. Import or continue a model you control",
+            "2. Describe your workload and measure model/machine fit",
+            "3. Tune or optimize a Candidate, compare trade-offs, then promote or reject",
+        ]
+    )
     return separator.join(
         [
             "STUDIO — FIT THE MODEL TO YOU",
             (
-                "Start from a model you control, measure it on your machine, set the build "
-                "you actually want, and iterate through candidates. A better model is the one "
-                "that improves your workload fit under your resource envelope—not simply the "
-                "largest checkpoint."
+                "Start from a local model you control, measure it on your machine, set growth "
+                "goals, and iterate through Candidates. The origin model is growth Stat 0; "
+                "later models move up or down relative to that permanent baseline."
             ),
-            (
-                "START HERE\n"
-                "1. Import or continue a model you control\n"
-                "2. Describe your workload and measure model/machine fit\n"
-                "3. Specialize or optimize a Candidate, compare trade-offs, then promote or reject"
-            ),
+            start_here,
             keys,
         ]
     )
+
+
+def _growth_stat_line(
+    *,
+    language: str,
+    axis: str,
+    evidence: dict[str, object] | None,
+    edition_profile: str | None,
+) -> str:
+    labels = {
+        "knowledge": ("Knowledge", "지식"),
+        "reasoning": ("Reasoning", "추론"),
+        "math": ("Math", "수학"),
+        "coding": ("Coding", "코딩"),
+        "instruction": ("Instruction", "지시수행"),
+        "language": ("Language", "언어"),
+        "context": ("Context", "컨텍스트"),
+    }
+    en_label, ko_label = labels.get(axis, (axis.title(), axis))
+    label = ko_label if language == "ko" else en_label
+    label = f"{label:12}"
+    if not isinstance(evidence, dict):
+        return f"{label} ?  " + _ui(language, "UNMEASURED", "미측정")
+
+    delta = evidence.get("display_delta")
+    relation = str(evidence.get("relation") or "UNMEASURED")
+    source = str(evidence.get("source") or "")
+    if not isinstance(delta, (int, float)) or isinstance(delta, bool):
+        return f"{label} ?  " + _ui(language, "UNMEASURED", "미측정")
+
+    delta_text = f"{float(delta):+.1f}"
+    if source == "ORIGIN_BASELINE":
+        return f"{label} {delta_text}  " + _ui(
+            language,
+            "BASELINE (reference, not absolute capability)",
+            "기준선 (절대 성능 점수가 아님)",
+        )
+
+    interval = evidence.get("delta_interval")
+    interval_text = ""
+    if (
+        isinstance(interval, list)
+        and len(interval) == 2
+        and all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in interval
+        )
+    ):
+        interval_text = f"  Δ95[{float(interval[0]):+.1f}, {float(interval[1]):+.1f}]"
+
+    try:
+        profile = EditionProfile(edition_profile or EditionProfile.STUDIO.value)
+    except ValueError:
+        profile = EditionProfile.STUDIO
+    if profile is EditionProfile.LAB:
+        source_count = evidence.get("source_count")
+        n_text = (
+            f" n={source_count}"
+            if isinstance(source_count, int) and not isinstance(source_count, bool)
+            else ""
+        )
+        source_text = f" source={source}" if source else ""
+        return f"{label} {delta_text}  {relation}{interval_text}{n_text}{source_text}"
+    return f"{label} {delta_text}  {relation}{interval_text}"
 
 
 def _stat_line(
@@ -477,6 +631,25 @@ class HelpScreen(ModalScreen[None]):
         with Vertical(id="help-dialog"):
             yield Static(
                 _edition_help_text(self.language, self.edition_profile),
+                id="help-text",
+            )
+
+
+class InfoScreen(ModalScreen[None]):
+    BINDINGS = [
+        Binding("escape", "dismiss", "Back"),
+        Binding("enter", "dismiss", "Back"),
+    ]
+
+    def __init__(self, title: str, text: str) -> None:
+        super().__init__()
+        self.title_text = title
+        self.body_text = text
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-dialog"):
+            yield Static(
+                self.title_text + chr(10) * 2 + self.body_text,
                 id="help-text",
             )
 
@@ -545,12 +718,14 @@ class ActionCenterScreen(ModalScreen[str | None]):
         *,
         title: str = "ACTION CENTER",
         intro: str = "Every action below uses the same Frontierwright core as CLI/JSON.",
+        language: str = "en",
     ) -> None:
         super().__init__()
         self.items = items
         self.index = 0
         self.title_text = title
         self.intro = intro
+        self.language = language
 
     def compose(self) -> ComposeResult:
         with Vertical(id="action-dialog"):
@@ -677,6 +852,8 @@ class ConfirmScreen(ModalScreen[bool]):
 class FrontierwrightApp(App[None]):
     """Keyboard-only human client over shared Frontierwright service views."""
 
+    TITLE = "FRONTIERWRIGHT"
+
     CSS = """
     #character-sheet, #build-view, #paths-view, #resources-view,
     #data-view, #workload-view, #history-view, #candidates-view {
@@ -766,6 +943,16 @@ class FrontierwrightApp(App[None]):
         self.last_run_id: str | None = None
         self.language = language
         self.tab_order = tab_order_for_edition(view.edition_profile)
+        try:
+            edition = EditionProfile(view.edition_profile or EditionProfile.STUDIO.value)
+        except ValueError:
+            edition = EditionProfile.STUDIO
+        policy = policy_for(edition)
+        self.title = "FRONTIERWRIGHT"
+        self.sub_title = (
+            f"{policy.display_name.removeprefix('Frontierwright ')}"
+            + (f"  //  {view.nickname}" if view.nickname else "")
+        )
 
     def compose(self) -> ComposeResult:
         renderers = {
@@ -795,6 +982,8 @@ class FrontierwrightApp(App[None]):
             edition = EditionProfile.STUDIO
 
         lines = [
+            *BRAND_BANNER,
+            "",
             self.view.nickname or "?",
             f"Edition: {self.view.edition_name or self.view.edition_profile or '?'}",
         ]
@@ -961,17 +1150,51 @@ class FrontierwrightApp(App[None]):
                         f"{human_fit_status(str(gap.get('status') or 'UNKNOWN'))}"
                     )
 
-        lines.extend(["", "CAPABILITY"])
-        for axis in ("general", "reasoning", "math", "coding"):
-            value = self.view.stats.get(axis)
+        lines.extend(
+            [
+                "",
+                _ui(
+                    self.language,
+                    "GROWTH STAT · ORIGIN MODEL = 0",
+                    "성장 STAT · 시작 모델 = 0",
+                ),
+            ]
+        )
+        for axis in (
+            "knowledge",
+            "reasoning",
+            "math",
+            "coding",
+            "instruction",
+            "language",
+            "context",
+        ):
             lines.append(
-                _stat_line(
+                _growth_stat_line(
+                    language=self.language,
                     axis=axis,
-                    value=value,
-                    uncertainty=self.view.stat_uncertainty.get(axis),
+                    evidence=self.view.stat_v2.get(axis),
                     edition_profile=self.view.edition_profile,
                 )
             )
+        if edition is EditionProfile.LAB and self.view.measurement_state == "MEASURED":
+            lines.extend(
+                [
+                    "",
+                    "LEGACY CAPABILITY v1 BENCHMARK EVIDENCE",
+                    "Raw absolute smoke-benchmark evidence; not the growth Stat scale.",
+                ]
+            )
+            for axis in ("general", "reasoning", "math", "coding"):
+                value = self.view.stats.get(axis)
+                lines.append(
+                    _stat_line(
+                        axis=axis,
+                        value=value,
+                        uncertainty=self.view.stat_uncertainty.get(axis),
+                        edition_profile=self.view.edition_profile,
+                    )
+                )
         return "\n".join(lines)
 
     def _build_text(self) -> str:
@@ -983,16 +1206,27 @@ class FrontierwrightApp(App[None]):
             lines.append(f"Archetype: {self.build.archetype}")
         if self.build.priorities:
             lines.extend(["", "PRIORITIES"])
-            for axis, value in sorted(self.build.priorities.items()):
-                lines.append(f"{axis.title():10} {value}")
+            for axis, priority_value in sorted(self.build.priorities.items()):
+                lines.append(f"{axis.title():10} {priority_value}")
         if self.build.targets:
             lines.extend(["", "TARGETS"])
-            for axis, value in sorted(self.build.targets.items()):
-                lines.append(f"{axis.title():10} {value}")
+            for axis, target_value in sorted(self.build.targets.items()):
+                lines.append(f"{axis.title():10} {target_value}")
         if self.build.floors:
             lines.extend(["", "FLOORS"])
-            for axis, value in sorted(self.build.floors.items()):
-                lines.append(f"{axis.title():10} {value}")
+            for axis, floor_value in sorted(self.build.floors.items()):
+                lines.append(f"{axis.title():10} {floor_value}")
+        if self.build.growth_goals:
+            lines.extend(["", _ui(self.language, "GROWTH RULES", "성장 규칙")])
+            for goal in self.build.growth_goals:
+                kind = goal.get("kind")
+                metric = goal.get("metric")
+                goal_value = goal.get("value")
+                unit = goal.get("unit")
+                suffix = ""
+                if goal_value is not None:
+                    suffix = f"={goal_value}{'%' if unit == 'PERCENT' else ''}"
+                lines.append(f"{kind} {metric}{(' ' + suffix) if suffix else ''}")
         if self.build.reason:
             lines.extend(["", self.build.reason])
         return "\n".join(lines)
@@ -1157,6 +1391,10 @@ class FrontierwrightApp(App[None]):
                 lines.append(f"Latency p50: {float(latency):.3f}s")
             if isinstance(throughput, (int, float)) and not isinstance(throughput, bool):
                 lines.append(f"Throughput p50: {float(throughput):.1f} tok/s")
+            if model_fit.get("workload_shape_bound") is False:
+                lines.append(
+                    "Reference profile shape: fixed prompt/output; not workload-shaped proof."
+                )
 
         lines.extend(
             [
@@ -1359,11 +1597,22 @@ class FrontierwrightApp(App[None]):
             lines.append(f"Latency ceiling: {latency}s")
         if throughput is not None:
             lines.append(f"Throughput floor: {throughput} tok/s")
-        lines.append(f"Privacy: {profile.get('privacy') or 'UNKNOWN'}")
+        privacy = profile.get("privacy")
+        lines.append(f"Privacy: {privacy or 'UNKNOWN'}")
+        if privacy == "PRIVATE":
+            lines.append(
+                "Privacy scope: Frontierwright application admission/data-boundary policy only."
+            )
+            lines.append(
+                "It does not attest OS/process/kernel/network isolation or remote attestation."
+            )
         if isinstance(floors, dict) and floors:
             lines.append("Capability floors:")
             for axis, value in sorted(floors.items()):
                 lines.append(f"  {str(axis).title():10} >= {value}")
+            lines.append(
+                "  Point-estimate thresholds; use acceptance EXPLICIT_INTERVAL for CI gating."
+            )
         if (
             edition is not EditionProfile.ACADEMY
             and isinstance(utility_weights, dict)
@@ -1684,14 +1933,45 @@ class FrontierwrightApp(App[None]):
                 )
                 self.notify("Candidate promoted with explicit build-violation override.")
             elif result == "reject":
-                reject_candidate(self.root, model_id)
-                self.notify("Candidate rejected.")
+                self.push_screen(
+                    WorkflowFormScreen(
+                        title="REJECT CANDIDATE",
+                        description=(
+                            "Optionally record why this Candidate was rejected. Frontierwright "
+                            "also pins the current Champion/evaluation/workload identity "
+                            "in history."
+                        ),
+                        fields=[FormField("reason", "Reason (optional)", "")],
+                    ),
+                    lambda values, target=model_id: self._submit_candidate_rejection(
+                        values, target
+                    ),
+                )
+                return
             else:
                 return
         except FrontierwrightError as exc:
             self.notify(str(exc), severity="error")
             return
         self._refresh_all()
+
+    def _submit_candidate_rejection(
+        self,
+        values: dict[str, str] | None,
+        model_id: str,
+    ) -> None:
+        if values is None:
+            return
+        try:
+            reject_candidate(
+                self.root,
+                model_id,
+                reason=values.get("reason") or None,
+            )
+            self._refresh_all()
+            self.notify("Candidate rejected and audit context recorded.")
+        except FrontierwrightError as exc:
+            self.notify(str(exc), severity="error")
 
     def _first_dataset_id(self, role: DatasetRole | None = None) -> str:
         for item in self.data.datasets:
@@ -1771,12 +2051,18 @@ class FrontierwrightApp(App[None]):
         return sys.executable
 
     def _action_items(self) -> list[ActionItem]:
+        def copy(en: str, ko: str) -> str:
+            return _ui(self.language, en, ko)
+
         if not self.view.initialized:
             return [
                 ActionItem(
                     "initialize_project",
-                    "Create Frontierwright project",
-                    "Choose character name, origin, edition, and UI language.",
+                    copy("Create Frontierwright project", "Frontierwright 프로젝트 만들기"),
+                    copy(
+                        "Choose character name, origin, edition, and UI language.",
+                        "프로젝트 이름, origin, edition, UI 언어를 선택합니다.",
+                    ),
                 )
             ]
 
@@ -1787,13 +2073,19 @@ class FrontierwrightApp(App[None]):
 
         resource_action = ActionItem(
             "detect_resources",
-            "Detect local resources",
-            "Measure CPU/RAM/disk/GPU and refresh feasibility.",
+            copy("Detect local resources", "로컬 자원 측정"),
+            copy(
+                "Measure CPU/RAM/disk/GPU and refresh feasibility.",
+                "CPU/RAM/디스크/GPU를 측정해 현재 실행 가능성을 갱신합니다.",
+            ),
         )
         dataset_action = ActionItem(
             "add_dataset",
-            "Register local dataset",
-            "Add PRETRAIN, SFT, or PREFERENCE data with an explicit classification.",
+            copy("Register local dataset", "로컬 데이터셋 등록"),
+            copy(
+                "Add PRETRAIN, SFT, or PREFERENCE data with an explicit classification.",
+                "PRETRAIN/SFT/PREFERENCE 데이터를 명시적 분류와 함께 등록합니다.",
+            ),
         )
         if edition is EditionProfile.ACADEMY:
             workload_action = ActionItem(
@@ -1812,8 +2104,11 @@ class FrontierwrightApp(App[None]):
         else:
             workload_action = ActionItem(
                 "set_workload",
-                "Define your workload",
-                "Tell Frontierwright what this model must do well on your machine.",
+                copy("Define your workload", "내 workload 정의"),
+                copy(
+                    "Tell Frontierwright what this model must do well on your machine.",
+                    "이 모델이 내 PC에서 어떤 일을 잘해야 하는지 정의합니다.",
+                ),
             )
             items = [resource_action, workload_action, dataset_action]
         if self.view.champion_model_id is not None:
@@ -1847,25 +2142,58 @@ class FrontierwrightApp(App[None]):
                 )
             )
         elif self.build.mode == "TARGETS_FLOORS":
-            items.append(
-                ActionItem(
-                    "build_targets",
-                    "Set measured build targets",
-                    (
-                        "Set explicit numeric targets and optional floors on the exact "
-                        "frozen capability scale."
-                    ),
+            if edition is not EditionProfile.ACADEMY:
+                items.append(
+                    ActionItem(
+                        "build_growth_goals",
+                        copy("Set growth rules", "성장 규칙 설정"),
+                        copy(
+                            (
+                                "Choose metrics to IMPROVE or PROTECT, plus allowed regression "
+                                "tolerances and hard constraints. Promotion checks these rules."
+                            ),
+                            (
+                                "향상할 지표, 보호할 지표, 허용 퇴보 범위와 하드 제약을 정합니다. "
+                                "Candidate 승격 때 이 규칙을 검사합니다."
+                            ),
+                        ),
+                    )
                 )
-            )
+            if edition is not EditionProfile.STUDIO:
+                items.append(
+                    ActionItem(
+                        "build_targets",
+                        copy(
+                            "Set absolute benchmark targets",
+                            "절대 benchmark 목표 설정",
+                        ),
+                        copy(
+                            (
+                                "Set explicit numeric targets and floors on the exact frozen "
+                                "legacy capability scale."
+                            ),
+                            (
+                                "고정된 legacy capability scale에 절대 수치 목표와 floor를 "
+                                "설정합니다."
+                            ),
+                        ),
+                    )
+                )
 
         if self.view.champion_model_id is not None:
             items.append(
                 ActionItem(
                     "capability_v1",
-                    "Measure Capability v1",
-                    (
-                        "Run the frozen 64-task General/Reasoning/Math/Coding "
-                        "bundle and update real stats."
+                    copy("Run legacy Capability v1 smoke benchmark", "Legacy Capability v1 측정"),
+                    copy(
+                        (
+                            "Run the frozen 64-task smoke benchmark as raw comparison evidence. "
+                            "It does not redefine the origin-relative growth Stat scale."
+                        ),
+                        (
+                            "64-task smoke benchmark를 원시 비교 근거로 실행합니다. "
+                            "시작 모델=0인 성장 Stat 기준선은 바뀌지 않습니다."
+                        ),
                     ),
                 )
             )
@@ -1893,6 +2221,22 @@ class FrontierwrightApp(App[None]):
                     "profile_champion_inference",
                     profile_title,
                     profile_description,
+                )
+            )
+            items.append(
+                ActionItem(
+                    "benchmark_catalog",
+                    copy("Inspect benchmark catalog", "Benchmark catalog 보기"),
+                    copy(
+                        (
+                            "See available benchmark sources, integration status, licensing "
+                            "checks, and the next action for each source."
+                        ),
+                        (
+                            "사용 가능한 benchmark source, 통합 상태, 라이선스 확인 상태와 "
+                            "각 source의 다음 작업을 봅니다."
+                        ),
+                    ),
                 )
             )
 
@@ -1993,11 +2337,33 @@ class FrontierwrightApp(App[None]):
         except ValueError:
             profile = EditionProfile.STUDIO
         policy = policy_for(profile)
+        if self.language == "ko":
+            title = {
+                EditionProfile.ACADEMY: "ACADEMY 가이드",
+                EditionProfile.STUDIO: "STUDIO 작업대",
+                EditionProfile.LAB: "LAB 컨트롤 플레인",
+            }[profile]
+            intro = {
+                EditionProfile.ACADEMY: (
+                    "실제 모델 상태를 바꾸거나 측정하는 작업을 순서대로 실행합니다."
+                ),
+                EditionProfile.STUDIO: (
+                    "내 모델을 내 workload와 자원 환경에 맞게 측정·튜닝·비교합니다."
+                ),
+                EditionProfile.LAB: (
+                    "버전이 고정된 근거, PRIVATE 경계, 예산, lineage와 회귀 gate를 기준으로 "
+                    "실험을 운영합니다."
+                ),
+            }[profile]
+        else:
+            title = policy.action_center_title
+            intro = policy.action_center_intro
         self.push_screen(
             ActionCenterScreen(
                 self._action_items(),
-                title=policy.action_center_title,
-                intro=policy.action_center_intro,
+                title=title,
+                intro=intro,
+                language=self.language,
             ),
             self._action_center_result,
         )
@@ -2022,6 +2388,41 @@ class FrontierwrightApp(App[None]):
                     ],
                 ),
                 self._submit_initialize_project,
+            )
+            return
+
+        if action_id == "benchmark_catalog":
+            sources = benchmark_source_payloads()
+            lines: list[str] = []
+            for source in sources:
+                raw_axes = source.get("axes")
+                axes = (
+                    ", ".join(str(item) for item in raw_axes)
+                    if isinstance(raw_axes, list) and raw_axes
+                    else "-"
+                )
+                lines.extend(
+                    [
+                        f"{source.get('source_id')} · {source.get('title')}",
+                        (
+                            f"  {source.get('kind')} · {source.get('lifecycle')} · "
+                            f"integration={source.get('integration_status')}"
+                        ),
+                        f"  axes={axes}",
+                        f"  source={source.get('upstream_url')}",
+                        (
+                            f"  license={source.get('license_status')} · "
+                            f"cost={source.get('cost_hint')}"
+                        ),
+                        f"  next={source.get('next_action')}",
+                        "",
+                    ]
+                )
+            self.push_screen(
+                InfoScreen(
+                    _ui(self.language, "BENCHMARK CATALOG", "BENCHMARK CATALOG"),
+                    chr(10).join(lines).rstrip(),
+                )
             )
             return
 
@@ -2051,6 +2452,11 @@ class FrontierwrightApp(App[None]):
                         FormField("language", "Language (optional)", ""),
                         FormField("failure_category", "Failure/correction category (optional)", ""),
                         FormField("latency", "Latency seconds (optional)", ""),
+                        FormField(
+                            "source",
+                            "Evidence source (HUMAN_CONFIRMED/SYNTHETIC_TEST/IMPORTED)",
+                            "HUMAN_CONFIRMED",
+                        ),
                     ],
                 ),
                 self._submit_observation,
@@ -2222,6 +2628,99 @@ class FrontierwrightApp(App[None]):
                     ],
                 ),
                 self._submit_build_intent,
+            )
+            return
+
+        if action_id == "build_growth_goals":
+            def metrics_for(kind: str) -> str:
+                return ", ".join(
+                    str(goal.get("metric"))
+                    for goal in self.build.growth_goals
+                    if goal.get("kind") == kind and isinstance(goal.get("metric"), str)
+                )
+
+            def values_for(kind: str) -> str:
+                rendered: list[str] = []
+                for goal in self.build.growth_goals:
+                    if goal.get("kind") != kind or not isinstance(goal.get("metric"), str):
+                        continue
+                    value = goal.get("value")
+                    if value is None:
+                        continue
+                    suffix = "%" if goal.get("unit") == "PERCENT" else ""
+                    rendered.append(f"{goal['metric']}={value}{suffix}")
+                return ", ".join(rendered)
+
+            self.push_screen(
+                WorkflowFormScreen(
+                    title=_ui(self.language, "SET GROWTH RULES", "성장 규칙 설정"),
+                    description=_ui(
+                        self.language,
+                        (
+                            "Growth Stat is origin-relative (origin=0). IMPROVE requires a clear "
+                            "measured gain; PROTECT forbids regression; TOLERANCE allows a bounded "
+                            "regression such as serving.latency_p50=5%."
+                        ),
+                        (
+                            "성장 Stat은 시작 모델=0 기준입니다. IMPROVE는 명확한 향상, "
+                            "PROTECT는 퇴보 금지, TOLERANCE는 serving.latency_p50=5%처럼 "
+                            "허용 가능한 퇴보 범위를 뜻합니다."
+                        ),
+                    ),
+                    fields=[
+                        FormField(
+                            "improve",
+                            _ui(
+                                self.language,
+                                "IMPROVE metrics (comma separated)",
+                                "향상할 지표 (쉼표 구분)",
+                            ),
+                            metrics_for("IMPROVE"),
+                            "capability.coding, serving.throughput_p50",
+                        ),
+                        FormField(
+                            "protect",
+                            _ui(
+                                self.language,
+                                "PROTECT metrics (comma separated)",
+                                "보호할 지표 (쉼표 구분)",
+                            ),
+                            metrics_for("PROTECT"),
+                            "capability.reasoning",
+                        ),
+                        FormField(
+                            "tolerance",
+                            _ui(
+                                self.language,
+                                "TOLERANCE metric=value or value%",
+                                "허용 퇴보 metric=value 또는 value%",
+                            ),
+                            values_for("TOLERANCE"),
+                            "serving.latency_p50=5%",
+                        ),
+                        FormField(
+                            "require",
+                            _ui(
+                                self.language,
+                                "Absolute requirement metric=value",
+                                "절대 요구조건 metric=value",
+                            ),
+                            values_for("ABSOLUTE_REQUIREMENT"),
+                            "serving.throughput_p50=20",
+                        ),
+                        FormField(
+                            "hard",
+                            _ui(
+                                self.language,
+                                "Hard constraint key=value",
+                                "하드 제약 key=value",
+                            ),
+                            values_for("HARD_CONSTRAINT"),
+                            "privacy=PRIVATE",
+                        ),
+                    ],
+                ),
+                self._submit_growth_goals,
             )
             return
 
@@ -2441,8 +2940,8 @@ class FrontierwrightApp(App[None]):
                 WorkflowFormScreen(
                     title="MEASURE FRONTIERWRIGHT CAPABILITY v1",
                     description=(
-                        "Runs the frozen 64-task local bundle. 100 is the 50% accuracy "
-                        "reference anchor, not a maximum; raw evidence remains inspectable."
+                        "Runs the frozen 64-task local smoke benchmark. Raw accuracy and "
+                        "uncertainty remain inspectable; growth Stat stays origin-relative."
                     ),
                     fields=[
                         FormField(
@@ -2463,8 +2962,8 @@ class FrontierwrightApp(App[None]):
                 WorkflowFormScreen(
                     title="MEASURE CANDIDATE CAPABILITY v1",
                     description=(
-                        "Runs the same frozen Capability v1 bundle on the selected candidate. "
-                        "This does not promote the candidate."
+                        "Runs the same frozen legacy smoke benchmark on the selected candidate. "
+                        "This adds comparison evidence and never promotes the candidate by itself."
                     ),
                     fields=[
                         FormField("candidate_model_id", "Candidate model ID", model_id),
@@ -2568,15 +3067,15 @@ class FrontierwrightApp(App[None]):
         if values is None:
             return
         try:
-            targets: dict[str, int] = {}
-            floors: dict[str, int] = {}
+            targets: dict[str, float] = {}
+            floors: dict[str, float] = {}
             for axis in ("general", "reasoning", "math", "coding"):
                 target_raw = values.get(f"target_{axis}", "").strip()
                 floor_raw = values.get(f"floor_{axis}", "").strip()
                 if target_raw:
-                    targets[axis] = int(target_raw)
+                    targets[axis] = float(target_raw)
                 if floor_raw:
-                    floors[axis] = int(floor_raw)
+                    floors[axis] = float(floor_raw)
             set_build_targets(
                 self.root,
                 targets=targets,
@@ -2584,6 +3083,56 @@ class FrontierwrightApp(App[None]):
             )
             self._refresh_all()
             self.notify("Measured build targets updated.")
+        except (FrontierwrightError, KeyError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+
+    def _submit_growth_goals(self, values: dict[str, str] | None) -> None:
+        if values is None:
+            return
+
+        def labels(raw: str) -> tuple[str, ...]:
+            return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+        def assignments(raw: str) -> dict[str, str]:
+            result: dict[str, str] = {}
+            for item in labels(raw):
+                if "=" not in item:
+                    raise ValueError(f"Expected metric=value: {item}")
+                key, raw_value = (part.strip() for part in item.split("=", 1))
+                if not key or not raw_value:
+                    raise ValueError(f"Expected nonempty metric=value: {item}")
+                if key in result:
+                    raise ValueError(f"Repeated metric: {key}")
+                result[key] = raw_value
+            return result
+
+        try:
+            tolerance: dict[str, tuple[float, str]] = {}
+            for metric, raw_value in assignments(values.get("tolerance", "")).items():
+                unit = "PERCENT" if raw_value.endswith("%") else "ABSOLUTE"
+                numeric = raw_value[:-1].strip() if unit == "PERCENT" else raw_value
+                tolerance[metric] = (float(numeric), unit)
+
+            absolute_requirements = {
+                metric: float(raw_value)
+                for metric, raw_value in assignments(values.get("require", "")).items()
+            }
+            set_growth_goals(
+                self.root,
+                improve=labels(values.get("improve", "")),
+                protect=labels(values.get("protect", "")),
+                tolerance=tolerance,
+                absolute_requirements=absolute_requirements,
+                hard_constraints=assignments(values.get("hard", "")),
+            )
+            self._refresh_all()
+            self.notify(
+                _ui(
+                    self.language,
+                    "Growth rules updated.",
+                    "성장 규칙을 갱신했습니다.",
+                )
+            )
         except (FrontierwrightError, KeyError, ValueError) as exc:
             self.notify(str(exc), severity="error")
 
@@ -2600,6 +3149,9 @@ class FrontierwrightApp(App[None]):
                 language=values.get("language") or None,
                 failure_category=values.get("failure_category") or None,
                 latency_seconds=float(raw_latency) if raw_latency else None,
+                source=ObservationSource(
+                    values.get("source", "HUMAN_CONFIRMED").strip().upper()
+                ),
             )
             self._refresh_all()
             self.notify("Real-use outcome recorded. No prompt/response content was stored.")

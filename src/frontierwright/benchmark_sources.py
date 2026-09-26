@@ -45,12 +45,27 @@ class BenchmarkSource:
     runner_hint: str
     contamination_note: str
     redistribution: str = "VERIFY_UPSTREAM_BEFORE_VENDORING"
+    integration_status: str = "CATALOG_ONLY"
+    license_status: str = "VERIFY_UPSTREAM"
+    cost_hint: str = "VARIES_BY_MODEL_AND_SELECTED_SUITE"
+
+    @property
+    def next_action(self) -> str:
+        if self.kind is BenchmarkKind.FRAMEWORK:
+            return (
+                "Use this framework to import/run a pinned task; "
+                "Frontierwright does not score the framework."
+            )
+        if self.kind is BenchmarkKind.SYSTEM:
+            return "Connect a system evaluator and keep results separate from pure model Stat v2."
+        return "Pin an exact upstream version/task and import compatible evaluation evidence."
 
     def to_payload(self) -> dict[str, object]:
         payload = asdict(self)
         payload["kind"] = self.kind.value
         payload["lifecycle"] = self.lifecycle.value
         payload["axes"] = [axis.value for axis in self.axes]
+        payload["next_action"] = self.next_action
         return payload
 
 

@@ -100,6 +100,63 @@ def _strict_string_list(raw: object, label: str) -> tuple[str, ...]:
     return tuple(raw)
 
 
+def lab_adapter_manifest_schema() -> dict[str, object]:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Frontierwright Lab Adapter Manifest",
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "schema_version",
+            "adapter_id",
+            "adapter_version",
+            "display_name",
+            "kinds",
+            "data_boundary",
+            "network_scope",
+        ],
+        "properties": {
+            "schema_version": {"const": 1},
+            "adapter_id": {"type": "string", "minLength": 1},
+            "adapter_version": {"type": "string", "minLength": 1},
+            "display_name": {"type": "string", "minLength": 1},
+            "kinds": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": True,
+                "items": {"enum": [item.value for item in LabAdapterKind]},
+            },
+            "data_boundary": {
+                "enum": [
+                    item.value
+                    for item in BackendDataBoundary
+                    if item is not BackendDataBoundary.UNKNOWN
+                ]
+            },
+            "network_scope": {"enum": [item.value for item in NetworkScope]},
+            "capabilities": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1},
+                "default": [],
+            },
+        },
+    }
+
+
+def lab_adapter_manifest_example() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "adapter_id": "my-private-evaluator",
+        "adapter_version": "1",
+        "display_name": "My Private Evaluator",
+        "kinds": [LabAdapterKind.EVALUATOR.value],
+        "data_boundary": BackendDataBoundary.CONTROLLED_PRIVATE.value,
+        "network_scope": NetworkScope.PRIVATE_ONLY.value,
+        "capabilities": ["evaluation"],
+    }
+
+
 def load_lab_adapter_manifest(path: Path) -> LabAdapterManifest:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))

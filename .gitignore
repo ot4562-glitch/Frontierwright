@@ -12,6 +12,8 @@ dist/
 .academy-smoke/
 .train-install*
 ASTRA_*.txt
+artifacts/
+workspaces/
 *.log
 *.pid
 nul

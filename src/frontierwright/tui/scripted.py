@@ -70,15 +70,34 @@ def _snapshot(app: FrontierwrightApp, *, step_index: int, action: str) -> dict[s
     focused_widget = focused.id if focused is not None else None
 
     static_text: list[str] = []
+    all_static_text: list[str] = []
+    visible_regions: list[dict[str, object]] = []
     for widget in app.screen.query(Static):
         content = str(widget.content).strip()
         if content:
+            all_static_text.append(content)
+        visible = bool(widget.visible and widget.display and widget.is_on_screen)
+        if visible and content:
             static_text.append(content)
+            region = widget.region
+            visible_regions.append(
+                {
+                    "id": widget.id,
+                    "type": type(widget).__name__,
+                    "x": region.x,
+                    "y": region.y,
+                    "width": region.width,
+                    "height": region.height,
+                }
+            )
 
     inputs: dict[str, str] = {}
+    visible_inputs: list[str] = []
     for input_widget in app.screen.query(Input):
         if input_widget.id:
             inputs[input_widget.id] = input_widget.value
+            if input_widget.visible and input_widget.display and input_widget.is_on_screen:
+                visible_inputs.append(input_widget.id)
 
     return {
         "step_index": step_index,
@@ -87,7 +106,11 @@ def _snapshot(app: FrontierwrightApp, *, step_index: int, action: str) -> dict[s
         "active_tab": active_tab,
         "focused_widget": focused_widget,
         "inputs": inputs,
+        "visible_inputs": visible_inputs,
         "text": "\n\n".join(static_text),
+        "all_text": "\n\n".join(all_static_text),
+        "visible_regions": visible_regions,
+        "visibility_semantics": "VISIBLE_ON_SCREEN_ONLY",
     }
 
 

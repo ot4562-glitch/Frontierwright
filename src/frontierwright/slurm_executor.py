@@ -201,6 +201,107 @@ class SlurmExecutorProfile:
         return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def slurm_profile_schema() -> dict[str, object]:
+    from frontierwright.lab_adapters import lab_adapter_manifest_schema
+
+    base = lab_adapter_manifest_schema()
+    raw_properties = base.get("properties")
+    properties: dict[str, object] = (
+        dict(raw_properties) if isinstance(raw_properties, dict) else {}
+    )
+    properties["slurm"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "schema_version",
+            "supported_paths",
+            "calibrate_worker_argv",
+            "train_worker_argv",
+            "shared_filesystem",
+        ],
+        "properties": {
+            "schema_version": {"const": 1},
+            "supported_paths": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": True,
+                "items": {"enum": [item.value for item in TrainingPathId]},
+            },
+            "calibrate_worker_argv": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"},
+            },
+            "train_worker_argv": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"},
+            },
+            "sbatch_argv": {"type": "array", "items": {"type": "string"}},
+            "scancel_argv": {"type": "array", "items": {"type": "string"}},
+            "sacct_argv": {"type": "array", "items": {"type": "string"}},
+            "partition": {"type": ["string", "null"]},
+            "account": {"type": ["string", "null"]},
+            "qos": {"type": ["string", "null"]},
+            "nodes": {"type": "integer", "minimum": 1},
+            "gpus_per_node": {"type": ["integer", "null"], "minimum": 1},
+            "cpus_per_task": {"type": "integer", "minimum": 1},
+            "memory_mb": {"type": ["integer", "null"], "minimum": 1},
+            "time_limit_minutes": {"type": "integer", "minimum": 1},
+            "max_queue_wait_seconds": {"type": "integer", "minimum": 1},
+            "shared_filesystem": {"const": True},
+        },
+    }
+    raw_required = base.get("required")
+    required = list(raw_required) if isinstance(raw_required, list) else []
+    return {
+        **base,
+        "title": "Frontierwright Controlled-Private Slurm Profile",
+        "required": [*required, "slurm"],
+        "properties": properties,
+    }
+
+
+def slurm_profile_example() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "adapter_id": "lab.slurm.private",
+        "adapter_version": "1",
+        "display_name": "Private Slurm Cluster",
+        "kinds": ["TRAINER", "CLUSTER_EXECUTOR"],
+        "data_boundary": "CONTROLLED_PRIVATE",
+        "network_scope": "PRIVATE_ONLY",
+        "capabilities": ["slurm", "lora-sft", "rl-policy-optimization"],
+        "slurm": {
+            "schema_version": 1,
+            "supported_paths": ["LORA_SFT", "RL_POLICY_OPTIMIZATION"],
+            "calibrate_worker_argv": [
+                "python",
+                "worker.py",
+                "--request",
+                "{request_json}",
+            ],
+            "train_worker_argv": [
+                "python",
+                "worker.py",
+                "--request",
+                "{request_json}",
+            ],
+            "sbatch_argv": ["sbatch"],
+            "scancel_argv": ["scancel"],
+            "sacct_argv": ["sacct"],
+            "partition": "private",
+            "nodes": 1,
+            "gpus_per_node": 1,
+            "cpus_per_task": 8,
+            "memory_mb": 32768,
+            "time_limit_minutes": 60,
+            "max_queue_wait_seconds": 3600,
+            "shared_filesystem": True,
+        },
+    }
+
+
 def load_slurm_executor_profile(path: Path) -> SlurmExecutorProfile:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))

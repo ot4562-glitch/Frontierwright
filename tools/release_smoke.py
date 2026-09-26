@@ -91,8 +91,26 @@ def main() -> int:
         _run([str(cli), "--help"])
         version_result = _run([str(cli), "--version"])
         version = version_result.stdout.strip()
-        if version != f"frontierwright {__version__}":
-            raise SystemExit(f"installed CLI reported unexpected version: {version!r}")
+        metadata_version = _run(
+            [
+                str(python),
+                "-c",
+                (
+                    "from importlib.metadata import version; "
+                    "print(version('frontierwright'))"
+                ),
+            ]
+        ).stdout.strip()
+        if metadata_version != __version__:
+            raise SystemExit(
+                "source version and installed wheel metadata disagree: "
+                f"source={__version__!r}, wheel={metadata_version!r}"
+            )
+        if version != f"frontierwright {metadata_version}":
+            raise SystemExit(
+                "installed CLI version and wheel metadata disagree: "
+                f"cli={version!r}, wheel={metadata_version!r}"
+            )
 
         init = _run(
             [

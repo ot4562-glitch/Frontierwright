@@ -28,13 +28,16 @@ class FitOpportunity:
     reason: str
     evidence_keys: tuple[str, ...]
     success_criterion: str
+    argv_steps: tuple[tuple[str, ...], ...] = ()
     improvement_prediction: None = None
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload = {
             **asdict(self),
             "opportunity_class": self.opportunity_class.value,
         }
+        payload["argv_steps"] = [list(step) for step in self.argv_steps]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,7 @@ def plan_fit_opportunities(
     constraints: list[dict[str, object]],
     model_fit: dict[str, object] | None,
     workload_evaluation_coverage: dict[str, object] | None,
+    workload_acceptance_status: str | None = None,
     observation_summary: dict[str, object] | None = None,
 ) -> FitOpportunityPlan:
     """Return falsifiable next experiments without forecasting improvement."""
@@ -115,6 +119,7 @@ def plan_fit_opportunities(
                 ),
                 evidence_keys=("workload.profile",),
                 success_criterion="A versioned Workload Profile exists.",
+                argv_steps=(("frontierwright", "workload", "set", "--help"),),
             ),
         )
         return FitOpportunityPlan(
@@ -142,6 +147,10 @@ def plan_fit_opportunities(
                 reason="Workload fit requires an exact model identity and fingerprint.",
                 evidence_keys=("model.identity",),
                 success_criterion="A current Champion model exists with an exact fingerprint.",
+                argv_steps=(
+                    ("frontierwright", "import", "--help"),
+                    ("frontierwright", "birth", "zero", "--help"),
+                ),
             ),
         )
         return FitOpportunityPlan(
@@ -199,6 +208,7 @@ def plan_fit_opportunities(
                 success_criterion=(
                     "Every referenced capability floor has comparable measured evidence."
                 ),
+                argv_steps=(("frontierwright", "eval", "capability-v1", "--help"),),
             ),
         )
 
@@ -227,6 +237,7 @@ def plan_fit_opportunities(
                     "A model-specific inference receipt supplies the missing serving and "
                     "resource evidence."
                 ),
+                argv_steps=(("frontierwright", "operate", "profile", "--help"),),
             ),
         )
 
@@ -246,7 +257,7 @@ def plan_fit_opportunities(
             FitOpportunity(
                 opportunity_id="measure-workload-coverage",
                 opportunity_class=OpportunityClass.BLOCKING_EVIDENCE,
-                action="frontierwright eval import-lm-eval/import-lighteval + workload bind-eval",
+                action="frontierwright eval import-lm-eval --help",
                 title=_edition_title(
                     edition,
                     academy="Test the model on the tasks you actually care about",
@@ -262,32 +273,64 @@ def plan_fit_opportunities(
                     "Every declared workload language/domain/task is explicitly bound to exact "
                     "stored task/version/metric evidence."
                 ),
+                argv_steps=(
+                    ("frontierwright", "eval", "import-lm-eval", "--help"),
+                    ("frontierwright", "workload", "bind-eval", "--help"),
+                ),
             ),
         )
 
     if "evaluation.workload_acceptance" in unknown_keys:
+        acceptance_steps: tuple[tuple[str, ...], ...]
+        acceptance_configured = workload_acceptance_status not in {None, "NOT_CONFIGURED"}
+        if acceptance_configured:
+            acceptance_action = "frontierwright workload acceptance assess --help"
+            acceptance_id = "assess-workload-acceptance"
+            acceptance_title = _edition_title(
+                edition,
+                academy="Check the saved success rules against the model evidence",
+                studio="Assess the saved success rules for this exact model",
+                lab="Assess the pinned acceptance contract against exact evidence",
+            )
+            acceptance_reason = (
+                "The acceptance contract already exists, but this exact model has not yet "
+                "been assessed against compatible evidence."
+            )
+            acceptance_steps = (
+                ("frontierwright", "workload", "acceptance", "assess", "--help"),
+            )
+        else:
+            acceptance_action = "frontierwright workload acceptance example --json"
+            acceptance_id = "configure-workload-acceptance"
+            acceptance_title = _edition_title(
+                edition,
+                academy="Choose what counts as success before deciding the next model",
+                studio="Turn your optimization goals into measurable success criteria",
+                lab="Pin the exact acceptance contract before trusting the experiment",
+            )
+            acceptance_reason = (
+                "Workload acceptance is mandatory decision evidence but no compatible "
+                "versioned success criteria are configured."
+            )
+            acceptance_steps = (
+                ("frontierwright", "workload", "acceptance", "example", "--json"),
+                ("frontierwright", "workload", "acceptance", "create", "--help"),
+            )
         _append_unique(
             items,
             seen,
             FitOpportunity(
-                opportunity_id="configure-workload-acceptance",
+                opportunity_id=acceptance_id,
                 opportunity_class=OpportunityClass.BLOCKING_EVIDENCE,
-                action="frontierwright workload acceptance example --json",
-                title=_edition_title(
-                    edition,
-                    academy="Choose what counts as success before deciding the next model",
-                    studio="Turn your optimization goals into measurable success criteria",
-                    lab="Pin the exact acceptance contract before trusting the experiment",
-                ),
-                reason=(
-                    "Workload acceptance is mandatory decision evidence but no compatible "
-                    "versioned success criteria are configured or assessed."
-                ),
+                action=acceptance_action,
+                title=acceptance_title,
+                reason=acceptance_reason,
                 evidence_keys=("evaluation.workload_acceptance",),
                 success_criterion=(
                     "A versioned acceptance contract is created and assessed against exact "
                     "compatible evaluation evidence."
                 ),
+                argv_steps=acceptance_steps,
             ),
         )
 

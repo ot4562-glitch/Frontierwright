@@ -175,3 +175,93 @@ def test_scripted_play_can_fill_a_visible_form(tmp_path: Path) -> None:
 
     assert payload["snapshots"][-1]["focused_widget"] == "form-field-0"
     assert payload["snapshots"][-1]["inputs"]["form-field-0"] == "workspace/sample.txt"
+
+
+
+def test_scripted_snapshot_text_contains_only_visible_active_tab(tmp_path: Path) -> None:
+    created = runner.invoke(
+        app,
+        [
+            "project",
+            "init",
+            str(tmp_path),
+            "--name",
+            "VISIBLE-QA",
+            "--origin",
+            "ZERO",
+            "--edition",
+            "ACADEMY",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert created.exit_code == 0, created.output
+
+    script = tmp_path / "visible-play.json"
+    script.write_text(json.dumps({"steps": []}), encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--path",
+            str(tmp_path),
+            "--script",
+            str(script),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    snapshot = json.loads(result.stdout)["snapshots"][0]
+
+    assert snapshot["active_tab"] == "character"
+    assert snapshot["visibility_semantics"] == "VISIBLE_ON_SCREEN_ONLY"
+    assert "GROWTH STAT · ORIGIN MODEL = 0" in snapshot["text"]
+    assert "No datasets registered." not in snapshot["text"]
+    assert "No datasets registered." in snapshot["all_text"]
+
+
+def test_scripted_play_renders_korean_help_and_action_center(tmp_path: Path) -> None:
+    created = runner.invoke(
+        app,
+        [
+            "project",
+            "init",
+            str(tmp_path),
+            "--name",
+            "KO-QA",
+            "--origin",
+            "ZERO",
+            "--edition",
+            "ACADEMY",
+            "--lang",
+            "ko",
+            "--json",
+            "--non-interactive",
+            "--yes",
+        ],
+    )
+    assert created.exit_code == 0, created.output
+
+    script = tmp_path / "ko-play.json"
+    script.write_text(
+        json.dumps({"steps": [{"press": ["?"]}, {"press": ["escape", "a"]}]}),
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--path",
+            str(tmp_path),
+            "--script",
+            str(script),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    snapshots = json.loads(result.stdout)["snapshots"]
+
+    assert "직접 만들면서 이해하기" in snapshots[1]["text"]
+    assert "ACADEMY 가이드" in snapshots[2]["text"]
+    assert "로컬 데이터셋 등록" in snapshots[2]["text"]

@@ -19,7 +19,11 @@ from frontierwright.editions import EditionProfile
 from frontierwright.errors import FrontierwrightError
 from frontierwright.evaluations import REFERENCE_LM_PACK
 from frontierwright.execution import BackendDataBoundary, HardBudgets, PermissionLevel
-from frontierwright.observations import ObservationOutcome
+from frontierwright.lab_adapters import (
+    lab_adapter_manifest_example,
+    lab_adapter_manifest_schema,
+)
+from frontierwright.observations import ObservationOutcome, ObservationSource
 from frontierwright.paths import TrainingPathId
 from frontierwright.recipes import (
     BYTE_SHARDS_PLUGIN_ID,
@@ -29,6 +33,7 @@ from frontierwright.recipes import (
 )
 from frontierwright.reference_backend import backend_spec_payload
 from frontierwright.reference_tokenizer import DEFAULT_MAX_TRAINING_BYTES
+from frontierwright.rl import rl_config_example, rl_config_schema
 from frontierwright.service import (
     ActionPreflightView,
     BirthView,
@@ -88,6 +93,7 @@ from frontierwright.service import (
     get_plan_view,
     get_resource_view,
     get_run_view,
+    get_stat_v2_growth,
     get_stats_view,
     get_status,
     get_tokenizers_view,
@@ -123,11 +129,13 @@ from frontierwright.service import (
     reconcile_training_run,
     record_usage_observation,
     reject_candidate,
+    remeasure_runtime_pair,
     repair_run_receipt,
     run_capability_v1,
     run_evaluation_pack,
     set_build_intent,
     set_build_targets,
+    set_growth_goals,
     set_project_edition,
     set_workload_profile,
     train_project_tokenizer,
@@ -137,6 +145,8 @@ from frontierwright.slurm_executor import (
     inspect_slurm_availability,
     load_slurm_executor_profile,
     slurm_backend_spec_payload,
+    slurm_profile_example,
+    slurm_profile_schema,
 )
 from frontierwright.workload_acceptance import (
     workload_acceptance_contract_example,
@@ -226,7 +236,10 @@ def _emit_json(payload: dict[str, object]) -> None:
     )
 
 
-@benchmarks_app.command("list")
+@benchmarks_app.command(
+    "list",
+    help="List curated external benchmark sources and model/system boundaries.",
+)
 def benchmarks_list(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
@@ -255,8 +268,16 @@ def benchmarks_list(
             else "-"
         )
         typer.echo(
-            f"{source['source_id']} {source['kind']} {source['lifecycle']} axes={axes}"
+            f"{source['source_id']} · {source['title']} · {source['kind']} · "
+            f"{source['lifecycle']} · axes={axes}"
         )
+        typer.echo(
+            f"  Source: {source['upstream_url']} · integration={source['integration_status']} "
+            f"· license={source['license_status']}"
+        )
+        typer.echo(f"  Runner: {source['runner_hint']}")
+        typer.echo(f"  Cost: {source['cost_hint']}")
+        typer.echo(f"  Next: {source['next_action']}")
 
 
 def _fail(exc: FrontierwrightError, *, json_output: bool) -> NoReturn:
@@ -482,6 +503,72 @@ def _parse_float_assignments(items: list[str], label: str) -> dict[str, float]:
             ) from exc
     return parsed
 
+def _parse_string_assignments(items: list[str], label: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            raise FrontierwrightError(
+                "INVALID_BUILD_ARGUMENT",
+                f"{label} must use key=value syntax: {item}",
+                2,
+            )
+        key, value = (part.strip() for part in item.split("=", 1))
+        if not key or not value:
+            raise FrontierwrightError(
+                "INVALID_BUILD_ARGUMENT",
+                f"{label} requires nonempty key and value: {item}",
+                2,
+            )
+        if key in parsed:
+            raise FrontierwrightError(
+                "INVALID_BUILD_ARGUMENT",
+                f"{label} repeats key: {key}",
+                2,
+            )
+        parsed[key] = value
+    return parsed
+
+
+def _parse_tolerance_assignments(
+    items: list[str],
+) -> dict[str, tuple[float, str]]:
+    parsed: dict[str, tuple[float, str]] = {}
+    for item in items:
+        if "=" not in item:
+            raise FrontierwrightError(
+                "INVALID_BUILD_ARGUMENT",
+                f"tolerance must use metric=value or metric=value% syntax: {item}",
+                2,
+            )
+        metric, raw_value = (part.strip() for part in item.split("=", 1))
+        if not metric or metric in parsed:
+            raise FrontierwrightError(
+                "INVALID_BUILD_ARGUMENT",
+                f"Invalid or repeated tolerance metric: {metric or item}",
+                2,
+            )
+        unit = "ABSOLUTE"
+        if raw_value.endswith("%"):
+            unit = "PERCENT"
+            raw_value = raw_value[:-1].strip()
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise FrontierwrightError(
+                "INVALID_BUILD_ARGUMENT",
+                f"tolerance value must be numeric: {item}",
+                2,
+            ) from exc
+        if value < 0:
+            raise FrontierwrightError(
+                "INVALID_BUILD_ARGUMENT",
+                f"tolerance must be nonnegative: {item}",
+                2,
+            )
+        parsed[metric] = (value, unit)
+    return parsed
+
+
 
 def _print_model_comparison(view: ModelComparisonView) -> None:
     console.print("[bold]MODEL FIT COMPARISON[/bold]")
@@ -596,12 +683,22 @@ def _print_workload(view: WorkloadView) -> None:
     )
     console.print(f"Max latency: {profile.get('max_latency_seconds') or 'UNSPECIFIED'} s")
     console.print(f"Min throughput: {profile.get('min_tokens_per_second') or 'UNSPECIFIED'} tok/s")
-    console.print(f"Privacy: {profile.get('privacy') or 'UNKNOWN'}")
+    privacy = profile.get("privacy")
+    console.print(f"Privacy: {privacy or 'UNKNOWN'}")
+    if privacy == "PRIVATE":
+        console.print(
+            "Privacy scope: Frontierwright admission/data-boundary policy only; "
+            "not OS/process/kernel/network isolation or attestation."
+        )
     floors = profile.get("critical_floors")
     if isinstance(floors, dict) and floors:
         console.print("Critical capability floors:")
         for axis, value in sorted(floors.items()):
             console.print(f"  {axis.title()}: {value}")
+        console.print(
+            "  Semantics: point-estimate thresholds. For interval-aware "
+            "PASS/FAIL/INCONCLUSIVE, use workload acceptance EXPLICIT_INTERVAL."
+        )
     utility_weights = profile.get("utility_weights")
     utility_scales = profile.get("utility_scales")
     if isinstance(utility_weights, dict) and utility_weights and isinstance(utility_scales, dict):
@@ -657,6 +754,10 @@ def _print_workload_fit(view: WorkloadFitView) -> None:
         return
     if view.model_id:
         console.print(f"Model: {view.model_id}")
+    if view.privacy_semantics:
+        console.print(f"Privacy semantics: {view.privacy_semantics}")
+    if view.privacy_scope_note:
+        console.print(view.privacy_scope_note)
     for item in view.constraints:
         raw_status = str(item.get("status", "UNKNOWN"))
         display_status = str(item.get("resolution_state") or human_fit_status(raw_status))
@@ -694,17 +795,28 @@ def _print_build(view: BuildView) -> None:
         console.print(f"Archetype: {view.archetype}")
     if view.priorities:
         console.print("Priorities:")
-        for axis, value in sorted(view.priorities.items()):
-            console.print(f"  {axis.title():10} {value}")
+        for axis, priority_value in sorted(view.priorities.items()):
+            console.print(f"  {axis.title():10} {priority_value}")
     if view.targets:
         console.print("Targets:")
-        for axis, value in sorted(view.targets.items()):
-            console.print(f"  {axis.title():10} {value}")
+        for axis, target_value in sorted(view.targets.items()):
+            console.print(f"  {axis.title():10} {target_value}")
     if view.floors:
         console.print("Floors:")
-        for axis, value in sorted(view.floors.items()):
-            console.print(f"  {axis.title():10} {value}")
-    if view.targets or view.floors:
+        for axis, floor_value in sorted(view.floors.items()):
+            console.print(f"  {axis.title():10} {floor_value}")
+    if view.growth_goals:
+        console.print("Growth rules:")
+        for goal in view.growth_goals:
+            kind = goal.get("kind")
+            metric = goal.get("metric")
+            goal_value = goal.get("value")
+            unit = goal.get("unit")
+            suffix = ""
+            if goal_value is not None:
+                suffix = f" = {goal_value}{'%' if unit == 'PERCENT' else ''}"
+            console.print(f"  {kind:20} {metric}{suffix}")
+    if view.targets or view.floors or view.growth_goals:
         console.print(
             "Scale binding: "
             + (
@@ -1016,6 +1128,13 @@ def _print_inference_profile(view: InferenceProfileView) -> None:
         f"{metrics.get('cuda_memory_total_bytes')}"
     )
     console.print(f"Process RSS: {metrics.get('max_sampled_process_rss_bytes')}")
+    if metrics.get("workload_shape_bound") is False:
+        console.print(
+            "Profile shape: FIXED_REFERENCE_PROMPT · not workload-shaped serving proof."
+        )
+        note = metrics.get("profile_shape_note")
+        if note:
+            console.print(str(note))
 
 
 def _print_compare(view: CompareView) -> None:
@@ -1106,6 +1225,15 @@ def _print_compare(view: CompareView) -> None:
                 f"{item.get('threshold')} -> {item.get('status')}"
             )
 
+    if view.growth_goal_results:
+        console.print("")
+        console.print("GROWTH GOALS")
+        for item in view.growth_goal_results:
+            console.print(
+                f"  {item.get('kind')} {item.get('metric')} -> {item.get('status')} "
+                f"· {item.get('reason')}"
+            )
+
     if view.workload_comparison.get("configured"):
         champion_fit = view.workload_comparison.get("champion")
         candidate_fit = view.workload_comparison.get("candidate")
@@ -1140,6 +1268,18 @@ def _print_compare(view: CompareView) -> None:
         reason = view.pareto.get("inference_profile_reason")
         if reason:
             console.print(f"  Runtime evidence: {reason}")
+        uncertain_runtime = [
+            item
+            for item in metrics
+            if isinstance(item, dict)
+            and str(item.get("key", "")).startswith("serving.")
+            and item.get("relation") == "UNCERTAIN"
+        ] if isinstance(metrics, list) else []
+        if uncertain_runtime:
+            console.print(
+                "  Additional runtime measurement is recommended. "
+                "Use compare --remeasure-uncertain to run a consented ABBA remeasurement."
+            )
         utility = view.pareto.get("explicit_user_utility")
         if isinstance(utility, dict):
             status = utility.get("status")
@@ -1205,6 +1345,29 @@ def _print_status(view: StatusView) -> None:
         console.print(f"Format: {view.model_format}")
         console.print(f"Trainable: {'YES' if view.trainable else 'NO'}")
         console.print(f"Fingerprint: {view.model_fingerprint}")
+    console.print("")
+    console.print("[bold]STAT v2 GROWTH · permanent origin = 0[/bold]")
+    for axis, stat in view.stat_v2.items():
+        delta = stat.get("display_delta")
+        relation = stat.get("relation")
+        if isinstance(delta, (int, float)) and not isinstance(delta, bool):
+            display = f"{float(delta):+g}"
+        else:
+            display = "?"
+        interval = stat.get("delta_interval")
+        interval_text = ""
+        if (
+            isinstance(interval, list)
+            and len(interval) == 2
+            and all(isinstance(value, (int, float)) for value in interval)
+        ):
+            interval_text = f"  [{float(interval[0]):+g}, {float(interval[1]):+g}]"
+        console.print(f"{axis.title():12} {display:>8}  {relation}{interval_text}")
+    if view.stat_v2_note:
+        console.print(f"[dim]{view.stat_v2_note}[/dim]")
+
+    console.print("")
+    console.print("[bold]Capability v1 · legacy smoke benchmark[/bold]")
     for axis, value in view.stats.items():
         console.print(f"{axis.title():10} {value if value is not None else '?'}")
 
@@ -1305,7 +1468,10 @@ def _print_resources(view: ResourceView) -> None:
     console.print("bf16/fp16: MEASUREMENT NEEDED until backend-specific calibration")
 
 
-@project_app.command("init")
+@project_app.command(
+    "init",
+    help="Create a new Frontierwright project with an edition and model origin.",
+)
 def project_init(
     path: Annotated[Path, typer.Argument(help="Project directory.")] = Path("."),
     name: Annotated[str, typer.Option("--name", help="Project/character name.")] = "My Model",
@@ -1373,7 +1539,10 @@ def project_init(
         console.print("Studio: describe your workload and measure this model on your machine.")
 
 
-@project_app.command("edition")
+@project_app.command(
+    "edition",
+    help="Change the human workflow edition without rewriting model history.",
+)
 def project_edition(
     path: Annotated[
         Path,
@@ -1418,7 +1587,10 @@ def project_edition(
         console.print(f"Starting point: {view.edition_starting_point}")
 
 
-@lab_slurm_app.command("inspect")
+@lab_slurm_app.command(
+    "inspect",
+    help="Validate a controlled-private Slurm profile and report submit-host readiness.",
+)
 def lab_slurm_inspect(
     profile: Annotated[Path, typer.Argument(help="Controlled-private Slurm profile JSON.")],
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -1459,7 +1631,32 @@ def lab_slurm_inspect(
     console.print(str(payload["note"]))
 
 
-@lab_slurm_app.command("backend-spec")
+@lab_slurm_app.command("schema", help="Print the public JSON Schema for Slurm profiles.")
+def lab_slurm_schema(
+    json_output: Annotated[bool, typer.Option("--json")] = True,
+) -> None:
+    payload = slurm_profile_schema()
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print_json(data=payload)
+
+
+@lab_slurm_app.command("example", help="Print a complete bounded Slurm profile example.")
+def lab_slurm_example(
+    json_output: Annotated[bool, typer.Option("--json")] = True,
+) -> None:
+    payload = slurm_profile_example()
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print_json(data=payload)
+
+
+@lab_slurm_app.command(
+    "backend-spec",
+    help="Generate a pinned Command Backend spec from a Slurm profile.",
+)
 def lab_slurm_backend_spec(
     profile: Annotated[Path, typer.Argument(help="Controlled-private Slurm profile JSON.")],
     output: Annotated[Path, typer.Option("--output", help="Write Command Backend spec JSON.")],
@@ -1513,7 +1710,32 @@ def lab_slurm_backend_spec(
     console.print("Connect the same Lab adapter manifest before creating controlled-private plans.")
 
 
-@lab_adapters_app.command("list")
+@lab_adapters_app.command("schema", help="Print the public JSON Schema for Lab adapter manifests.")
+def lab_adapters_schema(
+    json_output: Annotated[bool, typer.Option("--json")] = True,
+) -> None:
+    payload = lab_adapter_manifest_schema()
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print_json(data=payload)
+
+
+@lab_adapters_app.command("example", help="Print a complete minimal Lab adapter manifest.")
+def lab_adapters_example(
+    json_output: Annotated[bool, typer.Option("--json")] = True,
+) -> None:
+    payload = lab_adapter_manifest_example()
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print_json(data=payload)
+
+
+@lab_adapters_app.command(
+    "list",
+    help="List connected controlled-private Lab adapter manifests.",
+)
 def lab_adapters_list(
     path: Annotated[
         Path,
@@ -1534,7 +1756,10 @@ def lab_adapters_list(
     _print_lab_adapters(view)
 
 
-@lab_adapters_app.command("connect")
+@lab_adapters_app.command(
+    "connect",
+    help="Connect and pin a controlled-private Lab adapter manifest.",
+)
 def lab_adapters_connect(
     manifest: Annotated[Path, typer.Argument(help="Lab adapter manifest JSON.")],
     path: Annotated[
@@ -1557,7 +1782,10 @@ def lab_adapters_connect(
     _print_lab_adapters(view)
 
 
-@lab_adapters_app.command("disconnect")
+@lab_adapters_app.command(
+    "disconnect",
+    help="Disconnect a Lab adapter without rewriting existing plan evidence.",
+)
 def lab_adapters_disconnect(
     adapter_ref: Annotated[str, typer.Argument(help="Adapter ref, e.g. id@version.")],
     path: Annotated[
@@ -1580,7 +1808,10 @@ def lab_adapters_disconnect(
     _print_lab_adapters(view)
 
 
-@birth_app.command("show")
+@birth_app.command(
+    "show",
+    help="Show the active zero-model birth root and immutable birth evidence.",
+)
 def birth_show(
     path: Annotated[
         Path,
@@ -1601,7 +1832,10 @@ def birth_show(
     _print_birth(view)
 
 
-@birth_app.command("tokenizer")
+@birth_app.command(
+    "tokenizer",
+    help="Train and register a deterministic tokenizer from PRETRAIN data.",
+)
 def birth_tokenizer(
     dataset_id: Annotated[
         str,
@@ -1669,7 +1903,10 @@ def birth_tokenizer(
     _print_tokenizer(view)
 
 
-@birth_app.command("tokenizers")
+@birth_app.command(
+    "tokenizers",
+    help="List registered immutable tokenizer artifacts.",
+)
 def birth_tokenizers(
     path: Annotated[
         Path,
@@ -1690,7 +1927,10 @@ def birth_tokenizers(
     _print_tokenizers(view)
 
 
-@birth_app.command("zero")
+@birth_app.command(
+    "zero",
+    help="Materialize a deterministic Frontierwright zero-model birth root.",
+)
 def birth_zero(
     path: Annotated[
         Path,
@@ -1769,7 +2009,10 @@ def birth_zero(
     _print_birth(view)
 
 
-@evolve_app.command("merge")
+@evolve_app.command(
+    "merge",
+    help="Create a deterministic weighted merge Candidate from compatible models.",
+)
 def evolve_merge(
     other_model_id: Annotated[
         str,
@@ -1839,7 +2082,10 @@ def evolve_merge(
     console.print("\nMerge created a PENDING candidate. Evaluate and compare it before promotion.")
 
 
-@optimize_app.command("quantize")
+@optimize_app.command(
+    "quantize",
+    help="Create a symmetric-int8 deployment Candidate from the Champion.",
+)
 def optimize_quantize(
     path: Annotated[
         Path,
@@ -1898,7 +2144,10 @@ def optimize_quantize(
     )
 
 
-@operate_app.command("export")
+@operate_app.command(
+    "export",
+    help="Export the Champion as a portable, verifiable model bundle.",
+)
 def operate_export(
     destination: Annotated[
         Path,
@@ -1935,7 +2184,10 @@ def operate_export(
     _print_export(view)
 
 
-@operate_app.command("verify")
+@operate_app.command(
+    "verify",
+    help="Verify a portable Frontierwright export without the source project.",
+)
 def operate_verify(
     destination: Annotated[
         Path,
@@ -1956,7 +2208,10 @@ def operate_verify(
     _print_export_verify(view)
 
 
-@operate_app.command("generate")
+@operate_app.command(
+    "generate",
+    help="Generate locally with the current Champion reference model.",
+)
 def operate_generate(
     prompt: Annotated[str, typer.Argument(help="Prompt text for the current Champion.")],
     path: Annotated[
@@ -2015,7 +2270,10 @@ def operate_generate(
     _print_generation(view)
 
 
-@operate_app.command("import-vllm-benchmark")
+@operate_app.command(
+    "import-vllm-benchmark",
+    help="Import exact-version vLLM serving benchmark evidence.",
+)
 def operate_import_vllm_benchmark(
     result: Annotated[
         Path,
@@ -2093,7 +2351,10 @@ def operate_import_vllm_benchmark(
     )
 
 
-@operate_app.command("import-serving-resources")
+@operate_app.command(
+    "import-serving-resources",
+    help="Import server resource evidence bound to exact serving conditions.",
+)
 def operate_import_serving_resources(
     manifest: Annotated[
         Path,
@@ -2141,7 +2402,10 @@ def operate_import_serving_resources(
     )
 
 
-@operate_app.command("profile")
+@operate_app.command(
+    "profile",
+    help="Measure local reference-model latency, throughput, and process resources.",
+)
 def operate_profile(
     path: Annotated[
         Path,
@@ -2271,7 +2535,7 @@ def import_model(
         )
 
 
-@app.command("status")
+@app.command("status", help="Show project identity, Champion, measurement state, and growth stats.")
 def status(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[
@@ -2308,7 +2572,10 @@ def status(
     _print_status(view)
 
 
-@resources_app.command("detect")
+@resources_app.command(
+    "detect",
+    help="Measure the local machine resources available to this project.",
+)
 def resources_detect(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -2327,7 +2594,10 @@ def resources_detect(
     _print_resources(view)
 
 
-@resources_app.command("show")
+@resources_app.command(
+    "show",
+    help="Show the latest measured resource snapshot and model-fit evidence.",
+)
 def resources_show(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -2383,7 +2653,10 @@ def resources_diagnose(
             console.print(f"  Next: {next_action}")
 
 
-@observe_app.command("record")
+@observe_app.command(
+    "record",
+    help="Record privacy-minimal real-use outcome evidence without prompt content.",
+)
 def observe_record(
     task: Annotated[
         str, typer.Argument(help="Short task/category label; raw prompts are not stored.")
@@ -2411,6 +2684,16 @@ def observe_record(
             help="Defaults to active workload privacy, otherwise PRIVATE.",
         ),
     ] = None,
+    source: Annotated[
+        str,
+        typer.Option(
+            "--source",
+            help=(
+                "Evidence provenance: HUMAN_CONFIRMED, SYNTHETIC_TEST, or IMPORTED. "
+                "Default HUMAN_CONFIRMED."
+            ),
+        ),
+    ] = ObservationSource.HUMAN_CONFIRMED.value,
     idempotency_key: Annotated[
         str | None,
         typer.Option(
@@ -2430,6 +2713,7 @@ def observe_record(
             if classification is not None
             else None
         )
+        parsed_source = ObservationSource(source.strip().upper())
         view = record_usage_observation(
             path,
             task=task,
@@ -2440,6 +2724,7 @@ def observe_record(
             failure_category=failure_category,
             latency_seconds=latency_seconds,
             classification=parsed_classification,
+            source=parsed_source,
             idempotency_key=idempotency_key,
         )
     except (FrontierwrightError, ValueError) as exc:
@@ -2448,7 +2733,7 @@ def observe_record(
         _fail(
             FrontierwrightError(
                 "INVALID_USAGE_OBSERVATION",
-                "outcome/classification is invalid.",
+                "outcome/classification/source is invalid.",
                 2,
             ),
             json_output=json_output,
@@ -2460,13 +2745,19 @@ def observe_record(
     observation = view.observation
     console.print("[bold]USAGE EVIDENCE RECORDED[/bold]")
     console.print(f"Model: {observation.get('model_id')}")
-    console.print(f"Task: {observation.get('task')} · outcome={observation.get('outcome')}")
+    console.print(
+        f"Task: {observation.get('task')} · outcome={observation.get('outcome')} "
+        f"· source={observation.get('source')}"
+    )
     console.print(f"Replayed: {'YES' if view.replayed else 'NO'}")
     console.print("Prompt/response content stored: NO")
     console.print("This is operational evidence, not an RL reward.")
 
 
-@observe_app.command("summary")
+@observe_app.command(
+    "summary",
+    help="Summarize real-use outcomes for the exact active workload revision.",
+)
 def observe_summary(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     model: Annotated[
@@ -2510,7 +2801,10 @@ def observe_summary(
     console.print(summary.note)
 
 
-@workload_app.command("show")
+@workload_app.command(
+    "show",
+    help="Show the active versioned workload profile.",
+)
 def workload_show(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -2527,7 +2821,10 @@ def workload_show(
     _print_workload(view)
 
 
-@workload_acceptance_app.command("schema")
+@workload_acceptance_app.command(
+    "schema",
+    help="Print the public workload-acceptance contract JSON Schema.",
+)
 def workload_acceptance_schema(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
@@ -2538,7 +2835,10 @@ def workload_acceptance_schema(
     typer.echo(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
 
 
-@workload_acceptance_app.command("example")
+@workload_acceptance_app.command(
+    "example",
+    help="Print a complete acceptance example bound to the active workload.",
+)
 def workload_acceptance_example(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -2556,7 +2856,10 @@ def workload_acceptance_example(
     typer.echo(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
 
 
-@workload_acceptance_app.command("create")
+@workload_acceptance_app.command(
+    "create",
+    help="Create and activate a versioned workload acceptance contract.",
+)
 def workload_acceptance_create(
     file: Annotated[
         Path,
@@ -2578,7 +2881,10 @@ def workload_acceptance_create(
     _print_workload_acceptance(view)
 
 
-@workload_acceptance_app.command("show")
+@workload_acceptance_app.command(
+    "show",
+    help="Show the active acceptance contract and latest assessment.",
+)
 def workload_acceptance_show(
     contract: Annotated[
         str | None,
@@ -2603,7 +2909,10 @@ def workload_acceptance_show(
     _print_workload_acceptance(view)
 
 
-@workload_acceptance_app.command("assess")
+@workload_acceptance_app.command(
+    "assess",
+    help="Assess a contract against exact stored evaluation receipts.",
+)
 def workload_acceptance_assess(
     contract: Annotated[str, typer.Argument(help="Contract ID or hash.")],
     evidence: Annotated[
@@ -2638,7 +2947,10 @@ def workload_acceptance_assess(
     _print_workload_acceptance(view)
 
 
-@workload_app.command("compare-models")
+@workload_app.command(
+    "compare-models",
+    help="Compare any two registered models using measured user-fit evidence.",
+)
 def workload_compare_models(
     baseline: Annotated[str, typer.Argument(help="Registered baseline/stock model ID.")],
     contender: Annotated[str, typer.Argument(help="Registered contender/descendant model ID.")],
@@ -2657,7 +2969,10 @@ def workload_compare_models(
     _print_model_comparison(view)
 
 
-@workload_app.command("fit")
+@workload_app.command(
+    "fit",
+    help="Assess the Champion against workload, acceptance, and resource evidence.",
+)
 def workload_fit(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     model: Annotated[
@@ -2678,7 +2993,10 @@ def workload_fit(
     _print_workload_fit(view)
 
 
-@workload_app.command("bind-eval")
+@workload_app.command(
+    "bind-eval",
+    help="Bind exact evaluation receipts to declared workload coverage.",
+)
 def workload_bind_eval(
     manifest: Annotated[
         Path,
@@ -2733,7 +3051,10 @@ def workload_bind_eval(
                 console.print(f"Missing {kind}: " + ", ".join(str(x) for x in values))
 
 
-@workload_app.command("next")
+@workload_app.command(
+    "next",
+    help="Show machine-readable next measurements or bounded experiments.",
+)
 def workload_next(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     model: Annotated[
@@ -2759,11 +3080,17 @@ def workload_next(
         console.print(f"{index}. [{item.opportunity_class.value}] {item.title}")
         console.print(f"   Why: {item.reason}")
         console.print(f"   Action: {item.action}")
+        if item.argv_steps:
+            for step_index, argv in enumerate(item.argv_steps, start=1):
+                console.print(f"   Step {step_index}: " + " ".join(argv))
         console.print(f"   Success: {item.success_criterion}")
     console.print(plan.note)
 
 
-@workload_app.command("set")
+@workload_app.command(
+    "set",
+    help="Create and activate a versioned workload profile.",
+)
 def workload_set(
     name: Annotated[str, typer.Option("--name", help="Workload profile name.")],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
@@ -2840,7 +3167,10 @@ def workload_set(
     _print_workload(view)
 
 
-@build_app.command("show")
+@build_app.command(
+    "show",
+    help="Show the desired model build, floors, targets, and growth rules.",
+)
 def build_show(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -2858,7 +3188,10 @@ def build_show(
     _print_build(view)
 
 
-@build_app.command("intent")
+@build_app.command(
+    "intent",
+    help="Set the high-level build archetype and capability priorities.",
+)
 def build_intent_command(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     archetype: Annotated[str, typer.Option("--archetype")] = "Balanced",
@@ -2887,16 +3220,25 @@ def build_intent_command(
     _print_build(view)
 
 
-@build_app.command("set")
+@build_app.command(
+    "set",
+    help="Set capability targets and protected floors for Candidate decisions.",
+)
 def build_set_command(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     target: Annotated[
         list[str] | None,
-        typer.Option("--target", help="Repeat axis=value, e.g. --target coding=140."),
+        typer.Option(
+            "--target",
+            help="Repeat axis=value; decimals are allowed, e.g. --target coding=37.5.",
+        ),
     ] = None,
     floor: Annotated[
         list[str] | None,
-        typer.Option("--floor", help="Repeat axis=value, e.g. --floor general=120."),
+        typer.Option(
+            "--floor",
+            help="Repeat axis=value; decimals are allowed, e.g. --floor general=25.0.",
+        ),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
@@ -2904,8 +3246,8 @@ def build_set_command(
 ) -> None:
     del non_interactive, yes
     try:
-        targets = _parse_assignments(target or [], "target")
-        floors = _parse_assignments(floor or [], "floor")
+        targets = _parse_float_assignments(target or [], "target")
+        floors = _parse_float_assignments(floor or [], "floor")
         view = set_build_targets(
             path,
             targets=targets,
@@ -2920,7 +3262,104 @@ def build_set_command(
     _print_build(view)
 
 
-@stats_app.command("show")
+@build_app.command(
+    "goals",
+    help=(
+        "Set evidence-backed growth rules: IMPROVE, PROTECT, TOLERANCE, "
+        "absolute requirements, and hard constraints."
+    ),
+)
+def build_goals_command(
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    improve: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--improve",
+            help="Repeat a metric that should improve, e.g. capability.coding.",
+        ),
+    ] = None,
+    protect: Annotated[
+        list[str] | None,
+        typer.Option("--protect", help="Repeat a metric that must not regress."),
+    ] = None,
+    tolerance: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--tolerance",
+            help="Repeat metric=value or metric=value%, e.g. serving.latency_p50=5%.",
+        ),
+    ] = None,
+    require: Annotated[
+        list[str] | None,
+        typer.Option("--require", help="Repeat metric=absolute-threshold."),
+    ] = None,
+    hard: Annotated[
+        list[str] | None,
+        typer.Option("--hard", help="Repeat categorical key=value, e.g. privacy=PRIVATE."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+) -> None:
+    del non_interactive, yes
+    try:
+        view = set_growth_goals(
+            path,
+            improve=tuple(item.strip() for item in (improve or []) if item.strip()),
+            protect=tuple(item.strip() for item in (protect or []) if item.strip()),
+            tolerance=_parse_tolerance_assignments(tolerance or []),
+            absolute_requirements=_parse_float_assignments(require or [], "require"),
+            hard_constraints=_parse_string_assignments(hard or [], "hard"),
+        )
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json(_build_payload(view))
+        return
+    _print_build(view)
+
+
+@stats_app.command(
+    "growth",
+    help="Show player-facing Stat v2 growth relative to the permanent project origin.",
+)
+def stats_growth(
+    path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact model ID; defaults to current Champion."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+) -> None:
+    del non_interactive
+    try:
+        payload = {"ok": True, **get_stat_v2_growth(path, model)}
+    except FrontierwrightError as exc:
+        _fail(exc, json_output=json_output)
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print("[bold]STAT v2 GROWTH · permanent origin = 0[/bold]")
+    stats = payload.get("stats")
+    if isinstance(stats, dict):
+        for axis, raw in stats.items():
+            stat = raw if isinstance(raw, dict) else {}
+            delta = stat.get("display_delta")
+            relation = stat.get("relation")
+            display = (
+                f"{float(delta):+g}"
+                if isinstance(delta, (int, float)) and not isinstance(delta, bool)
+                else "?"
+            )
+            console.print(f"{axis.title():12} {display:>8}  {relation}")
+    console.print(f"[dim]{payload.get('note')}[/dim]")
+
+
+@stats_app.command(
+    "show",
+    help="Show the active frozen-scale capability profile for a model.",
+)
 def stats_show(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     model: Annotated[
@@ -2942,7 +3381,10 @@ def stats_show(
     _print_stats(view)
 
 
-@stats_app.command("ingest")
+@stats_app.command(
+    "ingest",
+    help="Ingest a pinned evaluation receipt through a frozen capability scale.",
+)
 def stats_ingest(
     receipt: Annotated[Path, typer.Option("--receipt", help="Evaluation receipt JSON.")],
     scale: Annotated[Path, typer.Option("--scale", help="Frozen capability scale JSON.")],
@@ -2967,7 +3409,10 @@ def stats_ingest(
     _print_stats(view)
 
 
-@evaluation_app.command("import-lm-eval")
+@evaluation_app.command(
+    "import-lm-eval",
+    help="Import lm-evaluation-harness results as exact raw evidence.",
+)
 def evaluation_import_lm_eval(
     result: Annotated[
         Path,
@@ -3016,7 +3461,10 @@ def evaluation_import_lm_eval(
     console.print(str(payload["note"]))
 
 
-@evaluation_app.command("import-manifest")
+@evaluation_app.command(
+    "import-manifest",
+    help="Import a framework-neutral external evaluation manifest.",
+)
 def evaluation_import_manifest(
     manifest: Annotated[
         Path,
@@ -3062,7 +3510,10 @@ def evaluation_import_manifest(
     console.print(str(payload["note"]))
 
 
-@evaluation_app.command("import-lighteval")
+@evaluation_app.command(
+    "import-lighteval",
+    help="Import LightEval results as exact raw evaluation evidence.",
+)
 def evaluation_import_lighteval(
     result: Annotated[
         Path,
@@ -3111,7 +3562,10 @@ def evaluation_import_lighteval(
     console.print(str(payload["note"]))
 
 
-@evaluation_app.command("capability-v1")
+@evaluation_app.command(
+    "capability-v1",
+    help="Run or replay the frozen local Capability v1 smoke benchmark.",
+)
 def evaluation_capability_v1(
     path: Annotated[
         Path,
@@ -3189,7 +3643,10 @@ def evaluation_capability_v1(
         console.print(f"{axis.title():<10} {value if value is not None else '?'}")
 
 
-@evaluation_app.command("packs")
+@evaluation_app.command(
+    "packs",
+    help="List built-in raw evaluation packs.",
+)
 def evaluation_packs(
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
@@ -3214,7 +3671,10 @@ def evaluation_packs(
             console.print("  Metrics: " + ", ".join(str(value) for value in metrics))
 
 
-@evaluation_app.command("run")
+@evaluation_app.command(
+    "run",
+    help="Run or replay a built-in raw evaluation pack.",
+)
 def evaluation_run(
     dataset: Annotated[
         str,
@@ -3316,7 +3776,10 @@ def evaluation_run(
     _print_evaluation(view)
 
 
-@evaluation_app.command("compare")
+@evaluation_app.command(
+    "compare",
+    help="Evaluate Champion and Candidate under identical raw-eval conditions.",
+)
 def evaluation_compare(
     candidate: Annotated[
         str,
@@ -3392,7 +3855,10 @@ def evaluation_compare(
     _print_evaluation_compare(view)
 
 
-@data_app.command("show")
+@data_app.command(
+    "show",
+    help="Show registered datasets and immutable preparation provenance.",
+)
 def data_show(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -3410,7 +3876,10 @@ def data_show(
     _print_data(view)
 
 
-@data_app.command("add")
+@data_app.command(
+    "add",
+    help="Register local user or Lab data with role and classification.",
+)
 def data_add(
     source: Annotated[Path, typer.Argument(help="Local dataset file or directory.")],
     role: Annotated[
@@ -3461,7 +3930,10 @@ def data_add(
     _print_data(view)
 
 
-@data_app.command("recipes")
+@data_app.command(
+    "recipes",
+    help="List deterministic data-preparation recipes.",
+)
 def data_recipes(
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
@@ -3482,7 +3954,10 @@ def data_recipes(
         console.print(f"{plugin['plugin_id']}@{plugin['plugin_version']} · {plugin['title']}")
 
 
-@data_app.command("prepare")
+@data_app.command(
+    "prepare",
+    help="Materialize or dry-run an immutable prepared dataset.",
+)
 def data_prepare(
     dataset: Annotated[
         str,
@@ -3570,7 +4045,10 @@ def data_prepare(
     _print_data(view)
 
 
-@data_app.command("mix")
+@data_app.command(
+    "mix",
+    help="Create or dry-run a deterministic weighted text mixture.",
+)
 def data_mix(
     inputs: Annotated[
         list[str],
@@ -3657,7 +4135,10 @@ def data_mix(
     _print_data(view)
 
 
-@app.command("interventions")
+@app.command(
+    "interventions",
+    help="List versioned intervention surfaces and their training-path mappings.",
+)
 def interventions_command(
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
@@ -3679,7 +4160,10 @@ def interventions_command(
         console.print(f"  {item.get('title')}")
 
 
-@app.command("paths")
+@app.command(
+    "paths",
+    help="Show factual training-path availability, blockers, and calibrated READY plans.",
+)
 def paths_command(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -3697,7 +4181,10 @@ def paths_command(
     _print_paths(view)
 
 
-@backend_app.command("reference-spec")
+@backend_app.command(
+    "reference-spec",
+    help="Write a Command Backend spec for the built-in PyTorch reference backend.",
+)
 def backend_reference_spec(
     python_executable: Annotated[
         str,
@@ -3740,7 +4227,10 @@ def backend_reference_spec(
     console.print(f"Python: {python_executable}")
 
 
-@backend_app.command("doctor")
+@backend_app.command(
+    "doctor",
+    help="Check a backend spec and its execution environment before planning.",
+)
 def backend_doctor(
     python_executable: Annotated[
         str,
@@ -3835,7 +4325,44 @@ def backend_doctor(
         console.print(f"GPU: {payload.get('cuda_device_name')}")
 
 
-@plan_app.command("create")
+@plan_app.command(
+    "rl-schema",
+    help=(
+        "Print the RL_POLICY_OPTIMIZATION JSON Schema. Built-in reference RL is bounded "
+        "verifiable-choice REINFORCE, not open-ended production RL."
+    ),
+)
+def plan_rl_schema(
+    json_output: Annotated[bool, typer.Option("--json")] = True,
+) -> None:
+    payload = rl_config_schema()
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print_json(data=payload)
+
+
+@plan_app.command(
+    "rl-example",
+    help=(
+        "Print a complete bounded verifiable-choice REINFORCE example for "
+        "RL_POLICY_OPTIMIZATION."
+    ),
+)
+def plan_rl_example(
+    json_output: Annotated[bool, typer.Option("--json")] = True,
+) -> None:
+    payload = rl_config_example()
+    if json_output:
+        _emit_json(payload)
+        return
+    console.print_json(data=payload)
+
+
+@plan_app.command(
+    "create",
+    help="Create an immutable training plan with permissions, config, and hard budgets.",
+)
 def plan_create(
     path_id: Annotated[
         TrainingPathId,
@@ -3847,7 +4374,16 @@ def plan_create(
     ],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     dataset: Annotated[str | None, typer.Option("--dataset")] = None,
-    permission: Annotated[str, typer.Option("--permission")] = "PLAN",
+    permission: Annotated[
+        str,
+        typer.Option(
+            "--permission",
+            help=(
+                "PLAN, DRY_RUN, EXECUTE_SINGLE, EXECUTE_BOUNDED, or RECURSIVE_EXECUTE. "
+                "Default EXECUTE_SINGLE supports the normal create -> calibrate -> one-run flow."
+            ),
+        ),
+    ] = "EXECUTE_SINGLE",
     config_json: Annotated[Path | None, typer.Option("--config-json")] = None,
     max_wall_seconds: Annotated[float | None, typer.Option("--max-wall-seconds")] = None,
     max_gpu_hours: Annotated[float | None, typer.Option("--max-gpu-hours")] = None,
@@ -3892,7 +4428,10 @@ def plan_create(
     _print_plan(view)
 
 
-@plan_app.command("show")
+@plan_app.command(
+    "show",
+    help="Show plan identity, blockers, calibration, allowance, and replay state.",
+)
 def plan_show(
     plan_id: Annotated[str, typer.Argument()],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
@@ -3911,7 +4450,10 @@ def plan_show(
     _print_plan(view)
 
 
-@app.command("calibrate")
+@app.command(
+    "calibrate",
+    help="Calibrate a pinned training plan against its backend and hard budgets.",
+)
 def calibrate_command(
     plan_id: Annotated[str, typer.Argument()],
     backend_spec: Annotated[Path, typer.Option("--backend-spec")],
@@ -3962,7 +4504,10 @@ def calibrate_command(
     _print_plan(view)
 
 
-@app.command("run")
+@app.command(
+    "run",
+    help="Execute or replay a calibrated training plan under pinned permissions and budgets.",
+)
 def run_command(
     plan_id: Annotated[str, typer.Argument()],
     backend_spec: Annotated[Path, typer.Option("--backend-spec")],
@@ -3993,7 +4538,10 @@ def run_command(
     _print_run(view)
 
 
-@app.command("run-status")
+@app.command(
+    "run-status",
+    help="Show durable execution state for one run.",
+)
 def run_status(
     run_id: Annotated[str, typer.Argument()],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
@@ -4012,7 +4560,10 @@ def run_status(
     _print_run(view)
 
 
-@app.command("run-reconcile")
+@app.command(
+    "run-reconcile",
+    help="Reconcile worker liveness and finalize a durable training run.",
+)
 def run_reconcile(
     run_id: Annotated[str, typer.Argument()],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
@@ -4031,7 +4582,10 @@ def run_reconcile(
     _print_run(view)
 
 
-@app.command("run-repair-receipt")
+@app.command(
+    "run-repair-receipt",
+    help="Repair a missing exported run receipt from durable registry evidence.",
+)
 def run_repair_receipt(
     run_id: Annotated[str, typer.Argument()],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
@@ -4161,7 +4715,7 @@ def train_command(
         console.print("\nDry-run passed. Re-run with --execute to create a candidate.")
 
 
-@app.command("candidates")
+@app.command("candidates", help="List Candidate models and lifecycle status.")
 def candidates_command(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[bool, typer.Option("--json")] = False,
@@ -4179,26 +4733,113 @@ def candidates_command(
     _print_candidates(view)
 
 
-@app.command("compare")
+@app.command(
+    "compare",
+    help="Compare a Candidate with the Champion; optionally remeasure uncertain runtime evidence.",
+)
 def compare_command(
     candidate_model_id: Annotated[str, typer.Argument()],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    remeasure_uncertain: Annotated[
+        bool,
+        typer.Option(
+            "--remeasure-uncertain",
+            help="With consent, run additional ABBA Champion/Candidate runtime measurements.",
+        ),
+    ] = False,
+    python_executable: Annotated[
+        str,
+        typer.Option("--python", help="Python runtime used for additional local profiling."),
+    ] = sys.executable,
+    remeasure_rounds: Annotated[
+        int,
+        typer.Option(
+            "--remeasure-rounds",
+            help="ABBA rounds; each round adds two measured samples per model.",
+        ),
+    ] = 2,
+    max_new_tokens: Annotated[int, typer.Option("--max-new-tokens")] = 16,
+    device: Annotated[str, typer.Option("--device")] = "auto",
+    timeout_seconds: Annotated[float, typer.Option("--timeout-seconds")] = 120.0,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
-    del non_interactive
     try:
         view = compare_candidate(path, candidate_model_id)
+        metrics = view.pareto.get("metrics")
+        uncertain_runtime = [
+            item
+            for item in metrics
+            if isinstance(item, dict)
+            and str(item.get("key", "")).startswith("serving.")
+            and item.get("relation") == "UNCERTAIN"
+        ] if isinstance(metrics, list) else []
+        if remeasure_uncertain and uncertain_runtime:
+            sample_count = 2 * remeasure_rounds
+            if non_interactive and not yes:
+                raise FrontierwrightError(
+                    "REMEASUREMENT_CONSENT_REQUIRED",
+                    (
+                        "Additional measurement consumes compute. Re-run with --yes to consent "
+                        f"to {sample_count} additional samples per model."
+                    ),
+                    2,
+                )
+            if not non_interactive and not yes:
+                accepted = typer.confirm(
+                    (
+                        f"{len(uncertain_runtime)} runtime metric(s) are UNCERTAIN. "
+                        f"Measure {sample_count} more samples per model using ABBA order?"
+                    ),
+                    default=False,
+                )
+                if not accepted:
+                    if json_output:
+                        _emit_json(
+                            {
+                                **_compare_payload(view),
+                                "remeasurement": {
+                                    "performed": False,
+                                    "consent": False,
+                                    "recommended_samples_per_model": sample_count,
+                                },
+                            }
+                        )
+                        return
+                    _print_compare(view)
+                    console.print("Additional measurement skipped by user.")
+                    return
+            view = remeasure_runtime_pair(
+                path,
+                candidate_model_id,
+                python_executable=python_executable,
+                rounds=remeasure_rounds,
+                max_new_tokens=max_new_tokens,
+                device=device,
+                timeout_seconds=timeout_seconds,
+            )
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)
 
     if json_output:
-        _emit_json(_compare_payload(view))
+        payload = _compare_payload(view)
+        if remeasure_uncertain:
+            payload["remeasurement"] = {
+                "performed": True,
+                "protocol": "ABBA",
+                "rounds": remeasure_rounds,
+                "samples_per_model": 2 * remeasure_rounds,
+            }
+        _emit_json(payload)
         return
     _print_compare(view)
 
 
-@app.command("promote")
+@app.command(
+    "promote",
+    help="Promote a Candidate after evidence gates; overrides must be explicit.",
+)
 def promote_command(
     candidate_model_id: Annotated[str, typer.Argument()],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
@@ -4231,17 +4872,24 @@ def promote_command(
     _print_status(view)
 
 
-@app.command("reject")
+@app.command("reject", help="Reject a pending Candidate and optionally record an audit reason.")
 def reject_command(
     candidate_model_id: Annotated[str, typer.Argument()],
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
+    reason: Annotated[
+        str | None,
+        typer.Option(
+            "--reason",
+            help="Optional human-readable rejection reason for audit history.",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
     del non_interactive, yes
     try:
-        view = reject_candidate(path, candidate_model_id)
+        view = reject_candidate(path, candidate_model_id, reason=reason)
     except FrontierwrightError as exc:
         _fail(exc, json_output=json_output)
 
@@ -4251,7 +4899,7 @@ def reject_command(
     _print_candidates(view)
 
 
-@app.command("history")
+@app.command("history", help="Show append-only project event history and decision audit details.")
 def history_command(
     path: Annotated[Path, typer.Option("--path", help="Project directory.")] = Path("."),
     json_output: Annotated[bool, typer.Option("--json")] = False,

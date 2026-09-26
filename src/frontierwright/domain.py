@@ -37,6 +37,51 @@ class BuildMode(StrEnum):
     NOT_READY = "NOT_READY"
 
 
+class GrowthGoalKind(StrEnum):
+    IMPROVE = "IMPROVE"
+    PROTECT = "PROTECT"
+    TOLERANCE = "TOLERANCE"
+    ABSOLUTE_REQUIREMENT = "ABSOLUTE_REQUIREMENT"
+    HARD_CONSTRAINT = "HARD_CONSTRAINT"
+
+
+@dataclass(frozen=True)
+class GrowthGoal:
+    kind: GrowthGoalKind
+    metric: str
+    value: float | str | None = None
+    unit: str | None = None
+
+    def __post_init__(self) -> None:
+        require_text(self.metric, "metric")
+        if self.kind in {GrowthGoalKind.IMPROVE, GrowthGoalKind.PROTECT}:
+            if self.value is not None:
+                raise ValueError(f"{self.kind.value} must not declare value")
+        elif self.kind in {GrowthGoalKind.TOLERANCE, GrowthGoalKind.ABSOLUTE_REQUIREMENT}:
+            if (
+                isinstance(self.value, bool)
+                or not isinstance(self.value, (int, float))
+                or not math.isfinite(float(self.value))
+            ):
+                raise ValueError(f"{self.kind.value} requires a finite numeric value")
+            if self.kind is GrowthGoalKind.TOLERANCE and float(self.value) < 0:
+                raise ValueError("TOLERANCE must be nonnegative")
+        elif self.kind is GrowthGoalKind.HARD_CONSTRAINT:
+            if not isinstance(self.value, str):
+                raise ValueError("HARD_CONSTRAINT requires a string value")
+            require_text(self.value, "hard constraint value")
+        if self.unit is not None:
+            require_text(self.unit, "unit")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind.value,
+            "metric": self.metric,
+            "value": self.value,
+            "unit": self.unit,
+        }
+
+
 class CandidateStatus(StrEnum):
     PENDING = "PENDING"
     ACCEPTED = "ACCEPTED"
@@ -142,8 +187,8 @@ class BuildIntent:
 
 @dataclass(frozen=True)
 class BuildTargets:
-    targets: tuple[tuple[Axis, int], ...]
-    floors: tuple[tuple[Axis, int], ...] = ()
+    targets: tuple[tuple[Axis, float], ...]
+    floors: tuple[tuple[Axis, float], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.targets:
@@ -151,8 +196,14 @@ class BuildTargets:
         for label, values in (("targets", self.targets), ("floors", self.floors)):
             if len({axis for axis, _ in values}) != len(values):
                 raise ValueError(f"Build {label} cannot repeat an axis")
-            if any(value < 0 for _, value in values):
-                raise ValueError(f"Build {label} must be nonnegative")
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+                for _, value in values
+            ):
+                raise ValueError(f"Build {label} must be finite, numeric, and nonnegative")
 
         floors = dict(self.floors)
         for axis, target in self.targets:
@@ -164,8 +215,8 @@ class BuildTargets:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "targets": {axis.value.lower(): value for axis, value in self.targets},
-            "floors": {axis.value.lower(): value for axis, value in self.floors},
+            "targets": {axis.value.lower(): float(value) for axis, value in self.targets},
+            "floors": {axis.value.lower(): float(value) for axis, value in self.floors},
         }
 
 

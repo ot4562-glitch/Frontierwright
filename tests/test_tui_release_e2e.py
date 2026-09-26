@@ -410,7 +410,15 @@ async def test_keyboard_tui_studio_import_immediately_exposes_real_character_she
         assert app.view.champion_model_id[:20] in sheet
         assert "Measured machine fit: MEASUREMENT NEEDED" in sheet
         assert "Workload fit: NOT DEFINED" in sheet
-        assert "General    ?" in sheet
-        assert "Reasoning  ?" in sheet
-        assert "Math       ?" in sheet
-        assert "Coding     ?" in sheet
+        assert "GROWTH STAT · ORIGIN MODEL = 0" in sheet
+        for axis in (
+            "Knowledge",
+            "Reasoning",
+            "Math",
+            "Coding",
+            "Instruction",
+            "Language",
+            "Context",
+        ):
+            assert axis in sheet
+        assert sheet.count("BASELINE (reference, not absolute capability)") == 7

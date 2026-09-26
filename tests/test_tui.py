@@ -655,7 +655,10 @@ def test_tui_action_center_exposes_capability_v1_for_current_champion(
 
     actions = {item.action_id: item for item in app._action_items()}
     assert "capability_v1" in actions
-    assert actions["capability_v1"].title == "Measure Capability v1"
+    assert actions["capability_v1"].title == "Run legacy Capability v1 smoke benchmark"
+    assert "does not redefine the origin-relative growth Stat scale" in (
+        actions["capability_v1"].description
+    )
 
 
 async def test_tui_keyboard_sets_scale_bound_measured_build_targets(

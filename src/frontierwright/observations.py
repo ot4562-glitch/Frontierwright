@@ -17,7 +17,16 @@ from frontierwright.errors import FrontierwrightError
 
 OBSERVATION_EVENT_KIND = "USAGE_OBSERVATION_RECORDED"
 OBSERVATION_SCHEMA_VERSION = 1
-OBSERVATION_SOURCE_EXPLICIT = "EXPLICIT_USER"
+
+
+class ObservationSource(StrEnum):
+    HUMAN_CONFIRMED = "HUMAN_CONFIRMED"
+    SYNTHETIC_TEST = "SYNTHETIC_TEST"
+    IMPORTED = "IMPORTED"
+    EXPLICIT_USER_LEGACY = "EXPLICIT_USER"
+
+
+OBSERVATION_SOURCE_EXPLICIT = ObservationSource.EXPLICIT_USER_LEGACY.value
 
 
 class ObservationOutcome(StrEnum):
@@ -92,7 +101,7 @@ class UsageObservation:
     failure_category: str | None = None
     latency_seconds: float | None = None
     classification: DatasetClassification = DatasetClassification.PRIVATE
-    source: str = OBSERVATION_SOURCE_EXPLICIT
+    source: ObservationSource = ObservationSource.HUMAN_CONFIRMED
     idempotency_key: str | None = None
     schema_version: int = OBSERVATION_SCHEMA_VERSION
 
@@ -116,6 +125,18 @@ class UsageObservation:
             _label(self.failure_category, "failure_category"),
         )
         object.__setattr__(self, "latency_seconds", _latency(self.latency_seconds))
+        if not isinstance(self.source, ObservationSource):
+            try:
+                object.__setattr__(self, "source", ObservationSource(str(self.source)))
+            except ValueError as exc:
+                raise FrontierwrightError(
+                    "INVALID_USAGE_OBSERVATION",
+                    (
+                        "source must be HUMAN_CONFIRMED, SYNTHETIC_TEST, IMPORTED, "
+                        "or legacy EXPLICIT_USER."
+                    ),
+                    2,
+                ) from exc
         object.__setattr__(
             self,
             "idempotency_key",
@@ -138,6 +159,7 @@ class UsageObservation:
         payload = asdict(self)
         payload["outcome"] = self.outcome.value
         payload["classification"] = self.classification.value
+        payload["source"] = self.source.value
         payload["content_stored"] = False
         return payload
 
@@ -233,7 +255,9 @@ def observation_from_event(details: dict[str, object]) -> UsageObservation | Non
                 else None
             ),
             classification=classification,
-            source=str(details.get("source") or OBSERVATION_SOURCE_EXPLICIT),
+            source=ObservationSource(
+                str(details.get("source") or OBSERVATION_SOURCE_EXPLICIT)
+            ),
             idempotency_key=(
                 str(details["idempotency_key"])
                 if isinstance(details.get("idempotency_key"), str)

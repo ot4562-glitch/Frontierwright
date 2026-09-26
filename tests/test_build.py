@@ -22,6 +22,7 @@ from frontierwright.service import (
     get_build_view,
     set_build_intent,
     set_build_targets,
+    set_growth_goals,
 )
 
 
@@ -240,3 +241,58 @@ def test_target_cannot_be_below_same_axis_floor(tmp_path: Path) -> None:
             targets={"coding": 100},
             floors={"coding": 110},
         )
+
+
+
+def test_measured_model_persists_relative_growth_rules(tmp_path: Path) -> None:
+    registry = Registry(tmp_path)
+    registry.initialize("Studio", ModelOrigin.IMPORTED_LOCAL)
+    model = measured_candidate(registry, model_id="studio-origin")
+    registry.register_candidate(model)
+    registry.promote_candidate(model.model_id)
+    activate_frozen_profile(registry, model)
+
+    view = set_growth_goals(
+        tmp_path,
+        improve=("capability.coding",),
+        protect=("capability.reasoning",),
+        tolerance={"serving.latency_p50": (5.0, "PERCENT")},
+        absolute_requirements={"serving.throughput_p50": 20.0},
+        hard_constraints={"privacy": "PRIVATE"},
+    )
+
+    assert view.mode == "TARGETS_FLOORS"
+    assert view.configured is True
+    assert view.scale_bound is True
+    assert view.growth_goals == [
+        {
+            "kind": "IMPROVE",
+            "metric": "capability.coding",
+            "unit": None,
+            "value": None,
+        },
+        {
+            "kind": "PROTECT",
+            "metric": "capability.reasoning",
+            "unit": None,
+            "value": None,
+        },
+        {
+            "kind": "TOLERANCE",
+            "metric": "serving.latency_p50",
+            "unit": "PERCENT",
+            "value": 5.0,
+        },
+        {
+            "kind": "ABSOLUTE_REQUIREMENT",
+            "metric": "serving.throughput_p50",
+            "unit": None,
+            "value": 20.0,
+        },
+        {
+            "kind": "HARD_CONSTRAINT",
+            "metric": "privacy",
+            "unit": None,
+            "value": "PRIVATE",
+        },
+    ]

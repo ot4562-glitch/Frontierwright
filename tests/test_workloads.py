@@ -739,3 +739,38 @@ def test_decision_claim_exposes_regression_even_when_explicit_tradeoff_prefers_c
     payload = claim.to_payload()
     assert payload["better_for_workload_statement_allowed"] is False
     assert payload["claim_scope"] == "LOCAL_DECISION_EVIDENCE"
+
+
+
+def test_private_workload_fit_declares_application_policy_scope_only(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "private-scope"
+    registry = Registry(project)
+    registry.initialize("PRIVATE-SCOPE", ModelOrigin.IMPORTED_LOCAL)
+    state = registry.read()
+    model = ModelState(
+        model_id="private-scope-model",
+        identity_id=str(state.project["identity_id"]),
+        origin=ModelOrigin.IMPORTED_LOCAL,
+        checkpoint="synthetic-private-scope",
+        fingerprint="sha256:private-scope",
+    )
+    registry.register_candidate(model)
+    registry.promote_candidate(model.model_id)
+    set_workload_profile(
+        project,
+        WorkloadProfile(
+            name="Private workload",
+            privacy=DatasetClassification.PRIVATE,
+            task_weights={"research": 1.0},
+        ),
+    )
+
+    fit = get_workload_fit(project)
+
+    assert fit.privacy_semantics == "FRONTIERWRIGHT_APPLICATION_BOUNDARY_POLICY"
+    assert fit.privacy_scope_note is not None
+    assert "does not attest OS, process, kernel, hypervisor, or network isolation" in (
+        fit.privacy_scope_note
+    )

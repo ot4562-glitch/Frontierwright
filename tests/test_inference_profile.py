@@ -190,6 +190,9 @@ def test_profile_records_runtime_evidence_without_sample_text_in_history(
     assert view.intervention_id == "frontierwright.operate.profile-reference"
     assert view.metrics["latency_seconds_p50"] == 0.15
     assert view.metrics["tokens_per_second_p50"] == 120.0
+    assert view.metrics["profile_shape"] == "FIXED_REFERENCE_PROMPT"
+    assert view.metrics["workload_shape_bound"] is False
+    assert "not proof" in str(view.metrics["profile_shape_note"])
     request_path = captured["request_path"]
     assert isinstance(request_path, Path)
     assert not request_path.exists()
@@ -201,6 +204,8 @@ def test_profile_records_runtime_evidence_without_sample_text_in_history(
     assert "sample_generated_token_ids" not in serialized
     assert event["details"]["model_id"] == view.model_id
     assert event["details"]["metrics"]["tokens_per_second_p50"] == 120.0
+    assert event["details"]["metrics"]["workload_shape_bound"] is False
+    assert event["details"]["metrics"]["profile_shape"] == "FIXED_REFERENCE_PROMPT"
 
 
 def test_operate_profile_json_machine_surface(
@@ -250,6 +255,8 @@ def test_operate_profile_json_machine_surface(
     assert payload["intervention_id"] == "frontierwright.operate.profile-reference"
     assert payload["metrics"]["latency_seconds_p50"] == 0.15
     assert payload["metrics"]["tokens_per_second_p50"] == 120.0
+    assert payload["metrics"]["workload_shape_bound"] is False
+    assert payload["metrics"]["profile_shape"] == "FIXED_REFERENCE_PROMPT"
 
 
 def test_profile_rejects_invalid_structured_metrics(

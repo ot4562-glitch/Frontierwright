@@ -1,57 +1,76 @@
 # Frontierwright
 
 [![CI](https://github.com/ot4562-glitch/Frontierwright/actions/workflows/ci.yml/badge.svg)](https://github.com/ot4562-glitch/Frontierwright/actions/workflows/ci.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/ot4562-glitch/Frontierwright)](https://github.com/ot4562-glitch/Frontierwright/releases)
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+```text
++======================================================================+
+|                         F R O N T I E R W R I G H T                  |
+|                                                                      |
+|      MEASURE  ->  CHANGE  ->  PROVE  ->  KEEP THE CHAMPION          |
+|                                                                      |
+|  ORIGIN 0 ========> CANDIDATE ========> CHAMPION ========> REPEAT   |
++======================================================================+
+```
 
 > **Don't fit yourself to a model. Fit the model to you.**
 
-Frontierwright is a local/private model-development environment for turning open or
-user-controlled language models into models that fit a specific **workload, machine,
-budget, and set of goals**.
+Frontierwright is a keyboard-first local model-development environment for people who
+**control the model** and want to improve it without losing the evidence.
 
-A stock checkpoint is a starting point, not the finished product. Frontierwright
-measures the model and the machine, applies real training or optimization
-interventions, creates descendants, evaluates the trade-offs, and keeps exact lineage
-so the model can keep evolving as the user's needs change.
+It measures the model, machine, workload, and constraints; runs real training or model
+transformations; creates descendants; compares gains and regressions; and keeps exact
+lineage so a training run never silently becomes an “improvement”.
 
-**Fixed open models are starting points, not finished products.**
+**v1.0.0 ships three experiences over one evidence core: Studio, Academy, and Lab.**
 
 ---
 
-## Start with the edition that matches the job
+## 30-second start
 
-Frontierwright shares one evidence/lineage core, but the three editions are intentionally
-different products on top of it.
+Requires **Python 3.11+**.
 
-### Studio — I already have a model
+### Install from the v1 release source
 
-Import a local/open checkpoint, describe what *you* actually do, measure it on *your*
-machine, then decide whether specialization or optimization is worth the trade-off.
+```bash
+git clone https://github.com/ot4562-glitch/Frontierwright.git
+cd Frontierwright
+git checkout v1.0.0
+
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+
+python -m pip install -e .
+```
+
+For the built-in PyTorch reference model, real training, local evaluation, generation,
+and profiling:
+
+```bash
+python -m pip install -e ".[train]"
+```
+
+Then choose an edition.
+
+### Studio — grow a model you already own
 
 ```bash
 frontierwright import /path/to/model --path ./my-model --edition STUDIO --name MYMODEL
+frontierwright resources detect --path ./my-model
 frontierwright play --path ./my-model
 ```
 
-**First question:** is the model already a good fit for my workload and resource envelope?
-
-### Academy — I want to understand models by building one
-
-Start with no model. The UI follows the real sequence: data → tokenizer → Birth → training
-→ evaluation → Candidate → Champion. Nothing becomes a stat until it is measured.
+### Academy — build a real model from zero
 
 ```bash
 frontierwright project init ./academy --name NOVA --origin ZERO --edition ACADEMY
 frontierwright play --path ./academy
 ```
 
-**First question:** what changed in the model, and what evidence proves it?
-
-### Lab — I am developing controlled private models
-
-Start from an internal model, private data, explicit workload acceptance criteria, and
-pinned infrastructure/evaluator/reward identities. Lab optimizes for reproducible
-experiments rather than beginner guidance.
+### Lab — controlled private model development
 
 ```bash
 frontierwright import /path/to/internal-model --path ./lab \
@@ -59,318 +78,333 @@ frontierwright import /path/to/internal-model --path ./lab \
 frontierwright play --path ./lab
 ```
 
-**First question:** can this experiment be reproduced, compared, and rejected safely?
-
-> New to the repository? Install Frontierwright in [Quick start](#quick-start), then use
-> the edition route above.
+Everything visible in the TUI is backed by the same service layer used by the CLI/JSON
+API. Automation should use `--json --non-interactive --yes` instead of driving the TUI.
 
 ---
 
-## Why Frontierwright?
-
-Open models ship in discrete sizes and configurations. Real users do not.
-
-Your machine may have spare VRAM but a latency limit. Your work may need Korean,
-economics, code, long context, or private domain knowledge in a mixture no public
-leaderboard was designed for. A larger stock model may be wasteful; a smaller,
-specialized descendant may be better for *your* work.
-
-Frontierwright changes the question from:
-
-> Which downloadable model is best?
-
-to:
-
-> **Which reachable model gives me the most useful capability inside my actual
-> resource and privacy constraints?**
-
-The optimization target is user utility, not parameter count and not 100% hardware
-utilization.
-
----
-
-## The loop
+## The idea
 
 ```text
-measure model + machine + workload
-              ↓
-        choose a real goal
-              ↓
- plan / calibrate / dry-run
-              ↓
- train · align · distill · merge · optimize
-              ↓
-           Candidate
-              ↓
- comparable eval + resource evidence
-              ↓
-       promote or reject
-              ↓
-           Champion
-              ↓
-       use → observe → repeat
+                         YOUR REAL CONSTRAINTS
+                   workload · machine · privacy · budget
+                                  |
+                                  v
++-----------+      +----------+      +-----------+      +------------+
+|  ORIGIN   | ---> |  PLAN    | ---> | CANDIDATE | ---> |  COMPARE   |
+| baseline0 |      | calibrate|      | real bytes|      | evidence   |
++-----------+      +----------+      +-----------+      +------------+
+      ^                                                         |
+      |                                                         v
+      |                                                +----------------+
+      +------------------- REPEAT <--------------------| PROMOTE/REJECT |
+                                                       +----------------+
+                                                               |
+                                                               v
+                                                          CHAMPION
 ```
 
-A successful training run is **not** automatically an improvement. Frontierwright
-keeps the current Champion unchanged until a Candidate is measured and explicitly
-accepted.
+A successful training job means **a Candidate exists**. It does not mean the Candidate
+is better. Frontierwright keeps the Champion unchanged until measured evidence and an
+explicit decision say otherwise.
+
+The permanent project Origin is display baseline **0**. Promoting a new Champion never
+resets the growth history.
 
 ---
 
-## One core, three different experiences
+## Three editions, one model history
 
-| Edition | Built for | Default experience |
+| Edition | Best for | What the interface emphasizes |
 | --- | --- | --- |
-| **Frontierwright Studio** | People who already control an open/local model | Fit the model to **your machine and workload**: headroom, goals, specialist branches, compression, candidate trade-offs, continual improvement |
-| **Frontierwright Academy** | People learning how models are actually built | **Understand by doing**: guided data → tokenizer → birth → training → evaluation, progressive disclosure, explanations tied to real state |
-| **Frontierwright Lab** | Teams developing large private/internal models | **Controlled frontier development**: exact evidence, private infrastructure, experiment matrices, large-scale training/RL adapters, regression and budget gates |
+| **Studio** | Local/open-model owners and hobbyists | Growth, specialization, real trade-offs, machine fit, build goals |
+| **Academy** | Learning by actually building a model | Data → tokenizer → birth → training → evaluation → Candidate → Champion |
+| **Lab** | Startups/teams developing controlled private models | Exact evidence, workload acceptance, adapters, budgets, RL and scheduler boundaries |
 
-The editions share the same model lineage and raw evidence. Switching editions never
-rewrites history or invents different stats; it changes the **workflow, information
-density, defaults, explanations, and policies**.
+Changing editions changes workflow density and guidance. It does **not** rewrite model
+identity, lineage, measurements, or history.
 
----
+### Studio: “grow my model”
 
-## Real evidence, not game stats
+Studio supports origin-relative growth rules:
 
-Frontierwright never awards fake XP.
+- `IMPROVE` — this metric should measurably improve;
+- `PROTECT` — this metric must not regress;
+- `TOLERANCE` — bounded regression is acceptable;
+- absolute requirements and hard constraints for advanced workflows.
 
-A visible stat must trace back to a versioned evaluation receipt. A resource number
-must come from detection, calibration, or runtime measurement. A Candidate is an
-actual model artifact.
+```bash
+frontierwright build goals --path ./my-model \
+  --improve capability.coding \
+  --protect capability.reasoning \
+  --tolerance serving.latency_p50=10% \
+  --hard privacy=PRIVATE
+```
 
-Capability v1 is deliberately a small frozen local microbenchmark, not a claim of
-general intelligence. Frontierwright exposes the **sample count and 95% Wilson
-uncertainty interval** with each axis so a 16-item estimate is not presented with
-fake precision. New v2 evaluator receipts also retain same-item correctness/margin
-evidence. Candidate comparison reports improvement/regression flips and an exact
-two-sided McNemar test; this is diagnostic evidence, never an automatic promotion rule,
-and a non-significant result is treated as inconclusive rather than proof of equivalence.
+### Academy: real state, not a tutorial simulator
 
-Resource evidence similarly distinguishes:
+Academy can train a tokenizer, materialize a deterministic zero-model root, pretrain it,
+evaluate it, create descendants, and promote a measured Candidate.
 
-- **system availability now** — RAM, disk, and GPU VRAM reported free at detection;
-- **model-specific headroom** — requires an actual model/runtime profile before it can
-  be claimed.
+```bash
+frontierwright data add ./corpus.txt --role PRETRAIN --classification PRIVATE --path ./academy
+frontierwright birth tokenizer DATASET_ID --path ./academy --vocab-size 384
+frontierwright birth zero --path ./academy --preset zero-8m --tokenizer-artifact TOKENIZER_ID
+```
 
-Internally, missing evidence remains conservative. In the human UI it becomes an actionable
-**MEASUREMENT NEEDED** state, and threshold-overlapping uncertainty becomes **MORE EVIDENCE
-NEEDED**. Frontierwright should measure away uncertainty whenever a bounded compatible
-measurement is available instead of leaving the user in a permanent unknown state.
+### Lab: exact evidence before claims
 
----
+Lab adds explicit workload acceptance contracts, controlled-private adapter identities,
+scheduler contracts, and a bounded verifier-driven RL path.
 
-## What a real trade-off looks like
+```bash
+frontierwright workload acceptance schema --json
+frontierwright workload acceptance example --path ./lab --json
+frontierwright lab adapters schema --json
+frontierwright lab slurm schema --json
+frontierwright plan rl-schema --json
+```
 
-A direct RC self-play with the tiny built-in reference model produced this comparison:
-
-| Axis | Champion | Candidate | Delta |
-| --- | ---: | ---: | ---: |
-| General | 50.0 | 75.0 | +25.0 |
-| Reasoning | 50.0 | 62.5 | +12.5 |
-| Math | 50.0 | 37.5 | -12.5 |
-| Coding | 50.0 | 50.0 | 0.0 |
-
-The Build target was **General ≥ 60**, so the target was reached — but Math visibly
-regressed. Promotion remained an explicit decision.
-
-This is an integration example from Frontierwright's tiny local benchmark/model, **not
-a claim that Frontierwright universally improves models by these amounts**. The point
-is that gains, regressions, and resource trade-offs stay visible.
+`PRIVATE` means Frontierwright's application/data-boundary policy. It is **not** an
+attestation of OS, process, kernel, hypervisor, or network isolation.
 
 ---
 
-## What Frontierwright can do today
+## What v1 can actually do
 
-The current core supports real, reproducible lifecycle operations including:
+### Model lifecycle
 
-- model import, fingerprinting, lineage, Candidate/Champion state;
-- Academy tokenizer training and deterministic `zero-8m` / `zero-25m` Birth;
-- pretraining, continued pretraining, full SFT, LoRA, NF4 QLoRA, and DPO;
-- knowledge distillation, deterministic linear merge, and symmetric int8 optimization;
-- frozen Capability v1 evaluation plus held-out LM evaluation;
-- raw comparable Candidate-vs-Champion evidence, practical-margin decision claims, and promotion gates;
-- versioned Workload Acceptance contracts with PASS / FAIL / INCONCLUSIVE / UNKNOWN internal decisions and actionable measurement states;
-- local generation, inference profiling, portable export and verification;
-- privacy-minimal real-use observations with atomic retry semantics and exact workload-revision cohorts;
-- private-data boundaries, Lab adapter contracts, and a bounded controlled-private Slurm executor bridge;
-- hard run/storage/time budgets, durable execution receipts, recovery and idempotency;
-- keyboard-first TUI for humans and stable CLI/JSON surfaces for automation.
+- import local trainable model directories with fingerprints and history confidence;
+- Candidate / Champion lifecycle with explicit promote/reject decisions;
+- permanent Origin identity and origin-relative Stat v2 primitives;
+- exact lineage for training and transformations;
+- deterministic export + independent verification.
 
-The long engineering inventory and known gaps live in
+### Real built-in training paths
+
+The PyTorch reference backend executes real parameter updates for:
+
+- from-scratch pretraining;
+- continued pretraining;
+- full-parameter causal SFT;
+- merged-output LoRA SFT;
+- bounded reference QLoRA SFT;
+- DPO;
+- knowledge distillation;
+- bounded verifier-driven `RL_POLICY_OPTIMIZATION` using REINFORCE.
+
+The built-in RL path is intentionally narrow: verifiable multiple-choice episodes with an
+exact reward. It is **not** presented as open-ended RLHF, arbitrary agentic RL, or a
+production distributed RL stack.
+
+### Model transformations
+
+- deterministic weighted linear merge;
+- symmetric int8 deployment artifact generation;
+- local reference generation;
+- portable export and verification.
+
+Quantization v1 claims the measured artifact-storage transformation. The reference loader
+may dequantize for execution, so it does not invent RAM/latency gains.
+
+### Evaluation and evidence
+
+- frozen 64-item Capability v1 smoke benchmark;
+- held-out causal-LM evaluation packs;
+- exact Champion/Candidate comparable evidence;
+- Wilson uncertainty intervals and paired McNemar diagnostics;
+- external evidence import from lm-evaluation-harness, LightEval, vLLM, generic manifests,
+  and exact serving-resource receipts;
+- explicit workload language/domain/task coverage binding;
+- versioned Workload Acceptance contracts with point or interval-aware rules;
+- privacy-minimal real-use observations with explicit provenance.
+
+Capability v1 is a **small frozen smoke benchmark**, not a claim of general intelligence.
+Its role is regression/integration evidence.
+
+### Resource and execution control
+
+- CPU/RAM/disk/GPU discovery without pretending an unavailable GPU was measured;
+- reference-model latency/throughput/process-memory profiling;
+- uncertainty-aware runtime comparison;
+- consent-triggered interleaved Champion/Candidate runtime remeasurement;
+- hard run-count, wall-time, and storage gates;
+- durable worker/result/usage receipts and reconciliation;
+- idempotent replay for expensive requests;
+- repairable exported run receipts.
+
+### Lab infrastructure
+
+- controlled-private adapter manifests;
+- exact adapter identity and manifest-drift guards;
+- one bounded Slurm bridge with hash-pinned scheduler/worker profile;
+- scheduler availability inspection and backend-spec generation.
+
+The Slurm bridge requires a POSIX submit host and real `sbatch`/`scancel` tools for
+actual submission. Frontierwright reports unsupported hosts instead of pretending a
+cluster exists.
+
+---
+
+## Stats: growth without fake precision
+
+Frontierwright v1 defines these long-lived model axes:
+
+```text
+KNOWLEDGE   REASONING   MATH   CODING   INSTRUCTION   LANGUAGE   CONTEXT
+```
+
+System evidence stays separate:
+
+```text
+AGENTIC / TOOL USE / LATENCY / THROUGHPUT / MEMORY / STORAGE
+```
+
+That separation matters: a better scaffold, tool runner, or runtime must not silently
+become a claim that model weights improved.
+
+Stat v2 stores raw benchmark evidence and derives an origin-relative display. If evidence
+is not compatible, the result stays `UNMEASURED`. If uncertainty overlaps the decision
+boundary, the result stays `UNCERTAIN`.
+
+---
+
+## Benchmark registry
+
+`frontierwright benchmarks list --json` ships a metadata registry for external benchmark
+sources, currently including model, system, and framework sources such as LiveBench,
+MMLU-Pro, IFEval, LiveCodeBench, SciCode, LongBench v2, Terminal-Bench,
+lm-evaluation-harness, Inspect AI, and OpenCompass.
+
+The registry is deliberately **not** a bundled benchmark-data dump. Each source keeps its
+own version, runner, license, contamination, and redistribution considerations. v1 does
+not claim every cataloged benchmark is already executable through Frontierwright.
+
+---
+
+## Terminal UX
+
+Launch the keyboard interface:
+
+```bash
+frontierwright play --path .
+```
+
+The v1 shell is edition-aware and starts with the same identity everywhere:
+
+```text
++-- FRONTIERWRIGHT ----------------------------------+
+|  MEASURE -> CHANGE -> PROVE -> KEEP THE CHAMPION  |
++----------------------------------------------------+
+
+[CHARACTER] [WORKLOAD] [RESOURCES] [BUILD] [PATHS] [DATA] [CANDIDATES] [HISTORY]
+
+GROWTH STAT · ORIGIN MODEL = 0
+Knowledge      +0.0  BASELINE
+Reasoning      +6.2  UNCERTAIN
+Math           +4.1  SAME
+Coding        +18.4  BETTER
+Instruction      ?   UNMEASURED
+Language         ?   UNMEASURED
+Context          ?   UNMEASURED
+```
+
+Core navigation is visible in the footer; `?` opens help and `a` opens the
+edition-specific Action Center. Scripted Textual QA uses the same widgets and reports
+only visible active-tab text by default.
+
+---
+
+## CLI for humans and automation
+
+Every public v1 command has a one-line help description.
+
+```bash
+frontierwright --help
+frontierwright workload --help
+frontierwright plan --help
+frontierwright lab slurm --help
+```
+
+Machine surfaces use JSON and stable error codes:
+
+```bash
+frontierwright status --path . --json --non-interactive
+frontierwright workload next --path . --json --non-interactive
+frontierwright candidates --path . --json --non-interactive
+```
+
+Expensive state-changing operations support explicit confirmation, dry-run/calibration
+where applicable, durable identity, and replay semantics.
+
+---
+
+## Final v1 validation
+
+Before the `v1.0.0` tag, the release candidate was played through all three editions
+using the public CLI/TUI:
+
+- **Academy** — zero-model birth, real PyTorch pretraining, evaluation, Candidate compare,
+  and successful Champion promotion;
+- **Studio** — continued pretraining, full SFT, LoRA, QLoRA, DPO, int8 transform, merge,
+  external eval/serving evidence, and full TUI tab walk;
+- **Lab** — exact interval-aware acceptance PASS, workload coverage PASS, controlled adapter
+  connect/disconnect, bounded Slurm host inspection, real verifier-driven RL, compare/reject,
+  and full TUI tab walk;
+- **CLI discovery** — all 81 public command help surfaces executed successfully.
+
+The repository also runs Ruff, strict mypy, the full pytest suite, package build, clean-wheel
+smoke, real reference-training lifecycle smoke, scripted Textual smoke, and reference-RL smoke.
+
+Detailed implementation boundaries are kept in
 [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
 
 ---
 
-## Quick start
+## Deliberate v1 boundaries
 
-Requires Python 3.11+.
+Frontierwright v1 does **not** claim:
 
-```bash
-git clone https://github.com/ot4562-glitch/Frontierwright.git
-cd Frontierwright
+- arbitrary Hugging Face architecture training support;
+- executable adapters for every benchmark in the catalog;
+- production verl/OpenRLHF integration;
+- generic multi-node/distributed training guarantees beyond the bounded Slurm bridge;
+- OS/hypervisor/network privacy attestation;
+- universal model improvement.
 
-python -m venv .venv
-python -m pip install -e ".[dev]"
-```
-
-For real reference-model training/evaluation, install the training extra in a Python
-environment with a PyTorch build appropriate for your machine:
-
-```bash
-python -m pip install -e ".[train]"
-```
-
-Create an Academy project and launch the human interface:
-
-```bash
-frontierwright project init . --name NOVA --origin ZERO --edition ACADEMY
-frontierwright play --path .
-```
-
-Or start from an existing trainable model in Studio:
-
-```bash
-frontierwright import /path/to/model --path . --edition STUDIO --name MYMODEL
-frontierwright resources detect --path .
-frontierwright play --path .
-```
-
-Compare a stock/open baseline with any registered descendant even after the descendant
-has already become Champion:
-
-```bash
-frontierwright workload compare-models STOCK_MODEL_ID CUSTOM_MODEL_ID --path .
-```
-
-This comparison is not tied to Candidate status. It reuses the same capability, workload,
-serving/resource, artifact-size, paired-item, Pareto, and explicit user-utility evidence
-that Frontierwright has actually measured; missing material dimensions block an unqualified
-superiority claim and become measurement work to close.
-
-Close the loop with privacy-minimal real-use evidence. These records are **not RL rewards** and do not store prompt/response content by default:
-
-```bash
-frontierwright observe record coding --outcome FAILURE --failure-category tool-selection --path .
-frontierwright observe summary --path .
-frontierwright workload next --path .
-```
-
-Repeated failures/corrections become evidence for the next bounded experiment. Frontierwright still requires them to be promoted into versioned evaluation/data/reward evidence before training or RL can claim to learn from them.
-
-AI agents and automation should use the non-interactive CLI/JSON contract instead of
-driving the TUI:
-
-```text
---json
---non-interactive
---yes
-stable exit codes
-versioned schemas
-idempotency for expensive actions
-```
-
-For **human-interface QA in a non-PTY environment** such as CodexPro, rc4 retains the ability to drive the
-same Textual widgets through a deterministic play script and emit the visible state after
-every step:
-
-```json
-{"steps":[{"press":["?"]},{"press":["escape","a"]}]}
-```
-
-```bash
-frontierwright play --path . --script play.json --json
-```
-
-This is intentionally a QA surface, not the normal agent API: it exercises the actual TUI
-key bindings, screens and forms so terminal-host limitations no longer prevent black-box
-human-UX testing.
+These are product boundaries, not hidden “coming soon” behavior. Unknown evidence stays
+unknown.
 
 ---
 
-## User-fit development layer
-
-The rc4 candidate continues moving beyond stock-model selection:
-
-- **Workload Profiles** pin task/language/context/latency/privacy requirements and hard
-  capability floors as versioned evidence.
-- **Measured model fit** links real inference receipts to the exact model instead of
-  treating currently-free system memory as post-load headroom. Client latency/throughput
-  and server VRAM/RSS receipts may be composed only when exact model fingerprint, runtime,
-  execution boundary, and serving-condition hash match.
-- **Evidence-driven next experiments** turn FAIL constraints into bounded interventions,
-  missing measurements into concrete measurement work, and INCONCLUSIVE thresholds into
-  additional compatible sampling. Frontierwright never predicts that a listed experiment
-  will improve the model; success is defined by comparable evidence.
-- **Pareto Candidate comparison** keeps capability, latency, throughput, VRAM/RAM and
-  artifact-size gains/regressions visible side by side.
-- **Explicit user utility** is optional: a user must provide both a weight and a
-  normalization scale for every metric they want combined. Missing evidence makes the
-  result INCOMPLETE; Frontierwright never invents cross-unit conversion or hides the
-  underlying Pareto trade-off.
-- **External evidence adapters** can import exact-version lm-evaluation-harness, LightEval,
-  vLLM, and framework-neutral evaluation manifests without automatically turning arbitrary
-  external scores into Frontierwright stats. Generic manifests must pin exact model
-  fingerprint, evaluator/version, task/version/metric identity, value, metric direction,
-  and may preserve sample count, standard error, and confidence intervals. Workload
-  language/domain/task coverage becomes PASS only through an explicit binding to exact
-  stored receipt identities; Frontierwright never infers coverage from benchmark names.
-- **Real RL foundations** include a rollout/reward/policy-optimization contract and a
-  reference verifier-driven policy-gradient path; DPO remains correctly labeled as
-  preference optimization. Operational observations are explicitly rejected as direct RL
-  rewards unless a separate versioned reward/verifier transformation is introduced.
-- **Bounded Lab Slurm execution** validates one explicit controlled-private scheduler profile,
-  hash-pins the submit contract, records scheduler accounting, and exposes CLI commands to
-  inspect the submit host and generate a Command Backend spec. It is deliberately not a
-  claim of generic cluster/framework support.
-
-The next major layers are broader arbitrary-open-model trainer adapters, production external
-RL backends such as verl/OpenRLHF behind the same reward/evidence boundary, richer distributed
-Lab topologies/checkpoint recovery, and validated adaptive evaluation.
-
----
-
-## Product contracts
-
-Canonical direction, in precedence order:
-
-1. [Product decisions](product/PRODUCT_DECISIONS_OVERRIDE_20260922.md)
-2. [RC4 Stat v2, benchmark sources & Studio growth](product/RC4_STAT_V2_BENCHMARK_AND_STUDIO_GROWTH_20260926.md)
-3. [User-fit optimization & edition experience](product/USER_FIT_OPTIMIZATION_AND_EDITION_EXPERIENCE_20260924.md)
-4. [Edition architecture](product/EDITION_ARCHITECTURE_DECISION_20260923.md)
-5. [v1 implementation blueprint](product/V1_IMPLEMENTATION_BLUEPRINT_20260922.md)
-6. [Capability v1 spec](product/CAPABILITY_V1_SPEC_20260924.md)
-
-External projects and papers being evaluated for interoperability are tracked in
-[External technical references](product/EXTERNAL_TECHNICAL_REFERENCES_20260924.md).
-
----
-
-## Current status
-
-The previously certified v1 candidate is `1.0.0rc1`. The current candidate is
-**`1.0.0rc4`**. It retains the rc3 lifecycle, user-fit, continual-observation, RL, bounded
-Lab, and edition UX contracts while adding the RC4 Stat v2 foundation: a permanent project
-origin model, origin-relative stat primitives, uncertainty-aware runtime comparison,
-discoverable workload-acceptance schema/example surfaces, explicit run-admission versus
-replay semantics, and a curated external benchmark source registry. Executable multi-source
-Capability v2 adapters remain a later RC4/Lab slice and are not claimed by this candidate.
-
-Run the verification suite:
+## Development verification
 
 ```bash
+python -m pip install -e ".[train,dev]"
 python -m ruff check .
 python -m mypy src/frontierwright
-python -m pytest
+python -m pytest -q
 python -m build
+python tools/release_smoke.py
+python tools/v1_e2e_smoke.py --timeout 180
+python tools/rl_reference_smoke.py
+python tools/rc3_scripted_play_smoke.py
 ```
 
-The frozen v1 candidate gate remains in `tools/v1_release_gate.py`. The rc4 candidate
-integrity gate lives in `tools/rc4_release_gate.py`; it inherits the rc3 lifecycle and
-edition criteria and additionally locks permanent-origin persistence/migration, acceptance
-discoverability and next-actions, uncertainty-aware Pareto evidence, explicit remaining-run
-and replay semantics, and the benchmark source registry. Clean-wheel, scripted Textual,
-real PyTorch lifecycle, and reference-RL smokes remain mandatory.
+On a POSIX host with a real Slurm client, run the Slurm integration path separately.
+Windows intentionally reports that submission is unavailable.
+
+---
+
+## Product and engineering documents
+
+- [Implementation status](docs/IMPLEMENTATION_STATUS.md)
+- [Product decisions](product/PRODUCT_DECISIONS_OVERRIDE_20260922.md)
+- [RC4 Stat v2 / benchmark / Studio growth design](product/RC4_STAT_V2_BENCHMARK_AND_STUDIO_GROWTH_20260926.md)
+- [User-fit optimization and edition UX](product/USER_FIT_OPTIMIZATION_AND_EDITION_EXPERIENCE_20260924.md)
+- [Edition architecture](product/EDITION_ARCHITECTURE_DECISION_20260923.md)
+- [Capability v1 specification](product/CAPABILITY_V1_SPEC_20260924.md)
+- [External technical references](product/EXTERNAL_TECHNICAL_REFERENCES_20260924.md)
 
 ---
 
