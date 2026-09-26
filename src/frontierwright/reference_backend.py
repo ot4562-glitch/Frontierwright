@@ -506,14 +506,15 @@ def _load_inference_profile_config(
 
 
 def _import_torch() -> Any:
+    from importlib import import_module
+
     try:
-        import torch
+        return import_module("torch")
     except ImportError as exc:
         raise RuntimeError(
             "PyTorch is not installed in the reference-backend environment. "
             "Install Frontierwright with the 'train' extra in a supported Python environment."
         ) from exc
-    return torch
 
 
 def _select_device(torch: Any, requested: str) -> str:
